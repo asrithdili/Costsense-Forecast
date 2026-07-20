@@ -8,8 +8,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 
+import os
+
 import boto3
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import BotoCoreError, ClientError, ProfileNotFound
 
 
 @dataclass(frozen=True)
@@ -27,7 +29,16 @@ class ProfileInfo:
 
 @lru_cache(maxsize=1)
 def list_profiles() -> tuple[str, ...]:
-    return tuple(boto3.Session().available_profiles)
+    try:
+        return tuple(boto3.Session().available_profiles)
+    except ProfileNotFound:
+        # AWS_PROFILE may point at a profile that isn't on this machine.
+        saved = os.environ.pop("AWS_PROFILE", None)
+        try:
+            return tuple(boto3.Session().available_profiles)
+        finally:
+            if saved is not None:
+                os.environ["AWS_PROFILE"] = saved
 
 
 @lru_cache(maxsize=32)

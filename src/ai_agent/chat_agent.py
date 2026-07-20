@@ -1,4 +1,4 @@
-"""Conversational FinOps bot with read-only AWS access.
+"""Conversational FinOps bot with read-only AWS + GitHub access.
 
 Maintains a message history across turns so the user can ask follow-ups.
 Every tool call goes through `scrub()` (from aws_tools_broad) which recursively
@@ -21,6 +21,7 @@ import boto3
 
 from src.ai_agent.aws_tools import TOOLS as BASE_TOOLS
 from src.ai_agent.aws_tools_broad import BROAD_TOOLS, all_broad_specs, scrub
+from src.ai_agent.github_tools import GITHUB_TOOLS, all_github_specs
 
 
 BEDROCK_REGION = "us-west-2"
@@ -37,25 +38,39 @@ have available.
 Your tools cover: Cost Explorer, CloudWatch metrics, CloudTrail events, \
 resource inventory (Lambda, RDS, EC2, NAT, EBS, S3, DynamoDB), AWS Compute \
 Optimizer, AWS Budgets, Service Quotas, S3 lifecycle policies, and rightsizing \
-recommendations.
+recommendations. You ALSO have read-only GitHub tools — you CAN and SHOULD \
+access GitHub repos directly: search for a repo by name, list its files, \
+read file contents, search code, and list/diff pull requests. Never claim \
+GitHub access is "outside your scope" — it isn't.
 
 Rules:
 - NEVER guess. When the user asks "what's my biggest cost driver," call \
 `cost_by_service` and report the actual top service. When they ask "is my \
 Lambda oversized," call `compute_optimizer_lambda`.
+- If the user references a repo by name only (not "org/repo"), ALWAYS call \
+`github_search_repositories` first to resolve it — it checks the \
+DiligentCorp org first, then falls back to a global search — then use the \
+matched `full_name` in the other `github_*` tools. Only tell the user you \
+couldn't find a repo after this search comes back empty.
+- To analyze a repo's cost impact (e.g. "analyse the cost of X repo"), read \
+its IaC/config files (`github_get_file` on Terraform/CDK/Dockerfiles, etc.) \
+and cross-reference the resources you find with AWS tools (cost_by_service, \
+CloudWatch, resource inventory) to ground the analysis in real spend.
 - Answer the question they asked. Don't hallucinate follow-up asks the user \
 didn't make. Keep replies short and direct.
-- When you cite a number, say WHICH tool call it came from ("via \
+- When you cite a number or fact, say WHICH tool call it came from ("via \
 cost_by_service") so the user can trust it.
 - If a tool errors or returns empty, say so plainly. Don't pretend a value \
 you fabricated came from a tool.
 - Assume you cannot see secrets. Fields that come back as \
 "[REDACTED-BY-COSTSENSE]" have been stripped by policy — don't demand them.
-- If the user asks something out of AWS scope (e.g. "write me a poem"), \
-politely redirect to FinOps.
+- If the user asks something truly out of scope (e.g. "write me a poem"), \
+politely redirect to FinOps or the connected GitHub repos.
 
 Response format: plain markdown. Use bullet points and short paragraphs. \
-No JSON unless the user explicitly asks for JSON."""
+No JSON unless the user explicitly asks for JSON. Always write dollar \
+figures with a leading "$" (e.g. "$400–800", "$65K/year", never a bare \
+"400–800" or "65K/year") since these are all USD amounts."""
 
 
 @dataclass
@@ -75,21 +90,24 @@ class ChatTurn:
 
 
 def _merged_tool_specs() -> list[dict]:
-    """All tools available to the chat agent: base + broad."""
+    """All tools available to the chat agent: AWS base + broad + GitHub."""
     from src.ai_agent.aws_tools import tool_specs as base_specs
-    return base_specs() + all_broad_specs()
+    return base_specs() + all_broad_specs() + all_github_specs()
 
 
 def _run_tool(name: str, args: dict, profile: str | None) -> dict:
     """Route to whichever registry has the tool, then scrub secrets."""
+    kwargs = dict(args or {})
     if name in BASE_TOOLS:
         fn, _ = BASE_TOOLS[name]
+        kwargs["profile"] = profile
     elif name in BROAD_TOOLS:
         fn, _ = BROAD_TOOLS[name]
+        kwargs["profile"] = profile
+    elif name in GITHUB_TOOLS:
+        fn, _ = GITHUB_TOOLS[name]  # GitHub tools auth via gh CLI / GITHUB_TOKEN
     else:
         return {"error": f"unknown tool: {name}"}
-    kwargs = dict(args or {})
-    kwargs["profile"] = profile
     try:
         result = fn(**kwargs)
     except Exception as e:  # noqa: BLE001

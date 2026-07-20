@@ -70,7 +70,8 @@ with st.sidebar:
         "• Resource inventory (EC2, RDS, Lambda, NAT, EBS, S3, DynamoDB)  \n"
         "• Compute Optimizer (EC2 + Lambda rightsizing)  \n"
         "• AWS Budgets, Service Quotas, S3 lifecycle policies  \n"
-        "• AWS Pricing API"
+        "• AWS Pricing API  \n"
+        "• GitHub repo browsing (search repos, files, code, PRs)"
     )
     st.caption("**Auto-redacted**")
     st.caption("Secrets, tokens, IAM policy docs, private keys, JWTs, and "
@@ -81,10 +82,16 @@ with st.sidebar:
 
 # `chat_history` = list of {role, content} sent to Claude (grows over time)
 # `chat_display` = list of {role, text, tool_calls} for rendering
+# `pending_question` = a question queued for processing on THIS rerun, after
+# the render loop below has already echoed the user's bubble — otherwise the
+# UI shows nothing for the entire (often 30s+) tool-calling loop and looks
+# stuck, which is what pushes people to submit twice.
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "chat_display" not in st.session_state:
     st.session_state.chat_display = []
+if "pending_question" not in st.session_state:
+    st.session_state.pending_question = None
 
 
 # ---------- suggested-question chips ----------
@@ -99,11 +106,21 @@ SUGGESTIONS = [
 ]
 
 
-def _handle_question(q: str) -> None:
-    """Run one chat step, append to both histories, rerun to display."""
+def _queue_question(q: str) -> None:
+    """Echo the user's message right away and defer the (slow) agent call
+    to the pending-question block below, which runs after this bubble is
+    already on screen."""
+    if st.session_state.pending_question:
+        return  # a question is already in flight — ignore double submits
     st.session_state.chat_display.append(
         {"role": "user", "text": q, "tool_calls": []}
     )
+    st.session_state.pending_question = q
+
+
+def _run_pending_question(q: str) -> None:
+    """Actually call the agent. Runs inside a spinner so multi-tool-call
+    turns (AWS + GitHub, sometimes 30s+) show visible progress."""
     try:
         turn = chat_step(
             profile=active.profile,
@@ -139,11 +156,6 @@ def _handle_question(q: str) -> None:
 for msg in st.session_state.chat_display:
     with st.chat_message(msg["role"]):
         st.markdown(msg["text"])
-        if msg["role"] == "assistant" and msg["tool_calls"]:
-            with st.expander(f"🔧 {len(msg['tool_calls'])} AWS tool call(s)"):
-                for tc in msg["tool_calls"]:
-                    st.markdown(f"**`{tc.name}`** · args: `{tc.input}`")
-                    st.code(tc.output_summary, language="json")
         if msg.get("_trace"):
             with st.expander("Traceback"):
                 st.code(msg["_trace"])
@@ -156,13 +168,29 @@ if not st.session_state.chat_display:
     cols = st.columns(3)
     for i, s in enumerate(SUGGESTIONS):
         if cols[i % 3].button(s, key=f"sug_{i}", use_container_width=True):
-            _handle_question(s)
+            _queue_question(s)
             st.rerun()
 
 
 # ---------- input box ----------
 
-user_q = st.chat_input("Ask about your AWS costs, resources, or PRs…")
+user_q = st.chat_input(
+    "Ask about your AWS costs, resources, or PRs…",
+    disabled=bool(st.session_state.pending_question),
+)
 if user_q:
-    _handle_question(user_q)
+    _queue_question(user_q)
+    st.rerun()
+
+
+# ---------- process the queued question (user bubble above is already
+# visible by this point) ----------
+
+if st.session_state.pending_question:
+    q = st.session_state.pending_question
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking — querying AWS / GitHub tools… this can "
+                        "take a while for multi-step questions."):
+            _run_pending_question(q)
+    st.session_state.pending_question = None
     st.rerun()
