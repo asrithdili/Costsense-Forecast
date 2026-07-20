@@ -1,0 +1,4 @@
+[client]
+# Hides the "Deploy" button in the top-right toolbar (Streamlit Community Cloud
+# shortcut, not used by this app). The "⋮" menu and everything else is unaffected.
+toolbarMode = "viewer"
