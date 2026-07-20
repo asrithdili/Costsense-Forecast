@@ -186,7 +186,6 @@ def analyze_open_prs(
             diff = pr_diff(opr.repo, opr.number)
         except Exception:  # noqa: BLE001
             continue
-        # Reuse the merged-PR analyzer — same prompt, same tool loop.
         verdict = analyze_pr_diff(
             diff, pr_title=opr.title, profile=profile, model_id=llm_model,
         )
@@ -212,7 +211,6 @@ def analyze_open_prs(
                 for c in verdict.changes
             ],
         ))
-    # Rank by absolute expected impact (already probability-weighted)
     priced.sort(key=lambda p: -abs(p.expected_daily_delta_usd))
     return priced
 

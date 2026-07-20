@@ -77,14 +77,26 @@ if run:
             st.code(traceback.format_exc())
             st.stop()
         if include_top_service and data:
-            with st.spinner("Fetching top service per account…"):
-                for acct in data[:30]:
+            # Only fetch top service for the top 30 by spend — the default
+            # view shows those, and each extra account adds a Cost Explorer
+            # call. If the user searches for a specific account outside the
+            # top 30, top service will just show "—" for it; they can
+            # follow up in the CostSense AI chat.
+            from concurrent.futures import ThreadPoolExecutor
+            targets = [a for a in data if a.total_usd > 0][:30]
+            with st.spinner(f"Fetching top service for {len(targets)} "
+                            "accounts (parallel)…"):
+                def _fetch(acct):
                     try:
-                        acct.__dict__["top_service"] = top_service_by_account(
+                        return acct.account_id, (top_service_by_account(
                             active.profile, acct.account_id, days=days,
-                        ) or "—"
+                        ) or "—")
                     except Exception:  # noqa: BLE001
-                        acct.__dict__["top_service"] = "—"
+                        return acct.account_id, "—"
+                with ThreadPoolExecutor(max_workers=10) as pool:
+                    results = dict(pool.map(_fetch, targets))
+            for a in data:
+                a.__dict__["top_service"] = results.get(a.account_id, "—")
         st.session_state[cache_key] = data
 
 
@@ -108,12 +120,36 @@ kpi[2].metric(f"Total org spend ({days}d)", f"${total:,.0f}")
 
 st.divider()
 
-# Per-account table
+# Search / filter — default view shows top 30 by spend. Search jumps to any
+# other account by ID substring, so users can look up accounts outside the
+# top 30 without loading all 676+ rows.
+TOP_N = 30
+search = st.text_input(
+    "Search account ID",
+    placeholder="Enter part of an account id (e.g. 972575) to look up "
+                "accounts outside the top 30",
+)
+
+if search.strip():
+    q = search.strip()
+    filtered = [a for a in data if q in a.account_id]
+    if not filtered:
+        st.warning(f"No account id contains `{q}`. "
+                   f"Showing top {TOP_N} by spend instead.")
+        filtered = data[:TOP_N]
+    else:
+        st.caption(f"{len(filtered)} match(es) for `{q}`.")
+else:
+    filtered = data[:TOP_N]
+    if len(data) > TOP_N:
+        st.caption(f"Showing top **{TOP_N}** of {len(data)} accounts by "
+                   f"spend. Use the search box above to look up a specific "
+                   "account, or download the full CSV.")
+
 rows = []
-for a in data:
+for a in filtered:
     row = {
         "Account ID": a.account_id,
-        "Account name": a.account_name,
         f"{days}d total ($)": round(a.total_usd, 2),
         "Last 7d ($)": a.spend_last_n_days(7),
         "Prior 7d ($)": (
@@ -127,6 +163,11 @@ for a in data:
     rows.append(row)
 
 df = pd.DataFrame(rows)
+st.caption(
+    "Every linked account under this Organization payer. Total spend for "
+    "the window, last-7d vs prior-7d, trend %. Use the search above to "
+    "look up any account outside the top 30 shown here."
+)
 st.dataframe(
     df,
     use_container_width=True, hide_index=True,
@@ -136,12 +177,6 @@ st.dataframe(
         "Prior 7d ($)": st.column_config.NumberColumn(format="$%.2f"),
         "Trend (%)": st.column_config.NumberColumn(format="%+.1f%%"),
     },
-)
-
-# CSV export
-st.download_button(
-    "Download as CSV", df.to_csv(index=False).encode("utf-8"),
-    file_name="org_level_spend.csv", mime="text/csv",
 )
 
 st.divider()
@@ -159,7 +194,7 @@ if any(a.trend_pct() is not None for a in data):
             if (a.trend_pct() or 0) <= 0:
                 continue
             st.markdown(
-                f"- **{a.account_name}** — trend `{a.trend_pct():+.1f}%`, "
+                f"- **{a.account_id}** — trend `{a.trend_pct():+.1f}%`, "
                 f"last 7d ${a.spend_last_n_days(7):,.0f}"
             )
     with c2:
@@ -168,6 +203,6 @@ if any(a.trend_pct() is not None for a in data):
             if (a.trend_pct() or 0) >= 0:
                 continue
             st.markdown(
-                f"- **{a.account_name}** — trend `{a.trend_pct():+.1f}%`, "
+                f"- **{a.account_id}** — trend `{a.trend_pct():+.1f}%`, "
                 f"last 7d ${a.spend_last_n_days(7):,.0f}"
             )
