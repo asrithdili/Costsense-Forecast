@@ -155,7 +155,10 @@ def _run_pending_question(q: str) -> None:
 
 for msg in st.session_state.chat_display:
     with st.chat_message(msg["role"]):
-        st.markdown(msg["text"])
+        # Escape "$" so dollar figures (e.g. "$400-800") don't get parsed as
+        # LaTeX math by Streamlit's markdown renderer — that mangles the
+        # font (serif/italic, wrong size) for anything between two "$".
+        st.markdown(msg["text"].replace("$", "\\$"))
         if msg.get("_trace"):
             with st.expander("Traceback"):
                 st.code(msg["_trace"])

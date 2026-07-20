@@ -41,6 +41,12 @@ class Finding:
     est_daily_delta_usd: float   # negative for savings
     rationale: str
     confidence: str = "medium"   # low | medium | high
+    # Populated for recommendations only — the concrete before/after code and
+    # the trade-offs, so the PR author can decide without guessing.
+    current_code: str | None = None
+    recommended_code: str | None = None
+    pros: list[str] = field(default_factory=list)
+    cons: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -155,7 +161,10 @@ Return ONLY a JSON object with this shape (no prose outside JSON):
   "verdict": "one-line summary — 'this PR will INCREASE daily cost by ~$X'",
   "direction": "increase" | "decrease" | "neutral",
   "est_daily_delta_usd": <signed number, negative = savings>,
-  "detail": "one paragraph explaining the reasoning",
+  "detail": "2-3 SHORT sentences in plain English explaining WHY, as if to a "
+            "non-technical stakeholder. No jargon walls, no run-on "
+            "sentences, no nested math. State the single biggest driver "
+            "and the bottom line — that's it.",
   "findings": [
     {"resource": "aws_lambda_function/bulkIngest", "action": "resize",
      "est_daily_delta_usd": -6.4, "rationale": "...", "confidence": "high"}
@@ -163,12 +172,24 @@ Return ONLY a JSON object with this shape (no prose outside JSON):
   "recommendations": [
     {"resource": "same resource or new one", "action": "resize",
      "est_daily_delta_usd": <further savings if the user applied this>,
-     "rationale": "concrete suggestion the PR author can implement",
-     "confidence": "medium"}
+     "rationale": "ONE short sentence — the concrete suggestion",
+     "confidence": "medium",
+     "current_code": "the actual existing snippet (Terraform/CDK/YAML/etc, "
+                     "pulled from the diff or inferred) that causes the "
+                     "cost — null if you can't identify a real snippet",
+     "recommended_code": "the exact replacement snippet implementing this "
+                         "recommendation — same language/format as "
+                         "current_code, null if not applicable",
+     "pros": ["1-3 short bullet strings — concrete benefits"],
+     "cons": ["1-3 short bullet strings — real trade-offs/risks, e.g. "
+             "'cold starts increase', 'requires re-deploy'; empty list "
+             "only if there are truly none"]}
   ]
 }
 Findings describe what the PR ALREADY DOES to cost.
-Recommendations describe what the PR SHOULD ALSO DO to reduce cost further."""
+Recommendations describe what the PR SHOULD ALSO DO to reduce cost further \
+— always include current_code/recommended_code when the resource's config \
+is visible in the diff, so the PR author can copy-paste the fix."""
 
 
 SYSTEM_ACCOUNT = """You are a senior AWS FinOps engineer auditing an AWS \
@@ -243,6 +264,10 @@ def _parse_verdict(text: str, model_id: str, tool_calls: int) -> AgentVerdict:
         est_daily_delta_usd=float(f.get("est_daily_delta_usd", 0.0) or 0.0),
         rationale=str(f.get("rationale", "")),
         confidence=str(f.get("confidence", "medium")),
+        current_code=(f.get("current_code") or None),
+        recommended_code=(f.get("recommended_code") or None),
+        pros=[str(p) for p in (f.get("pros") or [])],
+        cons=[str(c) for c in (f.get("cons") or [])],
     ) for f in (parsed.get("recommendations") or [])]
     return AgentVerdict(
         verdict=str(parsed.get("verdict", "")),
