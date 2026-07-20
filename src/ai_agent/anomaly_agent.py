@@ -21,8 +21,13 @@ from src.ai_agent.aws_tools_broad import all_broad_specs
 
 BEDROCK_REGION = "us-west-2"
 DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-6"
-MAX_TOOL_TURNS = 8
-MAX_TOKENS = 4000
+MAX_TOOL_TURNS = 12
+MAX_TOKENS = 16000
+# Cap the number of actions the model can return so it doesn't blow the
+# token budget and cause the final JSON to truncate mid-string.
+MAX_ACTIONS = 8
+# Each code snippet cap — enforced in prompt so approaches stay small.
+MAX_CODE_CHARS = 500
 
 
 SYSTEM = """You are a senior AWS FinOps analyst. You receive two pre-computed \
@@ -30,41 +35,65 @@ sweeps — one from the user's GitHub repos (recent PRs, IaC files, scheduled \
 rules) and one from their AWS account (idle resources, rightsizing recs, top \
 services, budgets). Your job:
 
-  Produce a RANKED LIST of concrete cost issues, each formatted as EXACTLY \
-three fields: Issue, Reason, Recommendation.
+  Produce a RANKED LIST of concrete cost issues. Each has three narrative \
+fields (Issue, Reason, Recommendation) PLUS 2-3 concrete fix approaches with \
+optional code snippets.
 
 Rules:
   1. Ground every entry in the provided sweep data. Cite which sweep field \
 you used (e.g. "compute_optimizer_lambda.top[0]" or "idle_ebs_volumes.sample[2]").
   2. Rank by est_daily_savings_usd, largest first.
-  3. Every action has EXACTLY these fields — no more, no less:
-     - issue: ONE short sentence naming the problem + the specific resource. \
-E.g. "3 idle NAT gateways cost ~$96/month". Include the resource id in the \
-sentence.
-     - reason: ONE short sentence explaining WHY this is happening / WHY it \
-costs money. E.g. "Each active NAT gateway is billed at $0.045/hour even \
-when idle."
-     - recommendation: ONE short sentence with a concrete action. E.g. \
-"Delete nat-0abc, nat-0def, nat-0ghi via the VPC console."
+  3. Use PLAIN TEXT dollars — write "~2375" or "roughly $2,375" but NEVER \
+wrap numbers in $...$ or use LaTeX. The UI renders these strings as \
+markdown and $..$ triggers math mode.
+  4. Every action has these fields:
+     - issue: ONE short sentence naming the problem + the specific resource.
+     - reason: ONE short sentence explaining WHY it costs money.
+     - recommendation: ONE short sentence summarizing the primary fix.
+     - approaches: array of 2-3 concrete alternative fixes. Each is:
+         { "title": short verb phrase (e.g. "Enable S3 Intelligent-Tiering"),
+           "description": 1-2 sentence description of the trade-off,
+           "code": optional code snippet the user could copy-paste (Terraform,
+                   CDK TypeScript, boto3, or aws-cli). Omit or set to null \
+if code doesn't help.
+           "language": "terraform" | "typescript" | "python" | "bash" | \
+"yaml" | "json" — required when `code` is present. }
      - est_daily_savings_usd (positive number)
      - confidence ("high" | "medium" | "low")
      - category ("idle" | "oversized" | "log-inefficiency" | \
 "missing-lifecycle" | "risky-upcoming-pr" | "trending-up")
      - source (sweep field path)
-  4. Keep each of issue/reason/recommendation ONE sentence. No paragraphs. \
-No lists inside. If you have multiple resources of the same kind, either list \
-them in the issue sentence or split into multiple actions.
-  5. If the sweeps don't have enough info, you may call one of the AWS tools \
-to drill deeper — but keep it to at most 4 targeted calls.
-  6. DO NOT make up numbers. If a saving amount isn't in the sweep, set \
+  5. REQUIRED: every action MUST include an `approaches` array with 2 or 3 \
+entries — never fewer, never zero, never omit the field. Prefer approaches \
+that trade off differently (e.g. delete-now vs migrate-to-cheaper-tier; \
+console-click vs IaC change; conservative vs aggressive). If you truly \
+cannot think of alternatives, at minimum split "do it via console" and \
+"do it via IaC/CLI" into two approaches.
+  6. If the fix requires code, put it under `approaches[i].code`. Otherwise \
+omit code and just describe the console/CLI steps in `description`.
+  7. Keep issue/reason/recommendation ONE short sentence each (<25 words). \
+approaches[i].description up to 2 SHORT sentences. Code snippets MUST be \
+under 500 characters — no full CDK stacks, just the essential 5-15 lines. \
+Never repeat the recommendation verbatim in a description.
+  8. Return AT MOST 8 actions total. Prioritize highest $/day savings. \
+Terse beats verbose — the JSON must fit in the response budget without \
+truncation.
+  9. If the sweeps don't have enough info, you may call an AWS tool to drill \
+deeper (up to 4 calls).
+  10. DO NOT make up numbers. If a saving amount isn't in the sweep, set \
 confidence to "low".
 
 Return ONLY JSON (no prose outside JSON, no code fences):
 {
-  "summary": "one-sentence high-level readout",
+  "summary": "one-sentence high-level readout, PLAIN TEXT dollar amounts",
   "total_daily_savings_usd": <number>,
   "actions": [
     {"issue": "...", "reason": "...", "recommendation": "...",
+     "approaches": [
+       {"title": "...", "description": "...",
+        "code": "...", "language": "terraform"},
+       {"title": "...", "description": "..."}
+     ],
      "est_daily_savings_usd": <number>, "confidence": "high|medium|low",
      "category": "...", "source": "sweep.field.path"}
   ]
@@ -72,10 +101,19 @@ Return ONLY JSON (no prose outside JSON, no code fences):
 
 
 @dataclass
+class Approach:
+    title: str = ""
+    description: str = ""
+    code: str = ""
+    language: str = ""
+
+
+@dataclass
 class Action:
     issue: str = ""
     reason: str = ""
     recommendation: str = ""
+    approaches: list[Approach] = field(default_factory=list)
     category: str = ""
     est_daily_savings_usd: float = 0.0
     confidence: str = "medium"
@@ -94,11 +132,37 @@ class AnomalyReport:
 
 
 def _extract_json(text: str) -> dict:
+    """Extract the outermost balanced JSON object that looks like our
+    envelope (has an `actions` array). Handles prose-before-JSON, fenced
+    ```json blocks, and truncated responses.
+
+    Strategy: try to parse the entire text first (works when the model
+    returned pure JSON). If that fails, walk `{` positions and prefer the
+    object with the largest size that (a) parses AND (b) contains an
+    `actions` key — that avoids picking up a nested Action object when
+    the outer envelope is truncated.
+    """
     t = text.strip()
-    if t.startswith("```"):
-        t = t.split("\n", 1)[1] if "\n" in t else t
-        if "```" in t:
-            t = t.split("```", 1)[0]
+
+    # Strip leading prose up to the first ```json fence, or general ``` fence
+    for fence in ("```json", "```"):
+        idx = t.find(fence)
+        if idx >= 0:
+            t = t[idx + len(fence):]
+            break
+    # Strip trailing fence
+    if "```" in t:
+        t = t.split("```", 1)[0]
+
+    # Fast path: entire string is one JSON object
+    try:
+        return json.loads(t.strip())
+    except json.JSONDecodeError:
+        pass
+
+    # Walk all `{` positions, collect every balanced object that parses,
+    # then prefer the one with an `actions` array (or the largest).
+    candidates: list[tuple[int, dict]] = []
     start = t.find("{")
     while start != -1:
         depth = 0
@@ -119,11 +183,49 @@ def _extract_json(text: str) -> dict:
                 depth -= 1
                 if depth == 0:
                     try:
-                        return json.loads(t[start:i+1])
+                        obj = json.loads(t[start:i+1])
+                        if isinstance(obj, dict):
+                            candidates.append((i - start, obj))
                     except json.JSONDecodeError:
-                        break
+                        pass
+                    break
         start = t.find("{", start + 1)
-    raise json.JSONDecodeError("no JSON object", text, 0)
+
+    # Prefer objects that look like our envelope
+    with_actions = [c for c in candidates if "actions" in c[1]]
+    if with_actions:
+        return max(with_actions, key=lambda c: c[0])[1]
+
+    # Truncation recovery: the outer envelope didn't close, so we scan for
+    # individual Action objects (those with issue+reason+recommendation)
+    # and rebuild a synthetic envelope from them.
+    action_shaped = [
+        c[1] for c in candidates
+        if isinstance(c[1], dict)
+        and "issue" in c[1] and "reason" in c[1] and "recommendation" in c[1]
+    ]
+    if action_shaped:
+        # Try to pull the summary from the raw text as a bonus
+        summary = ""
+        s_idx = t.find('"summary"')
+        if s_idx >= 0:
+            colon = t.find(":", s_idx)
+            q1 = t.find('"', colon + 1)
+            q2 = t.find('"', q1 + 1)
+            if q1 >= 0 and q2 > q1:
+                summary = t[q1 + 1: q2]
+        return {
+            "summary": summary,
+            "total_daily_savings_usd": sum(
+                float(a.get("est_daily_savings_usd", 0) or 0)
+                for a in action_shaped
+            ),
+            "actions": action_shaped,
+        }
+
+    if not candidates:
+        raise json.JSONDecodeError("no JSON object", text, 0)
+    return max(candidates, key=lambda c: c[0])[1]
 
 
 def _parse(text: str, model_id: str, tool_calls: int) -> AnomalyReport:
@@ -136,15 +238,24 @@ def _parse(text: str, model_id: str, tool_calls: int) -> AnomalyReport:
     actions = []
     for a in (parsed.get("actions") or []):
         try:
-            # Prefer new field names; fall back to old ones if the model
-            # emitted the legacy schema.
             issue = a.get("issue") or a.get("resource") or ""
             reason = a.get("reason") or a.get("rationale") or ""
             recommendation = a.get("recommendation") or a.get("action") or ""
+            approaches: list[Approach] = []
+            for ap in (a.get("approaches") or []):
+                if not isinstance(ap, dict):
+                    continue
+                approaches.append(Approach(
+                    title=str(ap.get("title", "")),
+                    description=str(ap.get("description", "")),
+                    code=str(ap.get("code") or ""),
+                    language=str(ap.get("language") or ""),
+                ))
             actions.append(Action(
                 issue=str(issue),
                 reason=str(reason),
                 recommendation=str(recommendation),
+                approaches=approaches,
                 category=str(a.get("category", "")),
                 est_daily_savings_usd=float(
                     a.get("est_daily_savings_usd", 0.0) or 0.0
@@ -181,7 +292,7 @@ def analyze_anomalies(
         "AWS SWEEP:\n"
         + json.dumps(aws_summary, default=str)[:10000]
         + "\n\nREPO SWEEP:\n"
-        + json.dumps(repo_summary, default=str)[:4000]
+        + json.dumps(repo_summary, default=str)[:12000]
         + "\n\nProduce the ranked recommendation JSON now."
     )
     messages: list = [{"role": "user", "content": user_msg}]
@@ -227,7 +338,32 @@ def analyze_anomalies(
         if not text_block:
             return AnomalyReport(model_id=model_id, tool_calls=tool_calls,
                                  error="no text in final response")
-        return _parse(text_block.get("text", ""), model_id, tool_calls)
+        candidate = _parse(text_block.get("text", ""), model_id, tool_calls)
+        # If any action came back without approaches, push back once —
+        # the prompt says approaches is REQUIRED, so this is a violation.
+        missing_approaches = (
+            candidate.error is None
+            and candidate.actions
+            and any(not a.approaches for a in candidate.actions)
+        )
+        already_retried = any(
+            isinstance(m.get("content"), str)
+            and "approaches missing" in m["content"]
+            for m in messages if m.get("role") == "user"
+        )
+        if missing_approaches and not already_retried:
+            messages.append({"role": "assistant", "content": content})
+            missing_count = sum(1 for a in candidate.actions if not a.approaches)
+            messages.append({"role": "user", "content": (
+                f"approaches missing on {missing_count} action(s). Per the "
+                "system rules, EVERY action MUST include an `approaches` "
+                "array with 2-3 entries. Resend the SAME actions, but this "
+                "time include the approaches array on every one. If you "
+                "can't think of code-based approaches, split into "
+                "'console approach' and 'CLI/IaC approach'."
+            )})
+            continue
+        return candidate
 
     return AnomalyReport(model_id=model_id, tool_calls=tool_calls,
                          error=f"exceeded {MAX_TOOL_TURNS} tool turns")

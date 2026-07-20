@@ -77,13 +77,25 @@ def _fetch_by_service(
     }
 
 
-def _latest_forecast_file(account_id: str) -> Path | None:
-    fs = sorted(predictions_dir(account_id).glob("forecast_*.json"))
-    return fs[-1] if fs else None
+def _latest_forecast_file(account_id: str, service: str | None = None) -> Path | None:
+    """Return the newest forecast JSON that matches the current service
+    filter. Prevents mixing an all-services forecast onto a service-filtered
+    history chart (which would make the future line jump discontinuously)."""
+    all_fs = sorted(predictions_dir(account_id).glob("forecast_*.json"))
+    if not all_fs:
+        return None
+    if service:
+        svc_suffix = f"__{service.replace(' ', '_')}.json"
+        matches = [f for f in all_fs if f.name.endswith(svc_suffix)]
+        return matches[-1] if matches else None
+    # No service selected → prefer files without any __service suffix
+    plain = [f for f in all_fs if "__" not in f.name.replace("forecast_", "", 1)]
+    return plain[-1] if plain else None
 
 
-def _load_latest_forecast(account_id: str) -> dict | None:
-    f = _latest_forecast_file(account_id)
+def _load_latest_forecast(account_id: str,
+                          service: str | None = None) -> dict | None:
+    f = _latest_forecast_file(account_id, service=service)
     return json.loads(f.read_text()) if f else None
 
 
@@ -180,7 +192,7 @@ with st.sidebar:
         selected_service = None
 
     st.divider()
-    st.subheader("GitHub PRs")
+    st.subheader("Repos to scan")
     st.caption("PRs merged to the base branch bump the future forecast by "
                "their estimated $ delta (via AWS Pricing API).")
 
@@ -192,27 +204,37 @@ with st.sidebar:
         orgs = []
         st.warning(f"gh CLI failed: {e}")
 
+    # Default the org to DiligentCorp when it's in the user's org list.
+    default_org_idx = 0
     if orgs:
-        gh_org = st.selectbox("GitHub org", orgs)
+        for _i, o in enumerate(orgs):
+            if o == "DiligentCorp":
+                default_org_idx = _i
+                break
+        gh_org = st.selectbox("GitHub org", orgs, index=default_org_idx)
     else:
-        gh_org = st.text_input("GitHub org", placeholder="org name")
+        gh_org = st.text_input("GitHub org", value="DiligentCorp")
 
     try:
-        suggested_repos = list(repos_with_user_prs(gh_org)) if gh_org else []
+        suggested_full = list(repos_with_user_prs(gh_org)) if gh_org else []
     except Exception as e:  # noqa: BLE001
-        suggested_repos = []
+        suggested_full = []
         st.warning(f"repo lookup failed: {e}")
 
-    st.caption(f"Signed in as **{_gh_user}** · {len(suggested_repos)} repos "
+    # Show only the short repo name; keep `org/name` internally for the scanner.
+    short_names = [r.split("/", 1)[-1] for r in suggested_full]
+
+    # Default to the repo whose name matches the chosen AWS profile
+    # (e.g. dil-data-platform-dev → data-platform). Falls back to all repos.
+    from src.pr_scanner.profile_repo_match import match_repos as _match
+    default_selection = _match(active_profile, short_names) or short_names
+
+    st.caption(f"Signed in as **{_gh_user}** · {len(short_names)} repos "
                "you've authored PRs in")
-    selected_repos = st.multiselect(
-        "Repos to scan", options=suggested_repos, default=suggested_repos,
+    picked_short = st.multiselect(
+        "Repos", options=short_names, default=default_selection,
     )
-    extra_repo = st.text_input(
-        "Add another repo (org/name)", placeholder="org/repo",
-    )
-    if extra_repo.strip() and extra_repo.strip() not in selected_repos:
-        selected_repos = selected_repos + [extra_repo.strip()]
+    selected_repos = [f"{gh_org}/{n}" for n in picked_short] if gh_org else []
 
     # Base branch — enumerate branches that actually received merged PRs.
     branch_choices: list[str] = []
@@ -257,24 +279,20 @@ with st.sidebar:
     st.caption("Trust check — past predictions")
     show_replay = st.checkbox("Show walk-forward backtest on chart",
                               value=True,
-                              help="At each origin, retrain Prophet on data "
-                                   "STRICTLY before that date and predict "
-                                   "forward. Overlay lets you eyeball model "
-                                   "accuracy against actuals.")
+                              help="At each origin, retrain the selected "
+                                   "model on data STRICTLY before that date "
+                                   "and predict forward. Overlay lets you "
+                                   "eyeball model accuracy against actuals.")
     n_origins = st.slider("Backtest origins", 2, 12, 6, step=1,
                           disabled=not show_replay)
     stride_days = st.slider("Stride between origins (days)", 3, 14, 7, step=1,
                             disabled=not show_replay)
 
-    st.divider()
-    c1, c2 = st.columns(2)
-    do_forecast = c1.button("Run forecast", type="primary",
-                             key="sidebar_run_forecast")
-    do_refresh = c2.button("Refresh cache", key="sidebar_refresh_cache")
-
-    if do_refresh:
-        st.cache_data.clear()
-        st.rerun()
+    # No Run-forecast / Refresh-cache buttons. Dashboard reads the last
+    # persisted forecast JSON from disk on every render (cheap) and Cost
+    # Explorer history through the 10-min `_fetch_history` cache. If a
+    # fresh forecast is needed, generate it from another tool / cron.
+    do_forecast = False
 
 
 # ---------- main pane ----------
@@ -300,7 +318,7 @@ except Exception as e:  # noqa: BLE001
 
 # On-demand forecast run
 if do_forecast:
-    with st.spinner("Fetching Cost Explorer, scanning PRs, fitting Prophet…"):
+    with st.spinner(f"Fetching Cost Explorer, scanning PRs, fitting {model_choice}…"):
         try:
             out = run_pipeline(
                 cutoff=cutoff, profile=active_profile,
@@ -320,7 +338,7 @@ if do_forecast:
             st.code(traceback.format_exc())
 
 
-latest = _load_latest_forecast(account_id)
+latest = _load_latest_forecast(account_id, service=selected_service)
 
 # opportunistically score any old forecasts whose targets have landed
 try:
@@ -331,14 +349,20 @@ except Exception:  # noqa: BLE001
 bt = _load_backtest(account_id)
 fc_df = pd.DataFrame(latest["forecast"]) if latest else pd.DataFrame()
 
-# PR step series (history + future) persisted by the pipeline
+# PR step series (history + future) persisted by the pipeline.
+# Only show it when NO service filter is selected — PR deltas are account-wide,
+# so overlaying them on a per-service chart would be misleading.
 pr_series_df = pd.DataFrame()
-if latest and latest.get("pr_daily_series"):
+if selected_service is None and latest and latest.get("pr_daily_series"):
     pr_series_df = pd.DataFrame(latest["pr_daily_series"])
 
-# Reconstruct PrSteps from the saved impacts so walk-forward can use them
+# Reconstruct PrSteps from the saved impacts so walk-forward can use them.
+# IMPORTANT: PR deltas are estimated for the WHOLE account. Applying them
+# to a service-filtered backtest would inflate predictions relative to the
+# filtered actuals (e.g. a NAT-gateway PR worth $32/day would be added to
+# an EC2-Other chart showing ~$3/day). Skip when service filter is on.
 saved_pr_steps: list = []
-if latest and latest.get("pr_scan", {}).get("impacts"):
+if selected_service is None and latest and latest.get("pr_scan", {}).get("impacts"):
     from src.forecast.timeseries import PrStep as _PrStep
     for imp in latest["pr_scan"]["impacts"]:
         if not imp.get("est_daily_delta_usd"):
@@ -357,7 +381,7 @@ if latest and latest.get("pr_scan", {}).get("impacts"):
 replay_points: list = []
 replay_df = pd.DataFrame()
 if show_replay and not hist_df.empty:
-    with st.spinner(f"Retraining Prophet at {n_origins} past origins…"):
+    with st.spinner(f"Retraining {model_choice} at {n_origins} past origins…"):
         try:
             hist_for_replay = pd.DataFrame({
                 "day": pd.to_datetime(hist_df["day"]),
@@ -813,82 +837,130 @@ else:
     st.plotly_chart(fig3, use_container_width=True)
 
 
-# ---------- Why did cost move? (AI narration — right after the backtest chart) ----------
+# ---------- Future forecast summary (no LLM, computed from data) ----------
 st.divider()
 st.subheader("What will happen next — and why")
-st.caption("Claude reads the recent daily series, the PRs merged, and can "
-           "call CloudTrail / CloudWatch to explain the peaks and troughs, "
-           "then predicts the next 7 days with concrete reasons.")
 
-_fc_file = _latest_forecast_file(account_id)
-_fc_stamp = str(_fc_file.stat().st_mtime) if _fc_file else "no-forecast"
-narr_key = f"narr::{account_id}::{cutoff.isoformat()}::{history_days}::{_fc_stamp}"
+if latest and latest.get("forecast"):
+    fc_rows = latest["forecast"]
+    future_total = sum(float(r.get("adjusted_usd", 0)) for r in fc_rows)
+    future_avg = future_total / max(1, len(fc_rows))
 
-cn1, cn2, _ = st.columns([1, 1, 2])
-narr_model = cn2.selectbox(
-    "Model",
-    options=["anthropic.claude-3-haiku-20240307-v1:0",
-             "us.anthropic.claude-sonnet-4-6"],
-    index=1,
-    key="narr_model_choice",
-    help="Sonnet grounds explanations in real CloudTrail/CloudWatch calls. "
-         "Haiku is cheaper but often skips tools.",
-)
-force_rerun = cn1.button("Re-run narration",
-                          disabled=(latest is None or hist_df.empty),
-                          help="Regenerate the AI explanation without waiting "
-                               "for a new forecast.")
+    # Compare with the last 7 days of actuals
+    last7_actual = hist_df.tail(7)["actual_usd"].sum() if not hist_df.empty else 0.0
+    last7_avg = last7_actual / 7 if last7_actual else 0.0
+    delta_pct = ((future_avg - last7_avg) / last7_avg * 100) if last7_avg else None
 
-narr = st.session_state.get(narr_key)
-should_run = (
-    not (latest is None or hist_df.empty)
-    and (narr is None or force_rerun)
-)
-
-if should_run:
-    from src.ai_agent.narrator import narrate as _narrate
-    ctx = f"AWS account {account_id} via profile `{active_profile}`."
-    with st.spinner("Auto-explaining chart — reading history, PRs, and "
-                    "calling AWS tools (30-90s)…"):
-        try:
-            narr = _narrate(
-                hist_df=hist_df.rename(columns={"actual_usd": "actual_usd"}),
-                forecast_rows=(latest.get("forecast") or []) if latest else [],
-                pr_impacts=(latest.get("pr_scan", {}).get("impacts") or [])
-                if latest else [],
-                profile=active_profile,
-                account_context=ctx,
-                model_id=narr_model,
-            )
-            st.session_state[narr_key] = narr
-        except Exception as e:  # noqa: BLE001
-            st.error(f"narration failed: {e}")
-
-if narr is not None:
-    if narr.error:
-        st.error(f"Agent error: {narr.error}")
+    # Direction banner
+    if delta_pct is None:
+        direction, arrow, color = "flat", "→", st.info
+    elif delta_pct > 5:
+        direction, arrow, color = "up", "↗", st.warning
+    elif delta_pct < -5:
+        direction, arrow, color = "down", "↘", st.success
     else:
-        arrow = {"up": "↗", "down": "↘", "flat": "→"}.get(
-            narr.future_direction, "•")
-        color = {"up": st.warning, "down": st.success,
-                 "flat": st.info}.get(narr.future_direction, st.info)
-        color(f"### {arrow} Next 7 days — est. **${narr.future_est_daily_usd:,.0f}/day**")
-        st.write(narr.future_outlook)
+        direction, arrow, color = "flat", "→", st.info
 
-        if narr.key_drivers:
-            st.markdown("**Key drivers:**")
-            for d in narr.key_drivers:
-                st.markdown(f"- {d}")
+    color(f"### {arrow} Next 7 days — est. **\\${future_avg:,.0f}/day** "
+          f"(\\${future_total:,.0f} total)")
 
-        if narr.past_events:
-            st.markdown("---")
-            st.markdown("**Why history moved:**")
-            for e in narr.past_events:
-                icon = "🔺" if e.kind in ("peak", "step-up") else \
-                       "🔻" if e.kind in ("trough", "step-down") else "•"
-                with st.container(border=True):
-                    ch = st.columns([1, 4])
-                    ch[0].markdown(f"{icon} **{e.date}**")
-                    delta_str = f"${e.change_vs_prior:+,.0f} to ${e.amount_usd:,.0f}"
-                    ch[0].caption(f"{delta_str}  ·  confidence: {e.confidence}")
-                    ch[1].markdown(e.explanation or "_no explanation returned_")
+    # Concrete reasons pulled from the forecast payload
+    tuned = latest.get("tuned_params") or {}
+    dow_ratios = tuned.get("dow_ratios") or {}
+    pr_impacts = (latest.get("pr_scan") or {}).get("impacts") or []
+    nonzero_prs = [p for p in pr_impacts if p.get("est_daily_delta_usd", 0)]
+    pr_delta_at_cutoff = float(latest.get("pr_delta_daily_usd_at_cutoff", 0.0))
+    open_pr_scan = latest.get("open_pr_scan") or {}
+    open_pr_expected = float(open_pr_scan.get(
+        "total_expected_daily_delta_usd", 0.0
+    ))
+
+    st.markdown("**Why the graph looks the way it does:**")
+
+    reasons: list[str] = []
+
+    # Recent trajectory
+    if last7_avg > 0 and delta_pct is not None:
+        if abs(delta_pct) < 5:
+            reasons.append(
+                f"**Steady level.** Last 7 days averaged "
+                f"\\${last7_avg:,.0f}/day; the forecast holds close to that "
+                f"({delta_pct:+.1f}%) because no strong up- or down-trend is "
+                "visible in recent history."
+            )
+        else:
+            reasons.append(
+                f"**Trend continues.** Last 7 days averaged "
+                f"\\${last7_avg:,.0f}/day; the model projects "
+                f"\\${future_avg:,.0f}/day next week ({delta_pct:+.1f}%) "
+                "because the trajectory of recent days points in that direction."
+            )
+
+    # Day-of-week pattern
+    if dow_ratios:
+        highest = max(dow_ratios.items(), key=lambda kv: float(kv[1]))
+        lowest = min(dow_ratios.items(), key=lambda kv: float(kv[1]))
+        dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        hi_name = dow_names[int(highest[0])]
+        lo_name = dow_names[int(lowest[0])]
+        hi_pct = (float(highest[1]) - 1) * 100
+        lo_pct = (float(lowest[1]) - 1) * 100
+        if abs(hi_pct) > 5 or abs(lo_pct) > 5:
+            reasons.append(
+                f"**Weekly rhythm.** The model applies a day-of-week pattern "
+                f"learned from the last 4 weeks: **{hi_name}** typically runs "
+                f"{hi_pct:+.0f}% vs the account average, **{lo_name}** runs "
+                f"{lo_pct:+.0f}%. That's why the forecast line wiggles rather "
+                f"than being flat."
+            )
+
+    # Merged PRs already in effect
+    if pr_delta_at_cutoff and abs(pr_delta_at_cutoff) > 0.5:
+        n = len(nonzero_prs)
+        reasons.append(
+            f"**Merged PR impact ({n} PR(s)).** The forecast is offset by "
+            f"**\\${pr_delta_at_cutoff:+,.2f}/day** because recent merged PRs "
+            "changed AWS resources (Lambda memory, log volume, etc.). "
+            "This offset carries forward into every day of the future forecast."
+        )
+
+    # Open PRs about to merge
+    if open_pr_expected and abs(open_pr_expected) > 0.5:
+        n_open = int(open_pr_scan.get("count", 0))
+        reasons.append(
+            f"**Upcoming PRs ({n_open} open).** Additional "
+            f"**\\${open_pr_expected:+,.2f}/day** expected once open PRs merge "
+            "(probability-weighted). The future line rises/falls slightly on "
+            "each expected merge date."
+        )
+
+    # Confidence band
+    band_widths = [float(r.get("upper_usd", 0)) - float(r.get("lower_usd", 0))
+                   for r in fc_rows]
+    avg_band = sum(band_widths) / max(1, len(band_widths))
+    if future_avg > 0:
+        band_pct = avg_band / future_avg * 100
+        if band_pct > 40:
+            reasons.append(
+                f"**Wide uncertainty band (±\\${avg_band/2:,.0f}/day, "
+                f"~{band_pct/2:.0f}%).** History was volatile, so the model "
+                "isn't confident. Actual cost could land anywhere inside "
+                "the shaded region — treat the number as a rough range, "
+                "not a promise."
+            )
+        else:
+            reasons.append(
+                f"**Tight uncertainty band (±\\${avg_band/2:,.0f}/day, "
+                f"~{band_pct/2:.0f}%).** History was stable, so the model "
+                "is reasonably confident in this number."
+            )
+
+    if reasons:
+        for r in reasons:
+            st.markdown(f"- {r}")
+    else:
+        st.info("Not enough data yet to explain the forecast. Click "
+                "**Run forecast** in the sidebar first.")
+else:
+    st.info("No forecast on disk yet. Click **Run forecast** in the sidebar "
+            "to generate one.")

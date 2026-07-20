@@ -57,7 +57,7 @@ def _fetch_config(repo: str) -> dict[str, str]:
     return {}
 
 
-def _open_prs(repo: str, limit: int = 15) -> list[dict]:
+def _open_prs(repo: str, limit: int = 50) -> list[dict]:
     """Recently updated open PRs. These are the leading indicator of what
     might merge and shift cost next."""
     try:
@@ -141,16 +141,21 @@ def sweep_repos(repos: list[str], max_workers: int = 4) -> list[RepoSweepResult]
 
 
 def sweep_to_summary(results: list[RepoSweepResult]) -> dict:
-    """Compact summary passed to the LLM as pre-computed context."""
+    """Compact summary passed to the LLM as pre-computed context.
+
+    Everything the fetcher collected is passed through. If the caller wants
+    to bound token spend, do it upstream by lowering the `limit` on
+    `_open_prs` / `_recent_iac_files` / `_scheduled_rules`.
+    """
     return {
         "repos": [
             {
                 "repo": r.repo,
                 "accounts_by_env": r.accounts,
                 "open_pr_count": len(r.open_prs),
-                "open_pr_titles": [p.get("title", "") for p in r.open_prs[:8]],
-                "recent_iac_files": r.recent_iac_files[:15],
-                "scheduled_rule_files": r.scheduled_rules[:10],
+                "open_pr_titles": [p.get("title", "") for p in r.open_prs],
+                "recent_iac_files": r.recent_iac_files,
+                "scheduled_rule_files": r.scheduled_rules,
                 "error": r.error,
             }
             for r in results
