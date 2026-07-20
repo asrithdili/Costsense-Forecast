@@ -12,13 +12,13 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 from dataclasses import dataclass, field
 from functools import lru_cache
 
 import boto3
 
 from src.ai_agent.aws_tools import call_tool, tool_specs
+from src.pr_scanner.gh_client import pr_diff, pr_view_json
 
 
 DEFAULT_MODEL = "anthropic.claude-3-haiku-20240307-v1:0"
@@ -63,12 +63,17 @@ def _client(profile: str | None):
     return make_client(profile, region=BEDROCK_REGION)
 
 
-def _run(args: list[str]) -> str:
-    r = subprocess.run(args, capture_output=True, check=False)
-    if r.returncode != 0:
-        err = r.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"gh failed: {err}")
-    return r.stdout.decode("utf-8", errors="replace")
+def fetch_pr_diff(pr_url: str) -> tuple[str, str, str, str]:
+    """Return (repo, pr_number, diff_text, title). Uses `gh` or GitHub API."""
+    repo, num = parse_pr_url(pr_url)
+    title = ""
+    try:
+        info = pr_view_json(repo, num)
+        title = info.get("title", "")
+    except Exception:  # noqa: BLE001
+        pass
+    diff = pr_diff(repo, num)
+    return repo, str(num), diff, title
 
 
 def parse_pr_url(url: str) -> tuple[str, int]:
@@ -77,20 +82,6 @@ def parse_pr_url(url: str) -> tuple[str, int]:
     if not m:
         raise ValueError(f"not a GitHub PR URL: {url!r}")
     return m.group(1), int(m.group(2))
-
-
-def fetch_pr_diff(pr_url: str) -> tuple[str, str, str]:
-    """Return (repo, pr_number, diff_text). Uses `gh` CLI."""
-    repo, num = parse_pr_url(pr_url)
-    title = ""
-    try:
-        info = json.loads(_run(["gh", "pr", "view", str(num),
-                                "--repo", repo, "--json", "title"]))
-        title = info.get("title", "")
-    except Exception:  # noqa: BLE001
-        pass
-    diff = _run(["gh", "pr", "diff", str(num), "--repo", repo])
-    return repo, str(num), diff, title  # type: ignore[return-value]
 
 
 SYSTEM_PR = """You are a senior AWS FinOps engineer reviewing a pull request \
