@@ -21,6 +21,30 @@ from src.aws.profiles import resolve_all
 st.set_page_config(page_title="CostSense · PR Predictor", layout="wide",
                    page_icon="🔮")
 
+# Streamlit's markdown renderer treats a "$...$" pair as inline LaTeX math,
+# which is exactly what raw "$57.60/day" style text looks like — it mangles
+# the font (serif/italic, wrong size) and garbles spacing. `_md` escapes the
+# "$" before anything AI-generated goes through st.markdown/st.write so all
+# body text renders in one consistent font. The CSS below is a second,
+# belt-and-suspenders normalizer for font-size across every text element.
+st.markdown("""
+<style>
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li,
+[data-testid="stMarkdownContainer"] span {
+    font-size: 1rem !important;
+    line-height: 1.6 !important;
+    font-style: normal !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+def _md(text: str | None) -> str:
+    """Escape '$' so it never gets parsed as LaTeX math."""
+    return (text or "").replace("$", "\\$")
+
+
 st.title("PR Predictor")
 st.caption("Paste a GitHub PR URL. The agent reads the diff, queries the "
            "AWS account for real usage metrics, and predicts whether the PR "
@@ -80,11 +104,11 @@ if run and pr_url.strip():
 
     # verdict banner
     if verdict.direction == "increase":
-        st.error(f"### ↗ {verdict.verdict}")
+        st.error(f"### ↗ {_md(verdict.verdict)}")
     elif verdict.direction == "decrease":
-        st.success(f"### ↘ {verdict.verdict}")
+        st.success(f"### ↘ {_md(verdict.verdict)}")
     else:
-        st.info(f"### → {verdict.verdict}")
+        st.info(f"### → {_md(verdict.verdict)}")
 
     cols = st.columns(3)
     cols[0].metric("Est. daily impact",
@@ -94,7 +118,7 @@ if run and pr_url.strip():
     cols[2].metric("AWS tool calls", verdict.tool_calls)
 
     if verdict.detail:
-        st.write(verdict.detail)
+        st.markdown(f"**In plain terms:** {_md(verdict.detail)}")
 
     st.divider()
 
@@ -105,7 +129,6 @@ if run and pr_url.strip():
                 "Resource": f.resource,
                 "Action": f.action,
                 "$/day Δ": f.est_daily_delta_usd,
-                "Confidence": f.confidence,
                 "Rationale": f.rationale,
             } for f in verdict.findings]),
             use_container_width=True, hide_index=True,
@@ -115,9 +138,31 @@ if run and pr_url.strip():
         st.subheader("Recommendations to reduce cost further")
         for i, r in enumerate(verdict.recommendations, start=1):
             with st.container(border=True):
-                cc = st.columns([3, 1, 1])
-                cc[0].markdown(f"**{i}. {r.resource}** — _{r.action}_")
+                cc = st.columns([3, 1])
+                cc[0].markdown(f"**{i}. {_md(r.resource)}** — _{r.action}_")
                 cc[1].metric("If applied", f"${r.est_daily_delta_usd:+,.2f}/d",
                              label_visibility="visible")
-                cc[2].markdown(f"Confidence: **{r.confidence}**")
-                st.markdown(r.rationale)
+                st.markdown(_md(r.rationale))
+
+                if r.pros or r.cons:
+                    pc = st.columns(2)
+                    with pc[0]:
+                        if r.pros:
+                            st.markdown("**✅ Pros**\n" + "\n".join(
+                                f"- {_md(p)}" for p in r.pros))
+                    with pc[1]:
+                        if r.cons:
+                            st.markdown("**⚠️ Cons**\n" + "\n".join(
+                                f"- {_md(c)}" for c in r.cons))
+
+                if r.current_code or r.recommended_code:
+                    with st.expander("📝 View suggested code change"):
+                        code_cols = st.columns(2)
+                        with code_cols[0]:
+                            st.caption("Current")
+                            st.code(r.current_code or "(not identified in diff)",
+                                    language="text")
+                        with code_cols[1]:
+                            st.caption("Recommended")
+                            st.code(r.recommended_code or "(no code change — see rationale above)",
+                                    language="text")

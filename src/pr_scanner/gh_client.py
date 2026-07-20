@@ -11,12 +11,41 @@ import urllib.parse
 import urllib.request
 
 
+# Common Windows install locations — checked as a fallback when `gh` isn't
+# on PATH. A Streamlit server started from a terminal that predates a fresh
+# `gh` install (or a fresh PATH update) won't see it via shutil.which alone,
+# silently falling back to an unauthenticated REST call that 404s on private
+# repos instead of a clear auth error.
+_GH_FALLBACK_PATHS = [
+    r"C:\Program Files\GitHub CLI\gh.exe",
+    r"C:\Program Files (x86)\GitHub CLI\gh.exe",
+]
+
+_gh_path_cache: str | None = None
+
+
+def _resolve_gh() -> str | None:
+    global _gh_path_cache
+    if _gh_path_cache is not None:
+        return _gh_path_cache or None
+    found = shutil.which("gh")
+    if not found:
+        for candidate in _GH_FALLBACK_PATHS:
+            if os.path.isfile(candidate):
+                found = candidate
+                break
+    _gh_path_cache = found or ""
+    return found or None
+
+
 def gh_available() -> bool:
-    return shutil.which("gh") is not None
+    return _resolve_gh() is not None
 
 
 def _run_cli(args: list[str]) -> str:
-    r = subprocess.run(args, capture_output=True, check=False)
+    gh_path = _resolve_gh() or "gh"
+    resolved_args = [gh_path, *args[1:]] if args and args[0] == "gh" else args
+    r = subprocess.run(resolved_args, capture_output=True, check=False)
     if r.returncode != 0:
         err = r.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"gh failed ({args}): {err}")
