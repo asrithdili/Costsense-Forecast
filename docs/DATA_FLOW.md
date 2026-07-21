@@ -206,9 +206,25 @@ This is why the section renders instantly — no Bedrock latency.
   `forecast_YYYY-MM-DD.json`.
 - **On every Dashboard page load** for the walk-forward backtest. The
   6-origin retrain runs *in-memory only* — doesn't write anything.
+- **The regime-shift detector runs on every training pass** (both live
+  forecasts and each origin of the backtest). It's a lightweight
+  pandas check — no extra retrain cost. When a >=40% drop or >=70%
+  rise is detected between the last 5 days and the prior 14 days,
+  training gets truncated to post-shift days before the auto-tuner
+  runs.
 
 There's no daemon, no scheduled retrain, no online learning. Every run
 is deterministic given the same history + same PRs.
+
+To reproduce forecast accuracy numbers for any account:
+
+```bash
+python -m scripts.test_forecast_accuracy --profile <name> --origins 8
+```
+
+The test mirrors the Dashboard's walk-forward path exactly, reads
+merged-PR steps from the newest saved forecast JSON on disk, and
+prints direction accuracy + MAE + WAPE per origin.
 
 ---
 
