@@ -20,44 +20,29 @@ if str(_REPO_ROOT) not in sys.path:
 import streamlit as st
 
 from src.ai_agent.chat_agent import chat_step
-from src.aws.profiles import resolve_all
+from src.dashboard.nav import render as render_nav
 
 
 st.set_page_config(page_title="CostSense · AI Chat", layout="wide",
                    page_icon="🤖")
 
+# Render title first so the page isn't blank while SSO/STS profile
+# resolution runs inside render_nav().
 st.title("CostSense AI")
 st.caption("Chat with a FinOps agent that has read-only access to your AWS "
            "account. Ask anything about spend, resources, PRs, or "
            "recommendations. The bot uses live AWS APIs and auto-redacts "
            "anything that looks like a secret.")
 
+sel = render_nav(include_model=True)
+active = sel.profile
+model_id = sel.model_id
+
 
 # ---------- sidebar ----------
 
 with st.sidebar:
-    st.header("AWS account")
-    profiles = [p for p in resolve_all() if p.account_id]
-    if not profiles:
-        st.error("No AWS profiles reachable.")
-        st.stop()
-    labels = [p.label for p in profiles]
-    pick = st.selectbox("Profile", labels)
-    active = profiles[labels.index(pick)]
-
-    st.divider()
-    model_id = st.selectbox(
-        "Bedrock model",
-        index=1,   # default to Sonnet
-        options=[
-            "anthropic.claude-3-haiku-20240307-v1:0",
-            "us.anthropic.claude-sonnet-4-6",
-        ],
-        help="Sonnet handles multi-turn tool-use well and is recommended.",
-    )
-
-    st.divider()
-    if st.button("Clear chat"):
+    if st.button("Clear chat", use_container_width=True):
         st.session_state.chat_history = []
         st.session_state.chat_display = []
         st.rerun()

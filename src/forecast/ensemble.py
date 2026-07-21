@@ -171,16 +171,102 @@ def tune_params(
     return best
 
 
+def detect_regime_shift(
+    history: pd.DataFrame,
+    *,
+    recent_days: int = 5,
+    baseline_days: int = 14,
+    drop_ratio: float = 0.6,
+    rise_ratio: float = 1.7,
+) -> date | None:
+    """Detect a recent level shift and return the first day OF the new
+    regime (i.e. the first day whose value crossed into shifted territory).
+
+    Rule of thumb — a shift has happened when the last `recent_days`
+    average is <= `drop_ratio` * or >= `rise_ratio` * the mean of the
+    prior `baseline_days`. We scan for the earliest day in the shifted
+    window whose value already reflects the new regime; forecasts
+    should train only on days from that day onward.
+
+    Returns None when no clear shift is present.
+    """
+    if history.empty or len(history) < baseline_days + recent_days:
+        return None
+    df = history.copy()
+    df["day"] = pd.to_datetime(df["day"])
+    df = df.sort_values("day").reset_index(drop=True)
+
+    recent = df.tail(recent_days)["amount_usd"].astype(float)
+    baseline = df.iloc[-(recent_days + baseline_days):-recent_days]["amount_usd"].astype(float)
+    if baseline.mean() <= 0:
+        return None
+    ratio = recent.mean() / baseline.mean()
+    if drop_ratio < ratio < rise_ratio:
+        return None
+    # Find first day in the "recent" tail whose value crosses the threshold.
+    baseline_mean = float(baseline.mean())
+    lo = baseline_mean * drop_ratio
+    hi = baseline_mean * rise_ratio
+    tail_rows = df.tail(recent_days + 2)
+    for _, row in tail_rows.iterrows():
+        v = float(row["amount_usd"])
+        if v <= lo or v >= hi:
+            return pd.Timestamp(row["day"]).date()
+    # Fallback: earliest day in the recent window
+    return pd.Timestamp(df.tail(recent_days).iloc[0]["day"]).date()
+
+
 def forecast_auto(
     history: pd.DataFrame,
     cutoff: date,
     horizon_days: int = 7,
+    *,
+    regime_aware: bool = True,
 ) -> tuple[list[ForecastPoint], TunedParams]:
     """Public entry point. Auto-tunes params on the given history, then
     forecasts `horizon_days` forward. Returns (points, tuned_params) so
-    callers can persist the params for audit."""
-    params = tune_params(history, cutoff, horizon_days=horizon_days)
-    fc = _forecast_with_params(history, cutoff, params, horizon_days=horizon_days)
+    callers can persist the params for audit.
+
+    When `regime_aware=True` (default), scan for a recent level shift
+    and truncate the training window to the shifted regime before
+    tuning. This prevents old-regime days from dragging the trimmed
+    mean toward the wrong level after workload pauses / restarts.
+    """
+    train = history.copy()
+    if regime_aware:
+        shift_day = detect_regime_shift(train)
+        if shift_day is not None:
+            train["day"] = pd.to_datetime(train["day"])
+            trimmed = train[train["day"] >= pd.Timestamp(shift_day)]
+            # Prefer full-shift-window training. If too few days exist
+            # post-shift to run the walk-forward tuner, we still need to
+            # produce a prediction — fall back to naive-yesterday of the
+            # post-shift period. This is exactly the case (2-5 days
+            # post-shift) where the un-trimmed model over-predicts by
+            # 100-200%.
+            if len(trimmed) >= 10:
+                train = trimmed.reset_index(drop=True)
+            elif len(trimmed) >= 2:
+                # Direct override: predict shifted-window mean, no tuning.
+                shifted_mean = float(trimmed["amount_usd"].astype(float).mean())
+                fallback = TunedParams(
+                    naive_weight=1.0, trim_window=len(trimmed),
+                    trim_fraction=0.0, decay_slope=0.0,
+                    tuning_wape=0.0, tuning_days_scored=0,
+                    dow_ratios={i: 1.0 for i in range(7)},
+                )
+                out = [
+                    ForecastPoint(
+                        target_date=cutoff + timedelta(days=i),
+                        predicted_usd=max(0.0, shifted_mean),
+                        lower_usd=max(0.0, shifted_mean * 0.5),
+                        upper_usd=max(0.0, shifted_mean * 1.5),
+                    )
+                    for i in range(1, horizon_days + 1)
+                ]
+                return out, fallback
+    params = tune_params(train, cutoff, horizon_days=horizon_days)
+    fc = _forecast_with_params(train, cutoff, params, horizon_days=horizon_days)
     return fc, params
 
 

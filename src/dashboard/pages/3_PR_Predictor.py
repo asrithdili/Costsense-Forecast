@@ -16,10 +16,17 @@ import streamlit as st
 
 from src.ai_agent.agent import analyze_pr
 from src.aws.profiles import resolve_all
+from src.dashboard.nav import inject_css, top_bar
 
 
 st.set_page_config(page_title="CostSense · PR Predictor", layout="wide",
                    page_icon="🔮")
+inject_css()
+
+MODEL_OPTIONS = [
+    ("us.anthropic.claude-sonnet-4-6",         "Claude Sonnet 4.6"),
+    ("anthropic.claude-3-haiku-20240307-v1:0", "Claude 3 Haiku"),
+]
 
 # Streamlit's markdown renderer treats a "$...$" pair as inline LaTeX math,
 # which is exactly what raw "$57.60/day" style text looks like — it mangles
@@ -52,30 +59,45 @@ st.caption("Paste a GitHub PR URL. The agent reads the diff, queries the "
            "reducing it further.")
 
 
-# ---------- sidebar ----------
+# ---------- top control bar ----------
 
-with st.sidebar:
-    st.header("AWS account")
+with st.spinner("Resolving profiles…"):
     profiles = [p for p in resolve_all() if p.account_id]
-    if not profiles:
-        st.error("No AWS profiles reachable. `aws sso login` first.")
-        st.stop()
-    labels = [p.label for p in profiles]
-    pick = st.selectbox("Profile", labels)
-    active = profiles[labels.index(pick)]
+if not profiles:
+    st.error("No AWS profiles reachable. `aws sso login` first.")
+    st.stop()
+labels = [p.label for p in profiles]
+model_ids = [mid for mid, _ in MODEL_OPTIONS]
+model_labels = [name for _, name in MODEL_OPTIONS]
 
-    st.divider()
-    st.subheader("Model")
-    model_id = st.selectbox(
-        "Bedrock model",
-        index=1,   # default to Sonnet — Haiku often skips tools and returns neutral
-        options=[
-            "anthropic.claude-3-haiku-20240307-v1:0",
-            "us.anthropic.claude-sonnet-4-6",
-        ],
-        help="Haiku is fast (~$0.001/PR). Sonnet is more accurate on complex "
-             "diffs and better at tool use.",
-    )
+picked_label = st.session_state.get("prp_profile", labels[0])
+if picked_label not in labels:
+    picked_label = labels[0]
+picked_model_idx = st.session_state.get("prp_model_idx", 0)
+if not (0 <= picked_model_idx < len(model_ids)):
+    picked_model_idx = 0
+
+header = (f"Controls  ·  Account: {picked_label}  ·  "
+          f"Model: {model_labels[picked_model_idx]}")
+with top_bar(header):
+    c1, c2 = st.columns([3, 3])
+    with c1:
+        picked_label = st.selectbox(
+            "Account", labels,
+            index=labels.index(picked_label),
+            key="prp_profile",
+        )
+    with c2:
+        picked_model_idx = st.selectbox(
+            "Model", range(len(model_labels)),
+            index=picked_model_idx,
+            format_func=lambda i: model_labels[i],
+            key="prp_model_idx",
+            help="Haiku is fast. Sonnet is more accurate on complex diffs.",
+        )
+
+active = profiles[labels.index(picked_label)]
+model_id = model_ids[picked_model_idx]
 
 
 # ---------- main ----------

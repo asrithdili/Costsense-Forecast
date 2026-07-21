@@ -21,10 +21,12 @@ import streamlit as st
 
 from src.aws.org_spend import fetch_org_spend, top_service_by_account
 from src.aws.profiles import resolve_all
+from src.dashboard.nav import inject_css, top_bar
 
 
 st.set_page_config(page_title="CostSense · Org Impact", layout="wide",
                    page_icon="🏢")
+inject_css()
 
 st.title("Org-Level Impact")
 st.caption("Per-account spend across every linked account in the AWS "
@@ -32,34 +34,54 @@ st.caption("Per-account spend across every linked account in the AWS "
            "dimension on the management/payer profile.")
 
 
-# ---------- sidebar ----------
+# ---------- top control bar ----------
 
-with st.sidebar:
-    st.header("Management profile")
+with st.spinner("Resolving profiles…"):
     profiles = [p for p in resolve_all() if p.account_id]
-    if not profiles:
-        st.error("No AWS profiles reachable.")
-        st.stop()
-    # Prefer control-tower-style names if present
-    default_idx = 0
-    for i, p in enumerate(profiles):
-        if "control-tower" in p.profile or "tower" in p.profile or "master" in p.profile:
-            default_idx = i
-            break
-    labels = [p.label for p in profiles]
-    pick = st.selectbox("Profile", labels, index=default_idx,
-                        help="This should be the AWS Organizations management "
-                             "(payer) account — usually control-tower.")
-    active = profiles[labels.index(pick)]
+if not profiles:
+    st.error("No AWS profiles reachable.")
+    st.stop()
+default_idx = 0
+for i, p in enumerate(profiles):
+    if "control-tower" in p.profile or "tower" in p.profile or "master" in p.profile:
+        default_idx = i
+        break
+labels = [p.label for p in profiles]
 
-    st.divider()
-    days = st.slider("History window (days)", 7, 90, 30, step=7)
-    include_top_service = st.checkbox(
-        "Fetch top service per account", value=False,
-        help="One extra Cost Explorer call per linked account. Slower but "
-             "more useful when spotting which account is driving cost.",
-    )
-    run = st.button("Fetch org spend", type="primary")
+# Header shows current picks; expander body has the widgets.
+picked_label = st.session_state.get("orglvl_profile", labels[default_idx])
+if picked_label not in labels:
+    picked_label = labels[default_idx]
+picked_days = st.session_state.get("orglvl_days", 30)
+header = (f"Controls  ·  Account: {picked_label}  ·  "
+          f"History: {picked_days}d")
+with top_bar(header):
+    c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+    with c1:
+        picked_label = st.selectbox(
+            "Management profile", labels,
+            index=labels.index(picked_label),
+            key="orglvl_profile",
+            help="AWS Organizations management (payer) account — "
+                 "usually control-tower.",
+        )
+    with c2:
+        picked_days = st.slider(
+            "History (days)", 7, 90, picked_days, step=7,
+            key="orglvl_days",
+        )
+    with c3:
+        include_top_service = st.checkbox(
+            "Fetch top service", value=False,
+            help="One extra CE call per linked account. Slower but useful.",
+            key="orglvl_top_service",
+        )
+    with c4:
+        run = st.button("Fetch org spend", type="primary",
+                        use_container_width=True)
+
+active = profiles[labels.index(picked_label)]
+days = picked_days
 
 
 # ---------- main ----------
@@ -101,8 +123,8 @@ if run:
 
 
 if data is None:
-    st.info("Pick a profile in the sidebar (ideally the management/payer "
-            "account) and click **Fetch org spend**.")
+    st.info("Open **Controls** above, pick the management/payer profile, "
+            "and click **Fetch org spend**.")
     st.stop()
 
 if not data:

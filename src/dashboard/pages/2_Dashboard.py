@@ -40,9 +40,11 @@ from src.pr_scanner.repos import (
     repo_default_branch,
     repos_with_user_prs,
 )
+from src.dashboard.nav import inject_css, top_bar
 
 
 st.set_page_config(page_title="CostSense · forecast", layout="wide", page_icon="💸")
+inject_css()
 
 
 # ---------- cached AWS fetchers ----------
@@ -129,114 +131,145 @@ def _auto_score(account_id: str, profile: str) -> int:
 
 # ---------- sidebar ----------
 
-with st.sidebar:
-    st.header("Account")
+# ---------- top control bar ----------
 
-    with st.spinner("Resolving profiles…"):
-        profiles: list[ProfileInfo] = resolve_all()
-    reachable = [p for p in profiles if p.account_id]
+with st.spinner("Resolving profiles…"):
+    profiles: list[ProfileInfo] = resolve_all()
+reachable = [p for p in profiles if p.account_id]
+if not reachable:
+    st.error("No reachable AWS profiles. Run `aws sso login` first, then reload.")
+    st.stop()
 
-    if not reachable:
-        st.error("No reachable AWS profiles. Run `aws sso login` first, then reload.")
-        st.stop()
+labels = [p.label for p in reachable]
+picked_label = st.session_state.get("dash_profile", labels[0])
+if picked_label not in labels:
+    picked_label = labels[0]
+chosen = reachable[labels.index(picked_label)]
+active_profile = chosen.profile
+account_id = chosen.account_id
 
-    labels = [p.label for p in reachable]
-    pick = st.selectbox("Profile", labels)
-    chosen = reachable[labels.index(pick)]
-    active_profile = chosen.profile
-    account_id = chosen.account_id
+# Read defaults for other controls up front so the header can reflect them.
+_cutoff = st.session_state.get("dash_cutoff", date.today())
+_history_days = st.session_state.get("dash_history_days", 90)
+_model_choice = st.session_state.get("dash_model", "ewm")
 
-    st.divider()
-    cutoff = st.date_input("Cutoff", value=date.today(),
-                           help="Forecast starts the day AFTER this. History "
-                                "trains only on days STRICTLY before this.")
-    history_days = st.slider("History window (days)", 30, 180, 90, step=15)
-
-    model_choice = st.selectbox(
-        "Forecast model",
-        options=["ewm", "prophet"],
-        index=0,
-        help="EWM (exponentially-weighted mean) adapts to level shifts in a "
-             "few days — best default for volatile FinOps data (measured ~10% "
-             "lower WAPE than Prophet on real dev-account cost). Prophet "
-             "handles weekly seasonality when the series is stable enough to "
-             "warrant it.",
+# Service list (used both for dropdown + header).
+try:
+    svc_map = _fetch_by_service(active_profile, _cutoff.isoformat(), _history_days)
+except Exception:  # noqa: BLE001
+    svc_map = {}
+if svc_map:
+    svc_totals = sorted(
+        ((s, sum(a for _, a in v)) for s, v in svc_map.items()),
+        key=lambda x: -x[1],
     )
+    svc_options = ["(all services — total spend)"] + [
+        f"{s}  —  ${t:,.0f}" for s, t in svc_totals
+    ]
+else:
+    svc_options = ["(all services — total spend)"]
+_svc_pick = st.session_state.get("dash_service", svc_options[0])
+if _svc_pick not in svc_options:
+    _svc_pick = svc_options[0]
+_selected_service = (None if _svc_pick.startswith("(all")
+                     else _svc_pick.split("  —  ")[0])
 
-    # Enumerate top services in the window and let the user filter to one.
-    # Per-service forecasting typically has better WAPE than total, especially
-    # when the total is polluted by non-code-driven services (GuardDuty, KMS,
-    # trial credits expiring, etc.).
-    try:
-        svc_map = _fetch_by_service(active_profile, cutoff.isoformat(), history_days)
-    except Exception as e:  # noqa: BLE001
-        svc_map = {}
-        st.warning(f"could not list services: {e}")
-    if svc_map:
-        # sort by total spend descending
-        svc_totals = sorted(
-            ((s, sum(a for _, a in v)) for s, v in svc_map.items()),
-            key=lambda x: -x[1],
+# GitHub org + repos
+try:
+    _gh_user = gh_login()
+    orgs = list(gh_orgs())
+except Exception:  # noqa: BLE001
+    _gh_user = "?"
+    orgs = []
+
+default_org_idx = 0
+if orgs:
+    for _i, o in enumerate(orgs):
+        if o == "DiligentCorp":
+            default_org_idx = _i
+            break
+    gh_org_default = orgs[default_org_idx]
+else:
+    gh_org_default = "DiligentCorp"
+gh_org = st.session_state.get("dash_gh_org", gh_org_default)
+
+try:
+    suggested_full = list(repos_with_user_prs(gh_org)) if gh_org else []
+except Exception:  # noqa: BLE001
+    suggested_full = []
+short_names = [r.split("/", 1)[-1] for r in suggested_full]
+
+from src.pr_scanner.profile_repo_match import match_repos as _match
+default_repos = _match(active_profile, short_names) or short_names
+
+svc_hdr = _selected_service or "All services"
+header = (f"Controls  ·  Account: {picked_label}  ·  "
+          f"Cutoff: {_cutoff.isoformat()}  ·  "
+          f"History: {_history_days}d  ·  Scope: {svc_hdr}  ·  "
+          f"Model: {_model_choice}")
+
+with top_bar(header):
+    # Row 1 — AWS
+    r1c1, r1c2, r1c3, r1c4 = st.columns([3, 2, 2, 2])
+    with r1c1:
+        picked_label = st.selectbox(
+            "Account", labels,
+            index=labels.index(picked_label),
+            key="dash_profile",
         )
-        svc_options = ["(all services — total spend)"] + [
-            f"{s}  —  ${t:,.0f}" for s, t in svc_totals
-        ]
+    with r1c2:
+        cutoff = st.date_input(
+            "Cutoff", value=_cutoff, key="dash_cutoff",
+            help="Forecast starts the day AFTER this. History trains "
+                 "only on days STRICTLY before.",
+        )
+    with r1c3:
+        history_days = st.slider(
+            "History (days)", 30, 180, _history_days, step=15,
+            key="dash_history_days",
+        )
+    with r1c4:
+        model_choice = st.selectbox(
+            "Forecast model", options=["ewm", "prophet"],
+            index=0 if _model_choice == "ewm" else 1,
+            key="dash_model",
+            help="EWM adapts to level shifts fast (default). Prophet "
+                 "handles weekly seasonality when history is stable.",
+        )
+
+    # Row 2 — service filter
+    r2c1, _ = st.columns([6, 6])
+    with r2c1:
         pick_svc = st.selectbox(
-            "Service filter",
-            svc_options,
-            help="Forecast one service at a time for cleaner attribution. "
-                 "Lambda is a good starting point since PRs land there.",
+            "Service filter", svc_options,
+            index=svc_options.index(_svc_pick),
+            key="dash_service",
+            help="Forecast one service at a time for cleaner attribution.",
         )
-        selected_service = None if pick_svc.startswith("(all") else pick_svc.split("  —  ")[0]
-    else:
-        selected_service = None
+    selected_service = (None if pick_svc.startswith("(all")
+                        else pick_svc.split("  —  ")[0])
 
-    st.divider()
-    st.subheader("Repos to scan")
-    st.caption("PRs merged to the base branch bump the future forecast by "
-               "their estimated $ delta (via AWS Pricing API).")
-
-    try:
-        _gh_user = gh_login()
-        orgs = list(gh_orgs())
-    except Exception as e:  # noqa: BLE001
-        _gh_user = "?"
-        orgs = []
-        st.warning(f"gh CLI failed: {e}")
-
-    # Default the org to DiligentCorp when it's in the user's org list.
-    default_org_idx = 0
-    if orgs:
-        for _i, o in enumerate(orgs):
-            if o == "DiligentCorp":
-                default_org_idx = _i
-                break
-        gh_org = st.selectbox("GitHub org", orgs, index=default_org_idx)
-    else:
-        gh_org = st.text_input("GitHub org", value="DiligentCorp")
-
-    try:
-        suggested_full = list(repos_with_user_prs(gh_org)) if gh_org else []
-    except Exception as e:  # noqa: BLE001
-        suggested_full = []
-        st.warning(f"repo lookup failed: {e}")
-
-    # Show only the short repo name; keep `org/name` internally for the scanner.
-    short_names = [r.split("/", 1)[-1] for r in suggested_full]
-
-    # Default to the repo whose name matches the chosen AWS profile
-    # (e.g. dil-data-platform-dev → data-platform). Falls back to all repos.
-    from src.pr_scanner.profile_repo_match import match_repos as _match
-    default_selection = _match(active_profile, short_names) or short_names
-
-    st.caption(f"Signed in as **{_gh_user}** · {len(short_names)} repos "
-               "you've authored PRs in")
-    picked_short = st.multiselect(
-        "Repos", options=short_names, default=default_selection,
-    )
+    # Row 3 — GitHub
+    r3c1, r3c2, r3c3, r3c4 = st.columns([2, 4, 2, 2])
+    with r3c1:
+        if orgs:
+            gh_org = st.selectbox(
+                "GitHub org", orgs,
+                index=orgs.index(gh_org) if gh_org in orgs else default_org_idx,
+                key="dash_gh_org",
+            )
+        else:
+            gh_org = st.text_input(
+                "GitHub org", value=gh_org, key="dash_gh_org",
+            )
+    with r3c2:
+        picked_short = st.multiselect(
+            "Repos", options=short_names, default=default_repos,
+            key="dash_repos",
+        )
     selected_repos = [f"{gh_org}/{n}" for n in picked_short] if gh_org else []
 
-    # Base branch — enumerate branches that actually received merged PRs.
+    # Base branch dropdown
     branch_choices: list[str] = []
     if selected_repos:
         for r in selected_repos:
@@ -249,50 +282,60 @@ with st.sidebar:
                     branch_choices.append(default)
             except Exception:  # noqa: BLE001
                 continue
-    if branch_choices:
-        base_branch = st.selectbox("Base branch (PRs merged into)", branch_choices)
-    else:
-        base_branch = st.text_input("Base branch (PRs merged into)",
-                                    placeholder="e.g. main")
-    pr_lookback = st.slider("PR lookback (days)", 3, 30, 14, step=1)
-    analyzer_choice = st.selectbox(
-        "PR analyzer",
-        options=["hybrid", "llm", "regex"],
-        index=0,
-        help="hybrid = LLM reads the diff, falls back to regex+pricing if LLM "
-             "fails or returns no impact. llm = Bedrock Claude only. regex = "
-             "old path (fast, misses config tweaks).",
-    )
-    llm_model_choice = st.selectbox(
-        "Bedrock model",
-        options=[
-            "anthropic.claude-3-haiku-20240307-v1:0",
-            "us.anthropic.claude-sonnet-4-6",
-        ],
-        index=0,
-        disabled=(analyzer_choice == "regex"),
-        help="Haiku is fast and cheap (~$0.001/PR). Sonnet 4.6 is more accurate "
-             "for complex diffs.",
-    )
+    with r3c3:
+        if branch_choices:
+            base_branch = st.selectbox(
+                "Base branch", branch_choices, key="dash_base_branch",
+            )
+        else:
+            base_branch = st.text_input(
+                "Base branch", placeholder="e.g. main",
+                key="dash_base_branch_text",
+            )
+    with r3c4:
+        pr_lookback = st.slider(
+            "PR lookback (d)", 3, 30, 14, step=1, key="dash_pr_lookback",
+        )
 
-    st.divider()
-    st.caption("Trust check — past predictions")
-    show_replay = st.checkbox("Show walk-forward backtest on chart",
-                              value=True,
-                              help="At each origin, retrain the selected "
-                                   "model on data STRICTLY before that date "
-                                   "and predict forward. Overlay lets you "
-                                   "eyeball model accuracy against actuals.")
-    n_origins = st.slider("Backtest origins", 2, 12, 6, step=1,
-                          disabled=not show_replay)
-    stride_days = st.slider("Stride between origins (days)", 3, 14, 7, step=1,
-                            disabled=not show_replay)
+    # Row 4 — PR analyzer / model + backtest controls
+    r4c1, r4c2, r4c3, r4c4 = st.columns([2, 3, 2, 2])
+    with r4c1:
+        analyzer_choice = st.selectbox(
+            "PR analyzer", options=["hybrid", "llm", "regex"],
+            index=0, key="dash_analyzer",
+            help="hybrid = LLM + regex fallback. llm = Bedrock only. "
+                 "regex = fast, misses config tweaks.",
+        )
+    with r4c2:
+        llm_model_choice = st.selectbox(
+            "Bedrock model",
+            options=[
+                "us.anthropic.claude-sonnet-4-6",
+                "anthropic.claude-3-haiku-20240307-v1:0",
+            ],
+            index=0,
+            key="dash_pr_llm",
+            disabled=(analyzer_choice == "regex"),
+        )
+    with r4c3:
+        show_replay = st.checkbox(
+            "Show backtest", value=True, key="dash_show_backtest",
+            help="Walk-forward past predictions on the chart.",
+        )
+    with r4c4:
+        n_origins = st.slider(
+            "Backtest origins", 2, 12, 6, step=1,
+            disabled=not show_replay, key="dash_n_origins",
+        )
 
-    # No Run-forecast / Refresh-cache buttons. Dashboard reads the last
-    # persisted forecast JSON from disk on every render (cheap) and Cost
-    # Explorer history through the 10-min `_fetch_history` cache. If a
-    # fresh forecast is needed, generate it from another tool / cron.
-    do_forecast = False
+    r5c1, _ = st.columns([2, 10])
+    with r5c1:
+        stride_days = st.slider(
+            "Stride (d)", 3, 14, 7, step=1,
+            disabled=not show_replay, key="dash_stride",
+        )
+
+do_forecast = False
 
 
 # ---------- main pane ----------
