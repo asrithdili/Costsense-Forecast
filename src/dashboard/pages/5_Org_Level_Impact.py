@@ -21,12 +21,15 @@ import streamlit as st
 
 from src.aws.org_spend import fetch_org_spend, top_service_by_account
 from src.aws.profiles import resolve_all
-from src.dashboard.nav import inject_css, top_bar
+from src.dashboard.nav import (
+    inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
+)
 
 
 st.set_page_config(page_title="CostSense · Org Impact", layout="wide",
                    page_icon="🏢")
 inject_css()
+render_sidebar_header()  # Diligent card renders before any AWS calls
 
 st.title("Org-Level Impact")
 st.caption("Per-account spend across every linked account in the AWS "
@@ -82,6 +85,16 @@ with top_bar(header):
 
 active = profiles[labels.index(picked_label)]
 days = picked_days
+
+with st.sidebar:
+    render_sidebar_footer(
+        active_profile=active.profile,
+        account_id=active.account_id,
+        extra_rows=[
+            ("Window", f"{days}d"),
+            ("Top svc", "on" if include_top_service else "off"),
+        ],
+    )
 
 
 # ---------- main ----------

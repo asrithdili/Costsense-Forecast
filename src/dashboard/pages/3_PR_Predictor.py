@@ -16,12 +16,15 @@ import streamlit as st
 
 from src.ai_agent.agent import analyze_pr
 from src.aws.profiles import resolve_all
-from src.dashboard.nav import inject_css, top_bar
+from src.dashboard.nav import (
+    inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
+)
 
 
 st.set_page_config(page_title="CostSense · PR Predictor", layout="wide",
                    page_icon="🔮")
 inject_css()
+render_sidebar_header()  # Diligent card renders before any AWS calls
 
 MODEL_OPTIONS = [
     ("us.anthropic.claude-sonnet-4-6",         "Claude Sonnet 4.6"),
@@ -99,15 +102,28 @@ with top_bar(header):
 active = profiles[labels.index(picked_label)]
 model_id = model_ids[picked_model_idx]
 
+with st.sidebar:
+    render_sidebar_footer(
+        active_profile=active.profile,
+        account_id=active.account_id,
+        extra_rows=[("Model", model_labels[picked_model_idx])],
+    )
+
 
 # ---------- main ----------
 
+# Persist the last predicted URL + verdict across tab switches so users
+# don't have to re-predict when they come back. Keyed on (profile, url).
 pr_url = st.text_input(
     "GitHub PR URL",
     placeholder="https://github.com/org/repo/pull/123",
+    key="prp_last_url",
 )
 run = st.button("Predict cost impact", type="primary",
                 disabled=not pr_url.strip())
+
+verdict_key = f"prp_verdict::{active.profile}::{pr_url.strip()}"
+verdict = st.session_state.get(verdict_key)
 
 if run and pr_url.strip():
     with st.spinner("Fetching diff + querying AWS…"):
@@ -119,7 +135,9 @@ if run and pr_url.strip():
             st.error(f"agent failed: {e}")
             st.code(traceback.format_exc())
             st.stop()
+    st.session_state[verdict_key] = verdict
 
+if verdict is not None:
     if verdict.error:
         st.error(f"Agent error: {verdict.error}")
         st.stop()

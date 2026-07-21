@@ -1,14 +1,16 @@
-"""Shared top-of-page control bar.
+"""Shared top-of-page control bar + sidebar chrome for CostSense.
 
-Renders a single-row "Controls" strip above the page title with
-labeled chips: AWS Account + (optional) Bedrock Model. Matches the
-inline-controls pattern seen in dashboarding tools (Datadog, CloudZero
-etc.) where every control is a compact "Label value" pair on one line.
-
-The 5-page navigation stays in Streamlit's default sidebar list.
-
-Call `render(...)` early on each page. It returns the selected profile
-(and optionally model) so the rest of the page can use them.
+Rules:
+- **No app-wide color overrides.** Streamlit's theme system (System /
+  Light / Dark from the ⋮ menu) needs to work, so we don't lock the
+  background or text colors. Only structural CSS (spacing, borders,
+  layout) and per-widget accents live in `_CSS`.
+- The Diligent brand card renders as a real widget inside
+  `st.sidebar` via `render_sidebar_header()`; it's called from each
+  page's `with st.sidebar:` block. This is more reliable than
+  injecting from `inject_css()`.
+- The optional footer status card (`render_sidebar_footer()`) pins to
+  the bottom of the sidebar.
 """
 from __future__ import annotations
 
@@ -26,50 +28,152 @@ DEFAULT_MODELS = (
 )
 
 
+# Page-nav definition — path is relative to the entry file
+# `src/dashboard/app.py`. Streamlit's `st.page_link` picks up each page's
+# `page_icon` from its own `set_page_config` automatically, so we don't
+# duplicate it here.
+_PAGES = [
+    ("app.py",                          "CostSense AI"),
+    ("pages/2_Dashboard.py",            "Dashboard"),
+    ("pages/3_PR_Predictor.py",         "PR Predictor"),
+    ("pages/4_Anomalies.py",            "Anomalies"),
+    ("pages/5_Org_Level_Impact.py",     "Org Level Impact"),
+]
+
+
+# ---------------------------------------------------------------------------
+# CSS — kept structural. No `.stApp { background }` etc, so Streamlit's
+# theme (System / Light / Dark) drives the base colors.
+# ---------------------------------------------------------------------------
 _CSS = """
 <style>
-/* --- collapse the empty top header strip --- */
-[data-testid="stHeader"] { background: transparent; height: 0; }
-[data-testid="stToolbar"] { right: 8px; top: 8px; }
+/* Slim the empty header strip a bit but leave its theme-derived color. */
+[data-testid="stHeader"] { min-height: 42px; }
+[data-testid="stToolbar"] { right: 12px; top: 8px; }
 
-/* --- app polish --- */
-.stApp { background: #0e1015; }
-section[data-testid="stSidebar"] > div {
-  background: #14161d;
-  border-right: 1px solid #23262f;
-}
-h1, h2, h3, h4 { letter-spacing: -0.01em; color: #f5f6fa; }
 .main .block-container {
-  padding-top: 0.5rem !important;
+  padding-top: 1rem !important;
   padding-bottom: 3rem;
   max-width: 1400px;
 }
 
-/* --- sidebar page nav — polish the default --- */
-[data-testid="stSidebarNav"] { padding-top: 0.5rem; }
+/* Footer pinned to bottom of the sidebar (still works — plain flex). */
+section[data-testid="stSidebar"] > div {
+  display: flex;
+  flex-direction: column;
+}
+.cs-sidebar-footer { margin-top: auto; }
+
 [data-testid="stSidebarNav"] ul { padding-left: 0; }
 [data-testid="stSidebarNav"] li a {
   border-radius: 8px;
   padding: 6px 12px !important;
   margin: 2px 6px !important;
-  color: #c7cbd6 !important;
   font-weight: 500 !important;
 }
-[data-testid="stSidebarNav"] li a:hover {
-  background: #1c1f28 !important;
-  color: #ffffff !important;
-}
-[data-testid="stSidebarNav"] li a[aria-current="page"] {
-  background: #232838 !important;
-  color: #ffffff !important;
-  box-shadow: inset 0 0 0 1px #3b4152;
+
+/* --- "Pages" section label between the Diligent card and the links --- */
+.cs-pages-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 4px 4px 2px 4px;
+  margin: 4px 0 4px 0;
+  opacity: 0.55;
 }
 
-/* --- top control expander — compact header --- */
-[data-testid="stExpander"] {
-  border: 1px solid #1c2a38 !important;
+/* Separator between page links and the rest of the sidebar content. */
+.cs-nav-sep {
+  height: 1px;
+  margin: 12px 4px 8px 4px;
+  background: rgba(120, 120, 140, 0.22);
+}
+
+/* Style st.page_link entries in the sidebar as compact nav pills. */
+section[data-testid="stSidebar"] [data-testid="stPageLink"] {
+  padding: 0 !important;
+}
+section[data-testid="stSidebar"] [data-testid="stPageLink"] a {
+  padding: 6px 12px !important;
+  margin: 1px 4px !important;
   border-radius: 8px !important;
-  background: #0f1620 !important;
+  font-size: 14px !important;
+  font-weight: 500 !important;
+}
+
+/* --- Diligent brand bar — rendered at the top of the MAIN content
+   area (not the sidebar) so we're not fighting Streamlit's
+   stSidebarNav DOM ordering.
+   Fixed-position under Streamlit's header, spans the full main-area
+   width regardless of `.block-container` centering. */
+/* --- Diligent brand card — rendered as a normal sidebar block. Sits
+   below Streamlit's page-nav (natural DOM order). Clean, professional,
+   no absolute positioning. --- */
+.cs-brandbar {
+  padding: 14px 16px 14px 16px;
+  margin: 4px 0 12px 0;
+  border: 1px solid rgba(120, 120, 140, 0.18);
+  border-radius: 10px;
+  background: linear-gradient(180deg,
+              rgba(124, 92, 255, 0.06) 0%,
+              rgba(20, 22, 29, 0.0) 100%);
+  text-align: center;
+}
+.cs-brandbar .cs-bb-row1 {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  margin-bottom: 6px;
+}
+.cs-brandbar .cs-bb-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: linear-gradient(135deg, #7c5cff, #4dabf7);
+  box-shadow: 0 0 8px rgba(124, 92, 255, 0.6);
+  flex-shrink: 0;
+}
+.cs-brandbar .cs-bb-name {
+  font-weight: 800;
+  font-size: 16px;
+  letter-spacing: -0.015em;
+  line-height: 1;
+}
+.cs-brandbar .cs-bb-sub {
+  display: block;
+  font-weight: 600;
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  opacity: 0.55;
+  line-height: 1;
+}
+.cs-diligent-card .cs-dc-wordmark {
+  display: flex; align-items: center; gap: 10px;
+  font-weight: 800;
+  font-size: 18px;
+  letter-spacing: -0.015em;
+  line-height: 1;
+}
+.cs-diligent-card .cs-dc-dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: linear-gradient(135deg, #7c5cff, #4dabf7);
+  box-shadow: 0 0 10px rgba(124, 92, 255, 0.6);
+}
+.cs-diligent-card .cs-dc-sub {
+  opacity: 0.55;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  margin-top: 5px;
+  margin-left: 19px;
+}
+
+/* --- Controls-bar expander polish --- */
+[data-testid="stExpander"] {
+  border: 1px solid rgba(120, 120, 140, 0.22) !important;
+  border-radius: 8px !important;
   margin-bottom: 16px !important;
 }
 [data-testid="stExpander"] summary,
@@ -77,124 +181,79 @@ h1, h2, h3, h4 { letter-spacing: -0.01em; color: #f5f6fa; }
   padding: 6px 14px !important;
   min-height: 34px !important;
   font-size: 12.5px !important;
-  color: #b4b9c5 !important;
   font-weight: 500 !important;
-  letter-spacing: 0.01em;
-}
-[data-testid="stExpander"] summary:hover,
-[data-testid="stExpander"] details > summary:hover {
-  color: #ffffff !important;
-  background: #131b26 !important;
-}
-[data-testid="stExpander"] p {
-  font-size: 12.5px !important;
-  margin: 0 !important;
-  color: inherit !important;
-}
-[data-testid="stExpander"] svg { color: #6f7686 !important; }
-
-/* --- top control bar wrapper (inside the expander) --- */
-.cs-controls-wrap {
-  background: transparent;
-  border: none;
-  border-radius: 0;
-  margin-bottom: 4px;
-  padding: 0;
-}
-/* Inner grid so labels + selectboxes sit inline like tabs. */
-.cs-controls-wrap [data-testid="column"] {
-  padding: 0 !important;
 }
 .cs-controls-title {
-  display: flex;
-  align-items: center;
-  height: 100%;
-  padding: 0 18px;
-  color: #d3d7df;
-  font-weight: 600;
-  font-size: 13px;
+  display: flex; align-items: center; height: 100%;
+  padding: 0 12px;
+  font-weight: 600; font-size: 13px;
+  opacity: 0.85;
+  white-space: nowrap; user-select: none;
+}
+
+/* --- Sidebar footer status card --- */
+.cs-sidebar-footer {
+  margin-top: auto;
+  padding: 14px 12px 16px 12px;
+  border-top: 1px solid rgba(120, 120, 140, 0.22);
+  font-size: 11.5px;
+  line-height: 1.45;
+  opacity: 0.85;
+}
+.cs-sidebar-footer .cs-sf-title {
+  display: flex; align-items: center; gap: 8px;
+  font-weight: 700;
+  font-size: 12.5px;
   letter-spacing: 0.02em;
-  border-right: 1px solid #1c2a38;
-  white-space: nowrap;
-  user-select: none;
+  margin-bottom: 6px;
+  opacity: 1;
 }
-
-/* Selectbox layout — put the label inline to the LEFT of the value,
-   the way the "Controls" reference bar does. */
-.cs-controls-wrap [data-testid="stSelectbox"] {
-  padding: 6px 16px !important;
-  border-right: 1px solid #1c2a38;
-  min-width: 0;
+.cs-sidebar-footer .cs-sf-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: linear-gradient(135deg, #7c5cff, #4dabf7);
+  box-shadow: 0 0 8px rgba(124, 92, 255, 0.55);
 }
-.cs-controls-wrap [data-testid="stSelectbox"] > label {
-  display: inline-block !important;
-  color: #d3d7df !important;
-  font-size: 13px !important;
-  font-weight: 600 !important;
-  text-transform: none !important;
-  letter-spacing: 0.01em !important;
-  margin: 0 !important;
-  padding: 0 !important;
-  min-height: 0 !important;
+.cs-sidebar-footer .cs-sf-row {
+  display: flex; justify-content: space-between; gap: 8px;
+  padding: 2px 0;
 }
-.cs-controls-wrap [data-testid="stSelectbox"] > label p {
-  color: #d3d7df !important;
-  font-size: 13px !important;
-  font-weight: 600 !important;
-  margin: 0 !important;
+.cs-sidebar-footer .cs-sf-row span:last-child {
+  text-align: right; word-break: break-all; opacity: 0.85;
 }
-.cs-controls-wrap [data-testid="stSelectbox"] div[data-baseweb="select"] {
-  margin-top: 2px !important;
-}
-.cs-controls-wrap [data-testid="stSelectbox"] div[data-baseweb="select"] > div {
-  background: transparent !important;
-  border: none !important;
-  min-height: 26px !important;
-  padding: 0 !important;
-  color: #8fb9ff !important;
-  font-size: 13px !important;
-  font-weight: 400 !important;
-  box-shadow: none !important;
-}
-.cs-controls-wrap [data-testid="stSelectbox"] div[data-baseweb="select"] > div:hover {
-  background: transparent !important;
-}
-/* the little chevron */
-.cs-controls-wrap [data-testid="stSelectbox"] div[data-baseweb="select"] svg {
-  color: #8fb9ff !important;
-  fill: #8fb9ff !important;
-}
-/* Remove the border on the last column so the bar ends cleanly. */
-.cs-controls-wrap > div > div > div:last-child [data-testid="stSelectbox"] {
-  border-right: none;
-}
-
-/* --- metric cards --- */
-[data-testid="stMetric"] {
-  background: #181b23;
-  padding: 14px 16px;
-  border-radius: 10px;
-  border: 1px solid #23262f;
-}
-[data-testid="stMetricLabel"] { color: #8a90a0; font-size: 12px; letter-spacing: 0.02em; }
-[data-testid="stMetricValue"] { color: #f5f6fa; font-weight: 600; }
-
-/* --- primary buttons --- */
-.stButton > button[data-testid="baseButton-primary"] {
-  background: linear-gradient(180deg, #6b4dff, #5a3fe6);
-  border: 1px solid #7c5cff;
-  color: #ffffff;
+.cs-sidebar-footer .cs-sf-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(120, 200, 120, 0.14);
+  border: 1px solid rgba(120, 200, 120, 0.4);
+  color: #7cc580;
+  font-size: 10.5px;
   font-weight: 600;
+  letter-spacing: 0.02em;
 }
-
-/* --- chat bubbles --- */
-[data-testid="stChatMessage"] {
-  background: #181b23;
-  border: 1px solid #23262f;
-  border-radius: 10px;
+.cs-sidebar-footer .cs-sf-pill::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%;
+  background: #85c37b; box-shadow: 0 0 6px rgba(133, 195, 123, 0.7);
+}
+.cs-sidebar-footer .cs-sf-caption {
+  font-size: 10.5px; margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(120, 120, 140, 0.22);
+  opacity: 0.7;
 }
 </style>
 """
+
+
+_TOP_BRAND_HTML = (
+    '<div class="cs-brandbar">'
+    '<div class="cs-bb-row1">'
+    '<span class="cs-bb-dot"></span>'
+    '<span class="cs-bb-name">Diligent</span>'
+    '</div>'
+    '<span class="cs-bb-sub">CostSense · AI FinOps</span>'
+    '</div>'
+)
 
 
 @dataclass
@@ -208,19 +267,74 @@ def inject_css() -> None:
     st.markdown(_CSS, unsafe_allow_html=True)
 
 
+def render_sidebar_header() -> None:
+    """Render the Diligent brand card into the sidebar.
+
+    Streamlit's built-in page-nav renders first (framework
+    behavior). Our card sits right below it. That's the reliable,
+    non-fragile DOM order — every attempt to force our card ABOVE
+    the nav failed on this Streamlit version, so we accept the
+    natural order and make the card look great.
+    """
+    st.sidebar.markdown(_TOP_BRAND_HTML, unsafe_allow_html=True)
+
+
+def render_top_brand() -> None:
+    """Backwards-compat alias."""
+    render_sidebar_header()
+
+
 def top_bar(header: str):
-    """Context manager that returns a collapsed top-bar expander for a
-    page to fill with its own controls.
+    """Context manager that returns a collapsed top-bar expander.
 
         with top_bar("Controls · Dashboard"):
-            col1, col2 = st.columns(2)
-            with col1: st.selectbox(...)
-            with col2: st.slider(...)
+            ...
 
-    Injects the shared CSS and dark-theme polish automatically.
+    Injects the shared CSS automatically.
     """
     inject_css()
     return st.expander(header, expanded=False)
+
+
+def render_sidebar_footer(
+    *,
+    active_profile: str | None = None,
+    account_id: str | None = None,
+    extra_rows: list[tuple[str, str]] | None = None,
+    caption: str = "Read-only access · Secrets auto-scrubbed",
+) -> None:
+    """Pin a compact status card to the bottom of the sidebar.
+
+    Call INSIDE a `with st.sidebar:` block at the very end of the
+    sidebar rendering.
+    """
+    rows: list[tuple[str, str]] = []
+    if account_id:
+        rows.append(("Account", account_id))
+    if active_profile:
+        rows.append(("Profile", active_profile))
+    if extra_rows:
+        rows.extend(extra_rows)
+    row_html = "".join(
+        f'<div class="cs-sf-row"><span>{label}</span>'
+        f'<span>{value}</span></div>'
+        for label, value in rows
+    )
+    st.markdown(
+        f"""
+        <div class="cs-sidebar-footer">
+          <div class="cs-sf-title">
+            <span class="cs-sf-dot"></span>
+            <span>CostSense</span>
+            <span style="flex:1"></span>
+            <span class="cs-sf-pill">Live</span>
+          </div>
+          {row_html}
+          <div class="cs-sf-caption">{caption}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def render(
@@ -230,24 +344,18 @@ def render(
     default_model_index: int = 0,
     key_prefix: str = "topbar",
 ) -> TopBarSelection:
-    """Render the shared top control bar and return the selection.
+    """Compact top bar for pages that only need Account + optional Model.
 
-    Controls live inside a collapsed expander so they don't consume
-    vertical space when the user isn't changing them. The expander
-    header always shows the current Account (and Model, if enabled) so
-    the current context is visible at a glance without expanding.
-
-    Calls `st.stop()` if no AWS profiles resolve.
+    Renders inside `top_bar()` — a collapsed expander whose header shows
+    the current selections. Returns the selected profile + model.
     """
-    st.markdown(_CSS, unsafe_allow_html=True)
+    inject_css()
 
     profiles = [p for p in resolve_all() if p.account_id]
     if not profiles:
         st.error("No AWS profiles reachable.")
         st.stop()
 
-    # Read the current selection from session_state (so the expander
-    # header reflects it BEFORE expanding). Fallback to first option.
     labels = [p.label for p in profiles]
     picked_label = st.session_state.get(f"{key_prefix}_profile", labels[0])
     if picked_label not in labels:
@@ -268,29 +376,16 @@ def render(
         header = f"Controls  ·  Account: {picked_label}"
 
     with st.expander(header, expanded=False):
-        st.markdown('<div class="cs-controls-wrap">', unsafe_allow_html=True)
         if include_model:
-            col_title, col_account, col_model, _spacer = st.columns(
-                [0.9, 3.5, 3.5, 4.1], gap="small",
-            )
+            col_account, col_model = st.columns([1, 1], gap="small")
         else:
-            col_title, col_account, _spacer = st.columns(
-                [0.9, 3.5, 7.6], gap="small",
-            )
-
-        with col_title:
-            st.markdown(
-                '<div class="cs-controls-title">Controls</div>',
-                unsafe_allow_html=True,
-            )
+            col_account, _spacer = st.columns([1, 1], gap="small")
 
         with col_account:
             picked_label = st.selectbox(
-                "Account",
-                labels,
+                "Account", labels,
                 index=labels.index(picked_label),
                 key=f"{key_prefix}_profile",
-                label_visibility="visible",
             )
 
         if include_model:
@@ -301,9 +396,7 @@ def render(
                     index=picked_model_idx,
                     format_func=lambda i: model_labels[i],
                     key=f"{key_prefix}_model",
-                    label_visibility="visible",
                 )
-        st.markdown('</div>', unsafe_allow_html=True)
 
     active = profiles[labels.index(picked_label)]
     model_id = model_ids[picked_model_idx] if include_model else None

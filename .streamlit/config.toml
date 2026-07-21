@@ -2,3 +2,11 @@
 # Hides the "Deploy" button in the top-right toolbar (Streamlit Community Cloud
 # shortcut, not used by this app). The "⋮" menu and everything else is unaffected.
 toolbarMode = "viewer"
+# Suppress the "Show error details / warnings" and file-change chatter in the
+# UI so demos aren't cluttered by Streamlit toasts.
+showErrorDetails = false
+
+[server]
+# Silently rerun on every file save instead of showing the
+# "File change. Rerun / Always rerun" toast at the top-right.
+runOnSave = true
