@@ -69,7 +69,7 @@ def walk_forward(
         if train.empty:
             continue
         eligible_steps = (
-            [s for s in pr_steps if s.from_day < origin] if pr_steps else None
+            [s for s in pr_steps if s.from_day < origin] if pr_steps else []
         )
         try:
             if model == "ewm":
@@ -84,6 +84,21 @@ def walk_forward(
                 fc = forecast_next_7_days(train, cutoff=origin)
         except ValueError:
             continue
+        # Apply step overlays to EWM too — walk_forward historically only
+        # threaded pr_steps into the Prophet path via forecast_with_pr_regressor
+        # (line above). For EWM, layer the cumulative step $ onto each
+        # predicted day. This mirrors what `run_daily.adjust()` does for
+        # the persisted forecast, so backtest points and the live future
+        # line stay comparable.
+        if model == "ewm" and eligible_steps:
+            for p in fc[:horizon_days]:
+                cum = sum(
+                    s.delta_usd for s in eligible_steps
+                    if s.from_day <= p.target_date
+                )
+                p.predicted_usd = max(0.0, p.predicted_usd + cum)
+                p.lower_usd = max(0.0, p.lower_usd + cum)
+                p.upper_usd = max(0.0, p.upper_usd + cum)
         for p in fc[:horizon_days]:
             out.append(ReplayPoint(
                 origin_date=origin,
