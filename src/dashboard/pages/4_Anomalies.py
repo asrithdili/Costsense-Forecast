@@ -28,10 +28,12 @@ from src.ai_agent.repo_sweep import sweep_repos
 from src.ai_agent.repo_sweep import sweep_to_summary as repo_summary
 from src.aws.profiles import resolve_all
 from src.pr_scanner.repos import gh_login, gh_orgs, repos_with_user_prs
+from src.dashboard.nav import inject_css, top_bar
 
 
 st.set_page_config(page_title="CostSense · Anomalies", layout="wide",
                    page_icon="🚨")
+inject_css()
 
 st.title("Anomalies & Recommendations")
 st.caption("Full-repo + full-AWS sweep. Ranked list of concrete cost-cutting "
@@ -39,69 +41,109 @@ st.caption("Full-repo + full-AWS sweep. Ranked list of concrete cost-cutting "
            "AWS + GitHub data.")
 
 
-# ---------- sidebar ----------
+# ---------- top control bar ----------
 
-with st.sidebar:
-    st.header("AWS account")
+with st.spinner("Resolving profiles…"):
     profiles = [p for p in resolve_all() if p.account_id]
-    if not profiles:
-        st.error("No AWS profiles reachable.")
-        st.stop()
-    labels = [p.label for p in profiles]
-    pick = st.selectbox("Profile", labels)
-    active = profiles[labels.index(pick)]
+if not profiles:
+    st.error("No AWS profiles reachable.")
+    st.stop()
+labels = [p.label for p in profiles]
 
-    st.divider()
-    st.header("Repos to scan")
-    try:
-        orgs = list(gh_orgs())
-        _gh_user = gh_login()
-    except Exception:  # noqa: BLE001
-        orgs = []
-        _gh_user = "?"
-    # Default the org to DiligentCorp when it's in the user's org list.
+try:
+    orgs = list(gh_orgs())
+    _gh_user = gh_login()
+except Exception:  # noqa: BLE001
+    orgs = []
+    _gh_user = "?"
+
+MODEL_OPTIONS = [
+    ("us.anthropic.claude-sonnet-4-6",         "Claude Sonnet 4.6"),
+    ("anthropic.claude-3-haiku-20240307-v1:0", "Claude 3 Haiku"),
+]
+model_ids = [mid for mid, _ in MODEL_OPTIONS]
+model_labels = [name for _, name in MODEL_OPTIONS]
+
+picked_label = st.session_state.get("anom_profile", labels[0])
+if picked_label not in labels:
+    picked_label = labels[0]
+picked_model_idx = st.session_state.get("anom_model_idx", 0)
+if not (0 <= picked_model_idx < len(model_ids)):
+    picked_model_idx = 0
+
+header = (f"Controls  ·  Account: {picked_label}  ·  "
+          f"Model: {model_labels[picked_model_idx]}")
+
+# Compute default repo selection BEFORE the expander body renders so the
+# multiselect widget has the right default when it first appears.
+active_preview = profiles[labels.index(picked_label)]
+if orgs:
     default_org_idx = 0
-    if orgs:
-        for i, o in enumerate(orgs):
-            if o == "DiligentCorp":
-                default_org_idx = i
-                break
-        gh_org = st.selectbox("GitHub org", orgs, index=default_org_idx)
-    else:
-        gh_org = st.text_input("GitHub org", value="DiligentCorp")
+    for i, o in enumerate(orgs):
+        if o == "DiligentCorp":
+            default_org_idx = i
+            break
+    org_preview = st.session_state.get("anom_gh_org", orgs[default_org_idx])
+else:
+    org_preview = st.session_state.get("anom_gh_org_text", "DiligentCorp")
 
-    try:
-        suggested_full = list(repos_with_user_prs(gh_org)) if gh_org else []
-    except Exception:  # noqa: BLE001
-        suggested_full = []
+try:
+    suggested_full_preview = list(repos_with_user_prs(org_preview)) if org_preview else []
+except Exception:  # noqa: BLE001
+    suggested_full_preview = []
+short_names_preview = [r.split("/", 1)[-1] for r in suggested_full_preview]
 
-    # Show only the short repo name in the multi-select; keep the full
-    # `org/name` internally for the scanner.
-    short_names = [r.split("/", 1)[-1] for r in suggested_full]
+from src.pr_scanner.profile_repo_match import match_repos as _match
+default_repos = _match(active_preview.profile, short_names_preview) or short_names_preview
 
-    # Default to the repo whose name matches the chosen AWS profile
-    # (e.g. dil-data-platform-dev -> data-platform). Falls back to all
-    # repos when no match (team / shared / control-tower profiles).
-    from src.pr_scanner.profile_repo_match import match_repos as _match
-    default_selection = _match(active.profile, short_names) or short_names
+with top_bar(header):
+    c1, c2 = st.columns([3, 3])
+    with c1:
+        picked_label = st.selectbox(
+            "Account", labels,
+            index=labels.index(picked_label),
+            key="anom_profile",
+        )
+    with c2:
+        picked_model_idx = st.selectbox(
+            "Bedrock model", range(len(model_labels)),
+            index=picked_model_idx,
+            format_func=lambda i: model_labels[i],
+            key="anom_model_idx",
+        )
 
-    picked_short = st.multiselect(
-        "Repos", options=short_names, default=default_selection,
-    )
-    selected_repos = [f"{gh_org}/{n}" for n in picked_short] if gh_org else []
+    c3, c4 = st.columns([2, 5])
+    with c3:
+        if orgs:
+            gh_org = st.selectbox(
+                "GitHub org", orgs,
+                index=orgs.index(org_preview) if org_preview in orgs else 0,
+                key="anom_gh_org",
+            )
+        else:
+            gh_org = st.text_input(
+                "GitHub org", value=org_preview,
+                key="anom_gh_org_text",
+            )
+    with c4:
+        try:
+            suggested_full = list(repos_with_user_prs(gh_org)) if gh_org else []
+        except Exception:  # noqa: BLE001
+            suggested_full = []
+        short_names = [r.split("/", 1)[-1] for r in suggested_full]
+        default_selection = _match(active_preview.profile, short_names) or short_names
+        picked_short = st.multiselect(
+            "Repos to scan", options=short_names,
+            default=default_selection,
+            key="anom_repos",
+        )
 
-    st.divider()
-    model_id = st.selectbox(
-        "Bedrock model",
-        index=1,
-        options=[
-            "anthropic.claude-3-haiku-20240307-v1:0",
-            "us.anthropic.claude-sonnet-4-6",
-        ],
-    )
+    run_btn = st.button("Analyze", type="primary",
+                        use_container_width=True)
 
-    st.divider()
-    run_btn = st.button("Analyze", type="primary")
+active = profiles[labels.index(picked_label)]
+model_id = model_ids[picked_model_idx]
+selected_repos = [f"{gh_org}/{n}" for n in picked_short] if gh_org else []
 
 
 # ---------- session cache ----------
