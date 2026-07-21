@@ -75,6 +75,9 @@ def walk_forward(
             if model == "ewm":
                 fc = _ewm_forecast(train, cutoff=origin,
                                    horizon_days=horizon_days)
+            elif model == "aws":
+                # GetCostForecast is point-in-time only — no historical replay.
+                continue
             elif eligible_steps:
                 fc, _ = forecast_with_pr_regressor(
                     train, cutoff=origin, pr_steps=eligible_steps,

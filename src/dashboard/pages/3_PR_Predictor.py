@@ -67,7 +67,7 @@ st.caption("Paste a GitHub PR URL. The agent reads the diff, queries the "
 with st.spinner("Resolving profiles…"):
     profiles = [p for p in resolve_all() if p.account_id]
 if not profiles:
-    st.error("No AWS profiles reachable. `aws sso login` first.")
+    st.error("No AWS profiles reachable. Run `aws sso login` or launch via `aws-vault exec <profile> --` first.")
     st.stop()
 labels = [p.label for p in profiles]
 model_ids = [mid for mid, _ in MODEL_OPTIONS]

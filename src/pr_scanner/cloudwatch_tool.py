@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any
 
-import boto3
+from src.aws.session import make_session
 
 
 DEFAULT_METRICS_REGION = "us-east-1"
@@ -28,7 +28,7 @@ class MetricPoint:
 
 @lru_cache(maxsize=8)
 def _cw_client(profile: str | None, region: str):
-    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+    session = make_session(profile)
     return session.client("cloudwatch", region_name=region)
 
 

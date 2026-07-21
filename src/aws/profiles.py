@@ -13,6 +13,8 @@ import os
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, ProfileNotFound
 
+from src.aws.session import make_session
+
 
 @dataclass(frozen=True)
 class ProfileInfo:
@@ -44,7 +46,7 @@ def list_profiles() -> tuple[str, ...]:
 @lru_cache(maxsize=32)
 def resolve(profile: str) -> ProfileInfo:
     try:
-        session = boto3.Session(profile_name=profile)
+        session = make_session(profile)
         acct = session.client("sts").get_caller_identity()["Account"]
         return ProfileInfo(profile=profile, account_id=acct)
     except (BotoCoreError, ClientError) as e:

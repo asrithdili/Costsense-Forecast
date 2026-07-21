@@ -16,8 +16,9 @@ from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any
 
-import boto3
 from botocore.exceptions import BotoCoreError, ClientError
+
+from src.aws.session import make_session
 
 
 # ---------------------------------------------------------------------------
@@ -26,7 +27,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 @lru_cache(maxsize=32)
 def _session(profile: str | None):
-    return boto3.Session(profile_name=profile) if profile else boto3.Session()
+    return make_session(profile)
 
 
 @lru_cache(maxsize=64)

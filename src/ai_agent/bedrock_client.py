@@ -8,8 +8,9 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-import boto3
 from botocore.config import Config
+
+from src.aws.session import make_session
 
 
 DEFAULT_REGION = "us-west-2"
@@ -23,7 +24,6 @@ _BEDROCK_CONFIG = Config(
 
 @lru_cache(maxsize=8)
 def make_client(profile: str | None, region: str = DEFAULT_REGION):
-    session = (boto3.Session(profile_name=profile)
-               if profile else boto3.Session())
+    session = make_session(profile)
     return session.client("bedrock-runtime", region_name=region,
                           config=_BEDROCK_CONFIG)

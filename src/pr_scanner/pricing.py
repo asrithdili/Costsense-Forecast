@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-import boto3
+from src.aws.session import make_session
 
 
 CACHE_PATH = Path(__file__).resolve().parents[2] / "data" / "pricing_cache.json"
@@ -50,7 +50,7 @@ def _save_cache(cache: dict) -> None:
 
 @lru_cache(maxsize=1)
 def _pricing_client(profile: str | None):
-    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+    session = make_session(profile)
     # Pricing endpoint only in us-east-1 / ap-south-1
     return session.client("pricing", region_name="us-east-1")
 
