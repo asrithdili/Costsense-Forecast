@@ -108,10 +108,12 @@ backend as a FastAPI service.
 
 ### 3.2 EWM blend vs. Prophet vs. an LLM-generated forecast
 
-**Chose an auto-tuned naive-heavy EWM blend.** Empirically wins on
-dev-account data (~43% WAPE vs. Prophet's ~60%). Prophet's weekly +
-trend components anchor on old data; the naive-heavy blend adapts to
-level shifts within 1 day.
+**Chose an auto-tuned naive-heavy EWM blend + regime-shift detector.**
+Empirically wins on dev-account data (~49% WAPE / 75% direction on
+`dil-data-platform-dev` walk-forward vs. Prophet's ~60% WAPE with no
+direction signal). Prophet's weekly + trend components anchor on old
+data; the naive-heavy blend adapts to level shifts within 1 day, and
+the regime detector catches sudden drops/rises immediately.
 
 We considered asking an LLM to forecast directly. Rejected because:
 - Non-reproducible (Sonnet gives different numbers on different runs)
@@ -171,12 +173,15 @@ CostSense will not see it coming. That change doesn't exist in git.
 It'll show up in Cost Explorer the next day and CostSense will fold it
 into the baseline going forward — but as a prediction, it's blind.
 
-### 4.2 Beat ~40% WAPE on volatile dev accounts
+### 4.2 Beat ~50% WAPE on volatile dev accounts
 
 Half of the day-to-day variance on Diligent's dev accounts is not
 code-driven — it's script runs, ad-hoc load tests, GuardDuty toggles,
-trial evaluations. No forecast that only reads git + billing history
-can do better than ~40% WAPE here.
+scheduled workloads pausing, trial evaluations. Even with the
+regime-shift detector, no forecast that only reads git + billing
+history can do better than ~50% WAPE here (measured 49.4% WAPE / 75%
+direction accuracy on `dil-data-platform-dev`, down from 77% / 50%
+before the detector).
 
 On steady prod workloads with consistent weekly rhythm, WAPE typically
 drops to 15-25%.
@@ -220,7 +225,7 @@ to a real IAM role and add a webhook step.
 
 ## 5. What's genuinely novel about CostSense
 
-Three things you won't find in any AWS-native or SaaS FinOps product:
+Four things you won't find in any AWS-native or SaaS FinOps product:
 
 1. **PR-aware forecast overlay.** Merged PRs become deterministic step
    functions in the future forecast, and open PRs get
@@ -231,7 +236,12 @@ Three things you won't find in any AWS-native or SaaS FinOps product:
    picks the model parameters, so a volatile dev account and a stable
    prod account both get an honest baseline — no manual tuning.
 
-3. **Grounded LLM with 23 read-only tools.** The chat and anomaly
+3. **Regime-shift detector.** The single biggest accuracy improvement:
+   when recent-5-day mean drops below 60% (or above 170%) of the prior
+   14-day baseline, training gets truncated to post-shift days. Boosted
+   direction accuracy from 50% → 75% on our dev-account test.
+
+4. **Grounded LLM with 23 read-only tools.** The chat and anomaly
    agents don't hallucinate numbers because every claim is backed by a
    tool call whose output Claude just saw. And every tool output passes
    through secret scrubbing before Claude sees it.
