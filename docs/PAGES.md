@@ -14,9 +14,14 @@ Streamlit builds the sidebar from filenames. The nav order is:
 4. **Anomalies** — full-repo + full-AWS sweep
 5. **Org Level Impact** — per-account rollup across the AWS Organization
 
-Every page has its own AWS profile picker in the sidebar. Switching
-profiles switches everything: which account is queried, which data is
-loaded from disk.
+Every page has its own **Controls** strip at the very top (a
+collapsible expander). The header always shows the current selections
+(e.g. `Controls · Account: dil-data-platform-dev · Model: Claude
+Sonnet 4.6`) so you can see the active context without expanding.
+Click it to switch the AWS profile, model, or any other input.
+
+Switching account switches everything: which data is queried, which
+saved forecast JSON is loaded from disk.
 
 ---
 
@@ -65,18 +70,20 @@ The forecasting home. Shows past cost, next-7-day prediction, walk-forward
 backtest for credibility, and a deterministic explanation of what the
 future will look like.
 
-### Sidebar controls
-- **Profile** — which AWS account
+### Top-bar controls (click **Controls ▸** at the top to expand)
+- **Account** — which AWS profile / account
 - **Cutoff** — the "as of" date (defaults to today)
-- **History window (days)** — how far back to train (30-180d)
+- **History (days)** — how far back to train (30-180d)
 - **Forecast model** — `ewm` (default, empirically best) or `prophet`
 - **Service filter** — forecast total spend or a single service
-- **Repos to scan** — GitHub repos whose PRs affect this forecast
+- **GitHub org** — defaults to `DiligentCorp`
+- **Repos** — GitHub repos whose PRs affect this forecast
 - **Base branch** — auto-discovered per repo (usually `dev` or `main`)
-- **PR lookback (days)** — how far back to scan merged PRs
+- **PR lookback (d)** — how far back to scan merged PRs
 - **PR analyzer** — `hybrid` (LLM + regex), `llm` only, or `regex` only
 - **Bedrock model** — Sonnet 4.6 default
-- **Show walk-forward backtest** — toggle the past-predictions overlay
+- **Show backtest** — toggle the past-predictions overlay
+- **Backtest origins / Stride (d)** — how many past origins to score
 
 ### Sections (top to bottom)
 
@@ -140,9 +147,11 @@ Paste any GitHub PR URL, get an AI-generated cost-impact prediction
 grounded in real AWS usage data.
 
 ### How to use
-1. Paste `https://github.com/DiligentCorp/data-platform/pull/854` (or any
-   PR URL you have `gh` access to)
-2. Pick a model (Sonnet default)
+1. Open the **Controls ▸** strip at the top and pick the AWS account
+   the PR will run against (defaults to your first available profile)
+   plus the Bedrock model (Sonnet default)
+2. Paste `https://github.com/DiligentCorp/data-platform/pull/854` (or
+   any PR URL you have `gh` access to) into the URL box
 3. Click **Predict cost impact**
 4. Wait 60-120s for Sonnet to read the diff and query CloudWatch
 
@@ -183,12 +192,12 @@ Full-repo + full-AWS sweep. Fires 12 parallel AWS calls and per-repo
 GitHub calls, then asks Sonnet to produce ranked, actionable
 recommendations.
 
-### Sidebar controls
-- **Profile** — which AWS account
-- **Repos to scan** — GitHub repos to inspect (defaults to the repo
-  matching the profile name, e.g. `dil-data-platform-dev` →
-  `data-platform`)
+### Top-bar controls (click **Controls ▸** to expand)
+- **Account** — which AWS profile / account
 - **Bedrock model** — Sonnet 4.6 default
+- **GitHub org** — defaults to `DiligentCorp`
+- **Repos to scan** — defaults to the repo matching the profile name
+  (e.g. `dil-data-platform-dev` → `data-platform`)
 - **Analyze** button
 
 ### What gets swept
@@ -242,12 +251,12 @@ Per-account spend rollup across every linked account in your AWS
 Organization. Uses Cost Explorer's `LINKED_ACCOUNT` dimension on the
 management (payer) account.
 
-### Sidebar controls
-- **Profile** — pick the payer / management account (defaults to
-  `control-tower` if such a profile exists)
-- **History window (days)** — 7-90 days
-- **Fetch top service per account** — checkbox, adds one CE call per
-  account (slower but useful)
+### Top-bar controls (click **Controls ▸** to expand)
+- **Management profile** — pick the payer / management account
+  (defaults to `control-tower` if such a profile exists)
+- **History (days)** — 7-90 days
+- **Fetch top service** — checkbox, adds one CE call per account
+  (slower but useful)
 - **Fetch org spend** button
 
 ### What you get

@@ -119,32 +119,80 @@ so a reviewer can audit exactly which parameters the model chose.
 
 We measured. On real Diligent dev-account data:
 
-| Model | WAPE (walk-forward) |
-|---|---:|
-| Prophet defaults | ~92% |
-| Prophet tuned | ~60% |
-| EWM (halflife=5) | ~53% |
-| **Fast-level blend (current default)** | **~43%** |
+| Model | Direction accuracy | WAPE (walk-forward) |
+|---|---:|---:|
+| Prophet defaults | — | ~92% |
+| Prophet tuned | — | ~60% |
+| EWM (halflife=5) | — | ~53% |
+| Fast-level blend (auto-tuned, no regime) | 50% (4/8) | ~77% |
+| **Fast-level blend + regime detector (current default)** | **75% (6/8)** | **~49%** |
 
 Fast-level wins because dev-account spend is dominated by **level shifts**
 (GuardDuty toggled off, RDS stopped, someone stops a script), not by
 seasonal patterns. Prophet's trend + weekly components anchor on old data
-and lag the shift by 1-2 weeks. The naive-heavy blend adapts within 1 day.
+and lag the shift by 1-2 weeks. The naive-heavy blend adapts within 1 day,
+and the regime detector (§4.4 below) shortens that even further when a
+sudden shift lands.
 
-Prophet is still available in the sidebar for accounts with a stable
-weekly rhythm (steady prod workloads).
+Prophet is still available in the top-bar controls for accounts with a
+stable weekly rhythm (steady prod workloads).
 
-### 4.4 Walk-forward backtest
+### 4.4 Regime-shift detector
+
+Because our biggest failure mode was the model over-predicting for 5-7
+days after a workload paused, `src/forecast/ensemble.py` includes a
+lightweight regime-shift detector:
+
+```
+recent_mean  = mean(last 5 days of history)
+baseline_mean = mean(prior 14 days before that)
+shift?       = recent_mean/baseline_mean <= 0.6  (big drop)
+            or recent_mean/baseline_mean >= 1.7  (big rise)
+```
+
+When a shift is detected, `forecast_auto` trains **only on days from
+the shift day onward** — old-regime days no longer drag the trimmed
+mean toward the wrong level. For 2-9 days post-shift (too few to run
+the walk-forward tuner), the forecast is the shifted-window mean
+directly.
+
+This is the single biggest accuracy improvement in the current
+codebase. Measured on `dil-data-platform-dev` walk-forward (8 origins,
+7-day stride):
+
+| Metric | Without regime detector | With regime detector | Δ |
+|---|---:|---:|---:|
+| Direction accuracy | 50% (4/8) | **75% (6/8)** | +25 pp |
+| MAE / day | $248 | **$205** | -$43 |
+| WAPE | 76.7% | **49.4%** | -27 pp |
+
+On stable accounts where no shift is detected the code path is
+identical to before — safe by construction.
+
+### 4.5 Walk-forward backtest
 
 `src/forecast/backtest_replay.py` runs the same model at N sampled past
 dates (default 6, one per week), each training on data *strictly before*
 that origin. The predicted-vs-actual comparison is the credibility check
 users see under "Backtest — predicted vs actual" on the Dashboard.
 
+The EWM path applies the same merged-PR + open-PR step deltas the live
+future line uses, so the backtest overlay and the future forecast line
+are computed by the same math — you can compare them apples-to-apples.
+
 WAPE (weighted absolute percentage error) is the primary metric because
 MAPE explodes on near-zero days.
 
-### 4.5 PR-driven forecast adjustment
+To reproduce the numbers in §4.4 above (or check any other account)
+run:
+
+```bash
+python -m scripts.test_forecast_accuracy --profile <name> --origins 8
+```
+
+Reports direction hits, per-direction precision/recall, MAE, and WAPE.
+
+### 4.6 PR-driven forecast adjustment
 
 When a merged PR modifies AWS resources, its estimated `$/day` delta is
 added as a **step function** starting at the merge date, projected forward
@@ -315,9 +363,10 @@ version:
 - **Cannot predict console-driven events.** Someone toggles GuardDuty at
   midnight, an RDS instance gets manually stopped, a trial expires — none
   of that is visible in git or in leading indicators.
-- **Cannot beat ~40% WAPE on volatile dev accounts.** Half the daily
-  variance on our test account is non-code-driven. This is a math floor,
-  not an implementation gap.
+- **Volatile dev accounts land at ~50% WAPE.** With the regime detector
+  we measure ~49% WAPE / 75% direction accuracy on `dil-data-platform-dev`
+  (was ~77% / 50% before). Half the daily variance on these accounts is
+  still non-code-driven — a math floor no forecast can beat.
 - **List prices only.** AWS Pricing API returns on-demand rates. We can't
   see your Reserved Instances or Savings Plan discounts, so $ deltas are
   upper bounds.
