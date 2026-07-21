@@ -21,10 +21,15 @@ import streamlit as st
 
 from src.ai_agent.chat_agent import chat_step
 from src.dashboard.nav import render as render_nav
+from src.dashboard.nav import render_sidebar_footer, render_sidebar_header
 
 
 st.set_page_config(page_title="CostSense · AI Chat", layout="wide",
                    page_icon="🤖")
+
+# Render the Diligent brand card FIRST — before any AWS calls — so it
+# appears instantly regardless of STS latency.
+render_sidebar_header()
 
 # Render title first so the page isn't blank while SSO/STS profile
 # resolution runs inside render_nav().
@@ -34,7 +39,8 @@ st.caption("Chat with a FinOps agent that has read-only access to your AWS "
            "recommendations. The bot uses live AWS APIs and auto-redacts "
            "anything that looks like a secret.")
 
-sel = render_nav(include_model=True)
+with st.spinner("Resolving AWS profiles…"):
+    sel = render_nav(include_model=True)
 active = sel.profile
 model_id = sel.model_id
 
@@ -61,6 +67,12 @@ with st.sidebar:
     st.caption("**Auto-redacted**")
     st.caption("Secrets, tokens, IAM policy docs, private keys, JWTs, and "
                "AWS access keys are stripped before the model sees them.")
+
+    render_sidebar_footer(
+        active_profile=active.profile,
+        account_id=active.account_id,
+        extra_rows=[("Model", (model_id or "").split(".")[-1] or "-")],
+    )
 
 
 # ---------- session-state chat history ----------

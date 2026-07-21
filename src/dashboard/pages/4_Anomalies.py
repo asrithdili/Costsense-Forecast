@@ -28,12 +28,15 @@ from src.ai_agent.repo_sweep import sweep_repos
 from src.ai_agent.repo_sweep import sweep_to_summary as repo_summary
 from src.aws.profiles import resolve_all
 from src.pr_scanner.repos import gh_login, gh_orgs, repos_with_user_prs
-from src.dashboard.nav import inject_css, top_bar
+from src.dashboard.nav import (
+    inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
+)
 
 
 st.set_page_config(page_title="CostSense · Anomalies", layout="wide",
                    page_icon="🚨")
 inject_css()
+render_sidebar_header()  # Diligent card renders before any AWS calls
 
 st.title("Anomalies & Recommendations")
 st.caption("Full-repo + full-AWS sweep. Ranked list of concrete cost-cutting "
@@ -70,6 +73,18 @@ if picked_label not in labels:
 picked_model_idx = st.session_state.get("anom_model_idx", 0)
 if not (0 <= picked_model_idx < len(model_ids)):
     picked_model_idx = 0
+
+# Detect account change and bump a widget-version counter so the
+# repos multiselect re-instantiates with a fresh default (see
+# `_widget_ver` — used to salt the widget key below).
+_new_profile = profiles[labels.index(picked_label)].profile
+_last_profile = st.session_state.get("anom_last_profile")
+if _last_profile != _new_profile:
+    st.session_state["anom_last_profile"] = _new_profile
+    st.session_state["anom_widget_ver"] = (
+        st.session_state.get("anom_widget_ver", 0) + 1
+    )
+_widget_ver = st.session_state.get("anom_widget_ver", 0)
 
 header = (f"Controls  ·  Account: {picked_label}  ·  "
           f"Model: {model_labels[picked_model_idx]}")
@@ -132,10 +147,12 @@ with top_bar(header):
             suggested_full = []
         short_names = [r.split("/", 1)[-1] for r in suggested_full]
         default_selection = _match(active_preview.profile, short_names) or short_names
+        # Key salted by widget-version counter — bumped on account
+        # change so `default=` takes effect for the new profile.
         picked_short = st.multiselect(
             "Repos to scan", options=short_names,
             default=default_selection,
-            key="anom_repos",
+            key=f"anom_repos_v{_widget_ver}",
         )
 
     run_btn = st.button("Analyze", type="primary",
@@ -144,6 +161,16 @@ with top_bar(header):
 active = profiles[labels.index(picked_label)]
 model_id = model_ids[picked_model_idx]
 selected_repos = [f"{gh_org}/{n}" for n in picked_short] if gh_org else []
+
+with st.sidebar:
+    render_sidebar_footer(
+        active_profile=active.profile,
+        account_id=active.account_id,
+        extra_rows=[
+            ("Model", model_labels[picked_model_idx]),
+            ("Repos", f"{len(selected_repos)} selected"),
+        ],
+    )
 
 
 # ---------- session cache ----------

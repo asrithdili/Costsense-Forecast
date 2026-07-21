@@ -40,11 +40,16 @@ from src.pr_scanner.repos import (
     repo_default_branch,
     repos_with_user_prs,
 )
-from src.dashboard.nav import inject_css, top_bar
+from src.dashboard.nav import (
+    inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
+)
 
 
 st.set_page_config(page_title="CostSense · forecast", layout="wide", page_icon="💸")
 inject_css()
+# Render the Diligent brand card FIRST — before any AWS calls — so it
+# appears instantly instead of waiting for STS profile resolution.
+render_sidebar_header()
 
 
 # ---------- cached AWS fetchers ----------
@@ -129,7 +134,12 @@ def _auto_score(account_id: str, profile: str) -> int:
     return n
 
 
-# ---------- sidebar ----------
+# ---------- page title (rendered first so the page never looks blank) ----------
+
+st.title("CostSense — daily cost forecast")
+st.caption("Read-only cost forecast for the selected AWS account. "
+           "Open **Controls** below to change scope, model, or PR filters.")
+
 
 # ---------- top control bar ----------
 
@@ -147,6 +157,27 @@ if picked_label not in labels:
 chosen = reachable[labels.index(picked_label)]
 active_profile = chosen.profile
 account_id = chosen.account_id
+
+# Detect account change EARLY (before any Cost Explorer / GitHub calls
+# run, so we don't waste a slow API round-trip on the old profile).
+# When the profile changes we:
+#   1. Bump a version counter — used to build fresh widget keys so
+#      Streamlit re-instantiates the multiselect with new defaults
+#      instead of restoring the OLD account's saved value.
+#   2. Reset the "last profile" pointer and skip the wipe-cascade so
+#      no fetches happen on the old profile.
+_last_profile = st.session_state.get("dash_last_profile")
+if _last_profile != active_profile:
+    st.session_state["dash_last_profile"] = active_profile
+    st.session_state["dash_widget_ver"] = (
+        st.session_state.get("dash_widget_ver", 0) + 1
+    )
+    # Purge any downstream widget state that was tied to the old profile.
+    for k in ("dash_service", "dash_base_branch", "dash_base_branch_text"):
+        st.session_state.pop(k, None)
+# Used to salt widget keys — the multiselect gets a NEW key on each
+# account change, guaranteeing Streamlit uses the fresh `default=` list.
+_widget_ver = st.session_state.get("dash_widget_ver", 0)
 
 # Read defaults for other controls up front so the header can reflect them.
 _cutoff = st.session_state.get("dash_cutoff", date.today())
@@ -263,9 +294,13 @@ with top_bar(header):
                 "GitHub org", value=gh_org, key="dash_gh_org",
             )
     with r3c2:
+        # Widget key includes the version counter — bumped on account
+        # change so Streamlit sees this as a NEW widget and honors
+        # `default=` (instead of restoring the previous multiselect
+        # state, which would keep showing the old profile's repo).
         picked_short = st.multiselect(
             "Repos", options=short_names, default=default_repos,
-            key="dash_repos",
+            key=f"dash_repos_v{_widget_ver}",
         )
     selected_repos = [f"{gh_org}/{n}" for n in picked_short] if gh_org else []
 
@@ -338,25 +373,42 @@ with top_bar(header):
 do_forecast = False
 
 
+# ---------- sidebar footer ----------
+
+with st.sidebar:
+    render_sidebar_footer(
+        active_profile=active_profile,
+        account_id=account_id,
+        extra_rows=[
+            ("Cutoff",   cutoff.isoformat()),
+            ("History",  f"{history_days}d"),
+            ("Model",    model_choice),
+            ("Scope",    selected_service or "All services"),
+        ],
+    )
+
+
 # ---------- main pane ----------
 
-st.title("CostSense — daily cost forecast")
 svc_label = f"**{selected_service}**" if selected_service else "**All services**"
 st.info(f"Live account: **{account_id}** via profile `{active_profile}`  ·  "
         f"scope: {svc_label}  ·  cutoff {cutoff.isoformat()}  ·  "
         f"history {history_days}d")
 
 
-# History — always fetched live
-try:
-    hist_df = _fetch_history(
-        active_profile, cutoff.isoformat(), history_days,
-        service=selected_service,
-    )
-except Exception as e:  # noqa: BLE001
-    st.error(f"Cost Explorer fetch failed: {e}")
-    st.code(traceback.format_exc())
-    st.stop()
+# History — always fetched live. Show a spinner in the gap so the
+# page doesn't look blank while Cost Explorer responds.
+with st.spinner(f"Fetching cost history for `{active_profile}`… "
+                f"({history_days}d, service: {selected_service or 'all'})"):
+    try:
+        hist_df = _fetch_history(
+            active_profile, cutoff.isoformat(), history_days,
+            service=selected_service,
+        )
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Cost Explorer fetch failed: {e}")
+        st.code(traceback.format_exc())
+        st.stop()
 
 
 # On-demand forecast run
