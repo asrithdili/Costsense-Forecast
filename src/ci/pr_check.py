@@ -23,6 +23,7 @@ class PrCostCheckResult:
     failures: list[str] = field(default_factory=list)
     forecast: ForecastContext | None = None
     chart_path: Path | None = None
+    chart_warning: str | None = None
 
     @property
     def passed(self) -> bool:
@@ -145,6 +146,14 @@ def write_step_summary(
             "",
         ])
 
+    if result.chart_warning:
+        lines.extend([
+            "### Forecast chart (skipped)",
+            "",
+            f"_{result.chart_warning}_",
+            "",
+        ])
+
     if result.failures:
         lines.extend(["### Policy failures", ""])
         for failure in result.failures:
@@ -180,6 +189,7 @@ def run_pr_cost_check(
 
     forecast: ForecastContext | None = None
     chart_path: Path | None = None
+    chart_warning: str | None = None
     if forecast_chart_path is not None:
         try:
             forecast = build_forecast_context(
@@ -190,11 +200,12 @@ def run_pr_cost_check(
             )
             chart_path = save_forecast_chart(forecast, forecast_chart_path)
         except Exception as exc:  # noqa: BLE001
-            failures.append(f"forecast chart failed: {exc}")
+            chart_warning = f"forecast chart failed: {exc}"
 
     return PrCostCheckResult(
         verdict=verdict,
         failures=failures,
         forecast=forecast,
         chart_path=chart_path,
+        chart_warning=chart_warning,
     )
