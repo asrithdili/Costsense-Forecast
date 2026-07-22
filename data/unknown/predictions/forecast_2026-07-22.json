@@ -1,0 +1,83 @@
+{
+  "account_id": "unknown",
+  "profile": null,
+  "run_cutoff": "2026-07-22",
+  "history_days": 90,
+  "service_filter": null,
+  "model": "lightgbm",
+  "tuned_params": null,
+  "pr_scan": {
+    "repos": [],
+    "base_branch": null,
+    "lookback_days": 90,
+    "analyzer": "hybrid",
+    "llm_model": null,
+    "impacts": []
+  },
+  "pr_daily_series": [],
+  "pr_delta_daily_usd_at_cutoff": 0.0,
+  "open_pr_scan": {
+    "count": 0,
+    "total_expected_daily_delta_usd": 0,
+    "prs": [],
+    "daily_expected_delta": {}
+  },
+  "forecast": [
+    {
+      "target_date": "2026-07-23",
+      "baseline_usd": 1800.5861837726184,
+      "pr_delta_usd": 0.0,
+      "adjusted_usd": 1800.5861837726184,
+      "lower_usd": 1430.6405819916365,
+      "upper_usd": 2170.5317855536
+    },
+    {
+      "target_date": "2026-07-24",
+      "baseline_usd": 1800.5861837726184,
+      "pr_delta_usd": 0.0,
+      "adjusted_usd": 1800.5861837726184,
+      "lower_usd": 1430.6405819916365,
+      "upper_usd": 2170.5317855536
+    },
+    {
+      "target_date": "2026-07-25",
+      "baseline_usd": 1800.5861837726184,
+      "pr_delta_usd": 0.0,
+      "adjusted_usd": 1800.5861837726184,
+      "lower_usd": 1430.6405819916365,
+      "upper_usd": 2170.5317855536
+    },
+    {
+      "target_date": "2026-07-26",
+      "baseline_usd": 1800.5861837726184,
+      "pr_delta_usd": 0.0,
+      "adjusted_usd": 1800.5861837726184,
+      "lower_usd": 1430.6405819916365,
+      "upper_usd": 2170.5317855536
+    },
+    {
+      "target_date": "2026-07-27",
+      "baseline_usd": 2241.315436778771,
+      "pr_delta_usd": 0.0,
+      "adjusted_usd": 2241.315436778771,
+      "lower_usd": 1871.3698349977892,
+      "upper_usd": 2611.2610385597527
+    },
+    {
+      "target_date": "2026-07-28",
+      "baseline_usd": 2241.315436778771,
+      "pr_delta_usd": 0.0,
+      "adjusted_usd": 2241.315436778771,
+      "lower_usd": 1871.3698349977892,
+      "upper_usd": 2611.2610385597527
+    },
+    {
+      "target_date": "2026-07-29",
+      "baseline_usd": 1800.5861837726184,
+      "pr_delta_usd": 0.0,
+      "adjusted_usd": 1800.5861837726184,
+      "lower_usd": 1430.6405819916365,
+      "upper_usd": 2170.5317855536
+    }
+  ]
+}
