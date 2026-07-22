@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
@@ -67,14 +68,27 @@ def write_verdict_json(verdict: AgentVerdict, path: str | Path) -> Path:
     return out
 
 
-def write_step_summary(
+def embed_chart_for_summary(
+    chart_path: Path,
+    summary_path: str | Path,
+) -> str | None:
+    """Copy *chart_path* beside GITHUB_STEP_SUMMARY so inline images render."""
+    if not chart_path.is_file():
+        return None
+    summary = Path(summary_path)
+    dest = summary.parent / chart_path.name
+    shutil.copy2(chart_path, dest)
+    return f"./{dest.name}"
+
+
+def _report_markdown_lines(
     result: PrCostCheckResult,
-    path: str | Path,
     *,
     pr_url: str,
     chart_filename: str | None = None,
-) -> Path:
-    """Write markdown for GITHUB_STEP_SUMMARY (supports relative image paths)."""
+    run_url: str | None = None,
+    for_pr_comment: bool = False,
+) -> list[str]:
     verdict = result.verdict
     emoji = _direction_emoji(verdict.direction)
     status = "PASSED" if result.passed else "FAILED"
@@ -85,17 +99,23 @@ def write_step_summary(
         f"**Status:** {status}",
         f"**PR:** {pr_url}",
         "",
+    ]
+    if run_url:
+        lines.append(f"**Workflow run:** {run_url}")
+        lines.append("")
+
+    lines.extend([
         f"### {emoji} {verdict.verdict or 'No verdict'}",
         "",
-        f"| Metric | Value |",
-        f"|---|---:|",
+        "| Metric | Value |",
+        "|---|---:|",
         f"| Direction | {verdict.direction} |",
         f"| Est. daily impact | ${verdict.est_daily_delta_usd:+,.2f} |",
         f"| Est. monthly impact | ${verdict.est_daily_delta_usd * 30:+,.0f} |",
         f"| AWS tool calls | {verdict.tool_calls} |",
         f"| Model | {verdict.model_id or '—'} |",
         "",
-    ]
+    ])
 
     if verdict.detail:
         lines.extend([f"**In plain terms:** {verdict.detail}", ""])
@@ -145,6 +165,15 @@ def write_step_summary(
             f"![Forecast with PR impact]({chart_filename})",
             "",
         ])
+    elif for_pr_comment and result.chart_path is not None and run_url:
+        lines.extend([
+            "### Forecast chart",
+            "",
+            f"View the chart inline in the [job summary]({run_url}) "
+            f"(open the run → **Summary** tab), or download `forecast.png` "
+            "from the **pr-cost-report** artifact on that run.",
+            "",
+        ])
 
     if result.chart_warning:
         lines.extend([
@@ -154,12 +183,62 @@ def write_step_summary(
             "",
         ])
 
+    if for_pr_comment and run_url:
+        lines.extend([
+            "### Report files",
+            "",
+            "Download the **`pr-cost-report`** artifact from the workflow run "
+            f"above. It contains:",
+            "",
+            "- `forecast.png` — cost forecast chart",
+            "- `pr-cost-verdict.json` — structured agent verdict",
+            "",
+        ])
+
     if result.failures:
         lines.extend(["### Policy failures", ""])
         for failure in result.failures:
             lines.append(f"- {failure}")
         lines.append("")
 
+    return lines
+
+
+def write_step_summary(
+    result: PrCostCheckResult,
+    path: str | Path,
+    *,
+    pr_url: str,
+    chart_filename: str | None = None,
+) -> Path:
+    """Write markdown for GITHUB_STEP_SUMMARY (supports relative image paths)."""
+    lines = _report_markdown_lines(
+        result, pr_url=pr_url, chart_filename=chart_filename,
+    )
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(lines))
+    return out
+
+
+def write_pr_comment(
+    result: PrCostCheckResult,
+    path: str | Path,
+    *,
+    pr_url: str,
+    run_url: str,
+) -> Path:
+    """Write markdown for a sticky PR comment (updated each workflow run)."""
+    lines = [
+        "<!-- comment-tag: costsense-pr-cost-check -->",
+        "",
+        *_report_markdown_lines(
+            result,
+            pr_url=pr_url,
+            run_url=run_url,
+            for_pr_comment=True,
+        ),
+    ]
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines))
