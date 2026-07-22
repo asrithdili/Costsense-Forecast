@@ -14,7 +14,10 @@ if str(_REPO_ROOT) not in sys.path:
 import pandas as pd
 import streamlit as st
 
-from src.ai_agent.agent import analyze_pr
+from datetime import date, timedelta
+
+from src.ai_agent.agent import analyze_pr, narrate_pr_impact
+from src.aws.cost_explorer import fetch_daily_totals
 from src.aws.profiles import resolve_all
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
@@ -125,6 +128,11 @@ run = st.button("Predict cost impact", type="primary",
 verdict_key = f"prp_verdict::{active.profile}::{pr_url.strip()}"
 verdict = st.session_state.get(verdict_key)
 
+narrative_key = f"prp_narrative::{active.profile}::{pr_url.strip()}"
+current_daily_key = f"prp_current_daily::{active.profile}"
+narrative = st.session_state.get(narrative_key)
+current_daily = st.session_state.get(current_daily_key)
+
 if run and pr_url.strip():
     with st.spinner("Fetching diff + querying AWS…"):
         try:
@@ -136,6 +144,32 @@ if run and pr_url.strip():
             st.code(traceback.format_exc())
             st.stop()
     st.session_state[verdict_key] = verdict
+
+    # Pull current account $/day (avg last 7 days from Cost Explorer)
+    with st.spinner("Fetching current account spend…"):
+        try:
+            today = date.today()
+            totals = fetch_daily_totals(
+                today - timedelta(days=7), today, profile=active.profile,
+            )
+            current_daily = (sum(a for _, a in totals) / len(totals)
+                             if totals else 0.0)
+        except Exception as e:  # noqa: BLE001
+            st.warning(f"Couldn't fetch current daily cost: {e}")
+            current_daily = 0.0
+    st.session_state[current_daily_key] = current_daily
+
+    with st.spinner("Writing plain-English summary…"):
+        try:
+            narrative = narrate_pr_impact(
+                current_daily_usd=current_daily,
+                verdict=verdict,
+                profile=active.profile,
+                model_id=model_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            narrative = f"(narrative unavailable: {e})"
+    st.session_state[narrative_key] = narrative
 
 if verdict is not None:
     if verdict.error:
@@ -150,12 +184,82 @@ if verdict is not None:
     else:
         st.info(f"### → {_md(verdict.verdict)}")
 
-    cols = st.columns(3)
-    cols[0].metric("Est. daily impact",
-                   f"${verdict.est_daily_delta_usd:+,.2f}")
-    cols[1].metric("Est. monthly impact",
-                   f"${verdict.est_daily_delta_usd * 30:+,.0f}")
-    cols[2].metric("AWS tool calls", verdict.tool_calls)
+    projected_daily = (float(current_daily or 0.0)
+                       + verdict.est_daily_delta_usd)
+
+    # Estimate metadata — shown as a badge/caption so it's clear whether
+    # the number came from measured metrics or a fallback estimate.
+    _basis = (verdict.estimation_basis or "measured").lower()
+    _measured = bool(verdict.measured)
+    _conf = (verdict.confidence or "medium").lower()
+    _lo, _hi = verdict.est_daily_delta_low_usd, verdict.est_daily_delta_high_usd
+    _has_range = (
+        _lo is not None and _hi is not None
+        and abs(_hi - _lo) > 0.01
+    )
+    if _basis == "measured" and _measured:
+        _basis_label = "🟢 Measured (CloudWatch / Cost Explorer)"
+    elif _basis == "sibling_account":
+        _basis_label = ("🟡 Estimated from peer AWS account "
+                        "(historical precedent)")
+    elif _basis == "unknown":
+        _basis_label = "⚪ Unquantifiable — no reachable AWS grounding"
+    else:
+        _basis_label = "⚪ Basis unknown"
+    _conf_label = {"high": "🟢 High", "medium": "🟡 Medium",
+                   "low": "🟠 Low"}.get(_conf, "⚪")
+
+    cols = st.columns(5)
+    cols[0].metric(
+        "Current account $/day",
+        f"${current_daily:,.2f}" if current_daily is not None else "—",
+        help="7-day average from Cost Explorer for the selected account.",
+    )
+    _proj_delta_label = (
+        f"{_lo:+,.2f} → {_hi:+,.2f}"
+        if _has_range else f"{verdict.est_daily_delta_usd:+,.2f}"
+    )
+    cols[1].metric(
+        "Projected $/day after merge",
+        f"${projected_daily:,.2f}",
+        delta=_proj_delta_label,
+    )
+    _daily_impact_label = (
+        f"${_lo:+,.2f} to ${_hi:+,.2f}"
+        if _has_range else f"${verdict.est_daily_delta_usd:+,.2f}"
+    )
+    cols[2].metric("Est. daily impact", _daily_impact_label)
+    _monthly_low = (_lo * 30) if _has_range else verdict.est_daily_delta_usd * 30
+    _monthly_high = (_hi * 30) if _has_range else verdict.est_daily_delta_usd * 30
+    _monthly_label = (
+        f"${_monthly_low:+,.0f} to ${_monthly_high:+,.0f}"
+        if _has_range else f"${verdict.est_daily_delta_usd * 30:+,.0f}"
+    )
+    cols[3].metric("Est. monthly impact", _monthly_label)
+    cols[4].metric("AWS tool calls", verdict.tool_calls)
+
+    badge_cols = st.columns([3, 2])
+    badge_cols[0].caption(f"**Basis:** {_basis_label}")
+    badge_cols[1].caption(f"**Confidence:** {_conf_label}")
+    if not _measured or _basis != "measured":
+        if _basis == "sibling_account":
+            st.caption(
+                "⚠ This number is an estimate, not a measured cost. It "
+                "comes from historical precedent: a prior scope-expansion "
+                "PR in this repo, and the step change it caused in a "
+                "sibling AWS account around its merge date."
+            )
+        else:
+            st.caption(
+                "⚠ No reachable AWS account runs the service this PR "
+                "affects, and no historical precedent was found in this "
+                "repo. The true cost delta is greater than $0/day but "
+                "cannot be quantified from available data."
+            )
+
+    if narrative:
+        st.markdown("**Cost summary:**")
+        st.markdown(_md(narrative))
 
     if verdict.detail:
         st.markdown(f"**In plain terms:** {_md(verdict.detail)}")

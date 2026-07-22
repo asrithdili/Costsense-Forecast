@@ -231,7 +231,91 @@ def extract_resources(diff: str) -> list[DiffResource]:
             evidence="metric buffer / batching keywords found in diff",
         ))
 
+    # NOTE: We used to detect "scope expansion" statically (whitelist/tenant
+    # additions) and hand the LLM a precedent-based rate. That produced
+    # false positives on refactored Python code that just added multi-line
+    # function arguments. Scope expansion is now decided by the LLM itself
+    # from the diff + AWS context, and it can invoke the `precedent_lookup`
+    # tool on demand when the diff actually looks like tenant onboarding.
+
     return out
+
+
+# --- Scope expansion (collection growth) -----------------------------------
+#
+# Detects any PR that adds many similar entries to a bracketed collection —
+# whether the code calls it a whitelist, allowlist, enabledCustomers,
+# partnerIds, or anything else. We don't rely on a keyword list.
+#
+# The signal is purely structural: a `+` line whose payload is one or more
+# comma/whitespace-separated value-shaped tokens, sitting inside a diff
+# hunk that is dominated by such additions rather than logic changes.
+_TOKEN_SPLIT_RE = re.compile(r"[,;\s]+")
+_LOOKS_LIKE_VALUE_RE = re.compile(r"^[\"'`]?[\w.\-:/@]+[\"'`]?$")
+
+
+def _tokens_on_added_line(line: str) -> list[str]:
+    """Extract the comma/whitespace-separated value-shaped tokens on a
+    single `+` line. Returns [] if the line is not a pure list of values
+    (e.g. it also declares a variable, opens a block, or contains an
+    operator)."""
+    if not line.startswith("+") or line.startswith("+++"):
+        return []
+    payload = line[1:]
+    payload = re.split(r"(?://|#)", payload, maxsplit=1)[0]
+    payload = payload.strip(" \t[]{}()")
+    if not payload:
+        return []
+    # Any = / => / : / ( / { in the payload means this is logic, not
+    # a pure list continuation. Reject.
+    if re.search(r"[=:{(]|=>", payload):
+        return []
+    tokens = [t.strip(" \t\"'`,;") for t in _TOKEN_SPLIT_RE.split(payload)]
+    return [t for t in tokens if t and _LOOKS_LIKE_VALUE_RE.match(t)]
+
+
+def _count_added_scope_ids(lines: list[str], min_run: int = 3) -> int:
+    """Count NEW entries added to a bracketed collection.
+
+    Shape-based, no keyword list: we look for RUNS of consecutive `+` lines
+    (allowing whitespace-only context lines to sit between them) where each
+    line is a pure list of comma-separated value tokens. A run of ≥
+    `min_run` such lines is treated as a scope-expansion; the total token
+    count across the run is returned. Multiple runs across the diff are
+    summed."""
+    n = len(lines)
+    i = 0
+    total = 0
+    while i < n:
+        # Skip anything that isn't the start of a plus run.
+        toks = _tokens_on_added_line(lines[i]) if lines[i].startswith("+") else []
+        if not toks:
+            i += 1
+            continue
+        run_tokens = list(toks)
+        run_lines = 1
+        j = i + 1
+        # Extend the run over subsequent `+` value-only lines. Allow at
+        # most one non-`+` context line between (line breaks in a list).
+        while j < n:
+            if lines[j].startswith("+"):
+                more = _tokens_on_added_line(lines[j])
+                if not more:
+                    break
+                run_tokens.extend(more)
+                run_lines += 1
+                j += 1
+                continue
+            # A single blank/whitespace context line is OK; anything else
+            # breaks the run.
+            if lines[j].strip() == "":
+                j += 1
+                continue
+            break
+        if run_lines >= min_run:
+            total += len(run_tokens)
+        i = j
+    return total
 
 
 def resources_to_prompt_hint(resources: list[DiffResource]) -> str:

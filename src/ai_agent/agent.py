@@ -54,7 +54,12 @@ class AgentVerdict:
     verdict: str = ""            # short one-line answer
     detail: str = ""             # longer explanation
     est_daily_delta_usd: float = 0.0
+    est_daily_delta_low_usd: float | None = None
+    est_daily_delta_high_usd: float | None = None
     direction: str = "unknown"   # "increase" | "decrease" | "neutral"
+    confidence: str = "medium"   # "low" | "medium" | "high"
+    measured: bool = True        # False when the number is a generic-rate estimate
+    estimation_basis: str = "measured"  # measured | sibling_account | generic_rate | unknown
     findings: list[Finding] = field(default_factory=list)
     recommendations: list[Finding] = field(default_factory=list)
     tool_calls: int = 0
@@ -141,6 +146,45 @@ batching N metrics saves (baseline_puts − new_puts) × 0.30 / 1e6 per day
   - Instance-type change: use rightsizing_recommendations, or compute new \
 vs old hourly × 24
 
+CLASSIFY THE PR FIRST. Read the diff carefully before you assume its \
+cost shape. Common categories:
+  - resource change: a Lambda/RDS/EC2/S3/... resource is created, resized, \
+    or removed → use the pricing formulas below.
+  - logging change: log-level / retention / log-statement counts change → \
+    see LOGGING PRs.
+  - refactor / bug fix / rename: code moves around but no new resources \
+    are created and no more tenants/customers get processed → cost delta \
+    is typically zero. Set `direction="neutral"`, \
+    `est_daily_delta_usd=0`, `confidence="medium"`, and briefly explain.
+  - scope expansion: the diff adds new entries (org IDs, tenant IDs, \
+    customer IDs, region codes, feature flags) to a WHITELIST / \
+    ALLOWLIST / CONFIG COLLECTION so that an existing service now \
+    processes more work. Read the diff literally: a run of `+` lines \
+    that are just comma-separated values inside a Python/TS/JSON \
+    ARRAY LITERAL is scope expansion. `+` lines that are function \
+    arguments, imports, or logic are NOT scope expansion — even if \
+    they look list-like.
+
+FOR SCOPE-EXPANSION PRs SPECIFICALLY:
+  1. Count the new entries yourself from the diff.
+  2. Call the `precedent_lookup` tool. It re-scans the repo for prior \
+     merged PRs that grew the same file(s), and measures the step change \
+     in daily spend that each caused in sibling AWS accounts (dev/ \
+     staging/prod of the same repo) that ARE locally reachable.
+  3. If precedent_lookup returns `usable: true`, multiply its \
+     `per_entry_daily_usd` by the number of entries THIS PR adds. Set \
+     `estimation_basis="sibling_account"`, `measured=false`, \
+     `confidence="medium"`. In `detail`, cite the precedent PR by \
+     number and the sibling profile name.
+  4. If precedent_lookup returns `usable: false`, do NOT invent a rate. \
+     Set `direction="unknown"`, `est_daily_delta_usd=0`, \
+     `estimation_basis="unknown"`, `confidence="low"`, and in `detail` \
+     say: "This PR expands scope but no historical precedent or \
+     reachable sibling AWS account is available, so the true delta \
+     (which is > $0/day) cannot be quantified from available data."
+  5. NEVER fabricate a numeric range from thin air. Numbers must trace \
+     to either measured metrics or a precedent-derived rate.
+
 LOGGING PRs (logger.info → logger.debug, adding/removing log statements, \
 raising/lowering log level, changing what's logged): these ARE cost-affecting \
 if prod runs at LOG_LEVEL=INFO. CloudWatch Logs ingestion is $0.50/GB and \
@@ -161,10 +205,19 @@ Return ONLY a JSON object with this shape (no prose outside JSON):
   "verdict": "one-line summary — 'this PR will INCREASE daily cost by ~$X'",
   "direction": "increase" | "decrease" | "neutral",
   "est_daily_delta_usd": <signed number, negative = savings>,
+  "est_daily_delta_low_usd": <lower bound of the estimate range, omit or
+                              set equal to est_daily_delta_usd when the
+                              number came from measured metrics>,
+  "est_daily_delta_high_usd": <upper bound of the estimate range>,
+  "confidence": "low" | "medium" | "high",
+  "measured": true | false,
+  "estimation_basis": "measured" | "sibling_account" | "generic_rate" |
+                      "unknown",
   "detail": "2-3 SHORT sentences in plain English explaining WHY, as if to a "
             "non-technical stakeholder. No jargon walls, no run-on "
             "sentences, no nested math. State the single biggest driver "
-            "and the bottom line — that's it.",
+            "and the bottom line — that's it. If you couldn't measure "
+            "and estimated from generic rates, say so.",
   "findings": [
     {"resource": "aws_lambda_function/bulkIngest", "action": "resize",
      "est_daily_delta_usd": -6.4, "rationale": "...", "confidence": "high"}
@@ -269,11 +322,18 @@ def _parse_verdict(text: str, model_id: str, tool_calls: int) -> AgentVerdict:
         pros=[str(p) for p in (f.get("pros") or [])],
         cons=[str(c) for c in (f.get("cons") or [])],
     ) for f in (parsed.get("recommendations") or [])]
+    _low = parsed.get("est_daily_delta_low_usd")
+    _high = parsed.get("est_daily_delta_high_usd")
     return AgentVerdict(
         verdict=str(parsed.get("verdict", "")),
         detail=str(parsed.get("detail", "")),
         est_daily_delta_usd=float(parsed.get("est_daily_delta_usd", 0.0) or 0.0),
+        est_daily_delta_low_usd=(float(_low) if _low is not None else None),
+        est_daily_delta_high_usd=(float(_high) if _high is not None else None),
         direction=str(parsed.get("direction", "unknown")),
+        confidence=str(parsed.get("confidence", "medium")),
+        measured=bool(parsed.get("measured", True)),
+        estimation_basis=str(parsed.get("estimation_basis", "measured")),
         findings=findings,
         recommendations=recs,
         tool_calls=tool_calls,
@@ -344,8 +404,20 @@ def _run_agent(
                 or abs(preview.est_daily_delta_usd) < 0.005
             )
         )
-        floor = (MIN_TOOL_CALLS_FOR_NEUTRAL_VERDICT if is_neutral_or_zero
-                 else MIN_TOOL_CALLS_FOR_VERDICT)
+        # If the model already flagged this as an unmeasured estimate (e.g.
+        # scope-expansion where the target account has no visibility), don't
+        # keep pushing it to make more CloudWatch calls that will only return
+        # empty — accept the low-confidence range.
+        is_generic_estimate = (
+            preview.error is None
+            and preview.measured is False
+            and preview.estimation_basis in ("generic_rate", "sibling_account")
+        )
+        if is_generic_estimate:
+            floor = MIN_TOOL_CALLS_FOR_VERDICT
+        else:
+            floor = (MIN_TOOL_CALLS_FOR_NEUTRAL_VERDICT if is_neutral_or_zero
+                     else MIN_TOOL_CALLS_FOR_VERDICT)
 
         if tool_calls < floor:
             messages.append({"role": "assistant", "content": content})
@@ -421,6 +493,11 @@ def analyze_pr(
         return AgentVerdict(model_id=model_id,
                             error=f"couldn't fetch PR: {e}")
 
+    # Stash the (repo, diff) so the `precedent_lookup` tool the LLM can
+    # invoke has access to them. Cleared after the run.
+    from src.ai_agent.aws_tools import set_precedent_context
+    set_precedent_context(repo, diff)
+
     # Step 1: static extraction on the FULL diff (before any truncation)
     static_resources = extract_resources(diff)
     resource_hint = resources_to_prompt_hint(static_resources)
@@ -455,12 +532,276 @@ def analyze_pr(
     user_msg += (
         f"Diff:\n```diff\n{diff}\n```\n\n"
         "Predict the cost impact of THIS PR, then suggest changes to reduce "
-        "cost further. For each resource listed in the pre-computed "
-        "analysis, call the appropriate AWS tool to get real usage numbers, "
-        "then compute the dollar impact using the pricing formulas.\n"
+        "cost further. Call AWS tools to ground your numbers in real "
+        "usage. If the PR is a scope-expansion (adding entries to a "
+        "whitelist/allowlist/config collection), call `precedent_lookup` "
+        "to get a measured $/entry/day rate; do NOT guess.\n"
         "Return only the JSON verdict."
     )
-    return _run_agent(SYSTEM_PR, user_msg, profile, model_id)
+    try:
+        return _run_agent(SYSTEM_PR, user_msg, profile, model_id)
+    finally:
+        set_precedent_context(None, None)
+
+
+SYSTEM_NARRATIVE = """You are an AWS FinOps analyst writing a short, plain-\
+English summary for a non-technical stakeholder.
+
+You will be given:
+  - The account's current average daily AWS spend (from Cost Explorer,
+    last 7 days).
+  - The projected new daily spend after a pull request merges.
+  - A verdict object describing what the PR changes and by how much per day.
+
+Write ONE short paragraph (3-5 sentences, no jargon) that:
+  1. States the CURRENT daily cost in dollars.
+  2. States what the PROJECTED daily cost will be after the PR merges, and
+     whether that is an increase or decrease.
+  3. Explains the single biggest driver of the change in plain terms.
+  4. Notes the monthly implication (delta x 30) so the reader has a
+     tangible number.
+
+Do NOT use markdown headings, bullet points, or code blocks. Just the
+paragraph. No preamble like "Here is the summary". Start directly with the
+first sentence."""
+
+
+def narrate_pr_impact(
+    current_daily_usd: float,
+    verdict: AgentVerdict,
+    profile: str | None = None,
+    model_id: str = DEFAULT_MODEL,
+) -> str:
+    """Ask Bedrock for a plain-English paragraph describing what the account
+    currently spends, what it will spend after this PR, and why."""
+    projected = current_daily_usd + verdict.est_daily_delta_usd
+    payload = {
+        "current_daily_usd": round(current_daily_usd, 2),
+        "projected_daily_usd": round(projected, 2),
+        "delta_daily_usd": round(verdict.est_daily_delta_usd, 2),
+        "direction": verdict.direction,
+        "verdict": verdict.verdict,
+        "detail": verdict.detail,
+        "findings": [
+            {
+                "resource": f.resource,
+                "action": f.action,
+                "delta_daily_usd": f.est_daily_delta_usd,
+                "rationale": f.rationale,
+            }
+            for f in verdict.findings
+        ],
+    }
+    user_msg = (
+        "Here is the cost context for this pull request:\n\n"
+        + json.dumps(payload, indent=2)
+        + "\n\nWrite the paragraph now."
+    )
+    client = _client(profile)
+    try:
+        resp = client.invoke_model(
+            modelId=model_id,
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 500,
+                "temperature": 0.2,
+                "system": SYSTEM_NARRATIVE,
+                "messages": [{"role": "user", "content": user_msg}],
+            }),
+        )
+        body = json.loads(resp["body"].read())
+    except Exception as e:  # noqa: BLE001
+        return f"(narrative unavailable: {e})"
+    for block in body.get("content", []):
+        if block.get("type") == "text":
+            return block.get("text", "").strip()
+    return ""
+
+
+SYSTEM_TRAJECTORY = """You are a senior AWS FinOps engineer estimating the \
+future cost trajectory of an AWS account.
+
+You are given:
+  1. The account's current average daily spend (last 7 days from Cost Explorer).
+  2. The estimated daily delta from ONE specific PR (already analyzed).
+  3. A sweep of every repository that deploys into this AWS account:
+     - open pull requests (leading indicator of what will merge soon)
+     - infrastructure-as-code files touched in the last 30 days
+     - files declaring scheduled/recurring compute (EventBridge, cron, etc.)
+
+You have read-only tools (cost_by_service, cloudwatch_metric, cloudtrail, \
+rightsizing) to ground your estimate in real data.
+
+Your job: estimate what this account will run at daily, ~30 days from now, \
+assuming pending PRs land at typical merge rates and current usage patterns \
+continue. Do NOT reprice the ONE PR that was already analyzed — that delta \
+is already accounted for. Focus on the REMAINING pending signal.
+
+Return ONLY a JSON object (no prose outside JSON):
+{
+  "pending_delta_daily_usd": <signed number — additional $/day from OTHER
+                              pending changes beyond the analyzed PR>,
+  "projected_daily_usd": <current_daily + analyzed_pr_delta +
+                          pending_delta — the number you predict the
+                          account will run at in ~30 days>,
+  "confidence": "low" | "medium" | "high",
+  "drivers": [
+    "short bullet — one concrete driver of the trajectory, referencing a
+     specific PR title / IaC file / scheduled rule from the sweep",
+    "..."
+  ],
+  "summary": "2-3 SHORT sentences in plain English. State the projected
+              daily cost, the direction vs today, and the single biggest
+              driver beyond the analyzed PR. No jargon, no markdown."
+}"""
+
+
+@dataclass
+class TrajectoryEstimate:
+    projected_daily_usd: float = 0.0
+    pending_delta_daily_usd: float = 0.0
+    confidence: str = "low"
+    drivers: list[str] = field(default_factory=list)
+    summary: str = ""
+    tool_calls: int = 0
+    model_id: str = ""
+    error: str | None = None
+    raw_text: str = ""
+
+
+def _parse_trajectory(
+    text: str, model_id: str, tool_calls: int,
+) -> TrajectoryEstimate:
+    try:
+        parsed = _extract_json(text)
+    except json.JSONDecodeError as e:
+        return TrajectoryEstimate(
+            model_id=model_id, tool_calls=tool_calls,
+            error=f"no JSON in response: {e}", raw_text=text[:500],
+        )
+    return TrajectoryEstimate(
+        projected_daily_usd=float(parsed.get("projected_daily_usd", 0.0) or 0.0),
+        pending_delta_daily_usd=float(
+            parsed.get("pending_delta_daily_usd", 0.0) or 0.0,
+        ),
+        confidence=str(parsed.get("confidence", "low")),
+        drivers=[str(d) for d in (parsed.get("drivers") or [])],
+        summary=str(parsed.get("summary", "")),
+        tool_calls=tool_calls,
+        model_id=model_id,
+        raw_text=text,
+    )
+
+
+def estimate_repo_trajectory(
+    repos: list[str],
+    verdict: AgentVerdict,
+    current_daily_usd: float,
+    profile: str | None = None,
+    model_id: str = DEFAULT_MODEL,
+    max_tool_turns: int = 6,
+) -> TrajectoryEstimate:
+    """Sweep the repos that deploy into this AWS account and ask the model
+    to project the account's daily cost ~30 days out.
+
+    The single PR that was already analyzed is passed in so the model
+    doesn't double-count it — it only prices the REMAINING pending
+    signal (open PRs, recent IaC churn, scheduled compute)."""
+    from src.ai_agent.repo_sweep import sweep_repos, sweep_to_summary
+
+    if not repos:
+        return TrajectoryEstimate(
+            projected_daily_usd=current_daily_usd + verdict.est_daily_delta_usd,
+            pending_delta_daily_usd=0.0,
+            confidence="low",
+            drivers=[],
+            summary=(
+                "No matched repositories for this AWS profile, so no "
+                "repo-wide trajectory could be computed. Projection "
+                "reflects only the analyzed PR."
+            ),
+            model_id=model_id,
+        )
+
+    try:
+        sweep = sweep_to_summary(sweep_repos(repos))
+    except Exception as e:  # noqa: BLE001
+        return TrajectoryEstimate(
+            model_id=model_id, error=f"repo sweep failed: {e}",
+        )
+
+    payload = {
+        "current_daily_usd": round(current_daily_usd, 2),
+        "analyzed_pr": {
+            "verdict": verdict.verdict,
+            "direction": verdict.direction,
+            "est_daily_delta_usd": round(verdict.est_daily_delta_usd, 2),
+            "detail": verdict.detail,
+        },
+        "repo_sweep": sweep,
+    }
+    user_msg = (
+        "Repo + account context:\n\n"
+        + json.dumps(payload, indent=2, default=str)
+        + "\n\nProject the account's daily cost ~30 days from now. "
+        "Use tools to sanity-check big claims. Return the JSON now."
+    )
+
+    client = _client(profile)
+    messages: list = [{"role": "user", "content": user_msg}]
+    tool_calls = 0
+
+    for _ in range(max_tool_turns + 1):
+        try:
+            resp = client.invoke_model(
+                modelId=model_id,
+                body=json.dumps({
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": MAX_TOKENS,
+                    "temperature": 0.0,
+                    "system": SYSTEM_TRAJECTORY,
+                    "tools": tool_specs(),
+                    "messages": messages,
+                }),
+            )
+            body = json.loads(resp["body"].read())
+        except Exception as e:  # noqa: BLE001
+            return TrajectoryEstimate(
+                model_id=model_id, tool_calls=tool_calls,
+                error=f"bedrock invoke failed: {e}",
+            )
+
+        content = body.get("content", [])
+        tool_use_blocks = [b for b in content if b.get("type") == "tool_use"]
+        if tool_use_blocks:
+            messages.append({"role": "assistant", "content": content})
+            results = []
+            for blk in tool_use_blocks:
+                tool_calls += 1
+                result = call_tool(blk["name"], blk.get("input") or {}, profile)
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": blk["id"],
+                    "content": json.dumps(result, default=str)[:8000],
+                })
+            messages.append({"role": "user", "content": results})
+            continue
+
+        text_block = next((b for b in content if b.get("type") == "text"), None)
+        if not text_block:
+            return TrajectoryEstimate(
+                model_id=model_id, tool_calls=tool_calls,
+                error="no text in final response",
+                raw_text=json.dumps(content)[:500],
+            )
+        return _parse_trajectory(
+            text_block.get("text", ""), model_id, tool_calls,
+        )
+
+    return TrajectoryEstimate(
+        model_id=model_id, tool_calls=tool_calls,
+        error=f"exceeded {max_tool_turns} tool turns",
+    )
 
 
 def recommend_account(
