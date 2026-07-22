@@ -204,13 +204,49 @@ h1{ font-size:1.55rem; } h2{ font-size:1.2rem; } h3{ font-size:1.02rem; }
 .cs-card{
   background:var(--card); border:1px solid var(--line); border-radius:12px;
   padding:14px 16px;
+  min-height:104px; /* keep tile rows visually aligned even when one has no delta */
+  display:flex; flex-direction:column; justify-content:center;
+  transition:border-color 120ms ease, box-shadow 120ms ease;
+}
+.cs-card:hover{
+  border-color:var(--brand-soft); box-shadow:0 1px 2px rgba(20,24,31,0.04);
 }
 .cs-card .lbl{ color:var(--muted); font-size:0.72rem; font-weight:600;
-  text-transform:uppercase; letter-spacing:0.04em; }
-.cs-card .val{ color:var(--ink); font-size:1.6rem; font-weight:680;
-  font-variant-numeric:tabular-nums; letter-spacing:-0.01em; margin-top:2px; }
-.cs-card .dlt{ font-size:0.85rem; font-weight:600; margin-top:2px;
-  font-variant-numeric:tabular-nums; }
+  text-transform:uppercase; letter-spacing:0.04em;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.cs-card .val{ color:var(--ink); font-size:1.55rem; font-weight:680;
+  font-variant-numeric:tabular-nums; letter-spacing:-0.01em; margin-top:4px;
+  line-height:1.15;
+}
+.cs-card .dlt{ font-size:0.82rem; font-weight:600; margin-top:6px;
+  font-variant-numeric:tabular-nums;
+}
+
+/* Metadata strip row (Basis / Confidence style) — used under tile grids
+   for grounding transparency. Consistent look across pages. */
+.cs-meta-row{
+  display:flex; flex-wrap:wrap; align-items:center; gap:14px 24px;
+  padding:10px 14px; margin:8px 0 4px 0;
+  border:1px solid var(--line); border-radius:10px;
+  background:var(--card);
+}
+.cs-meta-row .cs-meta-item{
+  display:inline-flex; align-items:center; gap:8px;
+}
+.cs-meta-row .cs-meta-label{
+  color:var(--muted); font-size:0.72rem; font-weight:600;
+  text-transform:uppercase; letter-spacing:0.04em;
+}
+.cs-meta-row .cs-meta-text{
+  color:var(--ink); font-size:0.9rem;
+}
+
+/* Tighten the built-in st.caption spacing so it sits close to the tile
+   row it annotates instead of drifting into the next block. */
+[data-testid="stCaptionContainer"]{
+  margin-top:-4px; margin-bottom:12px;
+}
 </style>
 """)
 
@@ -316,6 +352,31 @@ def callout(body: str, *, tone: str = "info", title: str = "") -> None:
         if title:
             st.markdown(f"**{title}**")
         st.markdown(body)
+
+
+def meta_row(items: list[tuple[str, str, str | None]]) -> None:
+    """Render a horizontal strip of (label, pill_level, description) entries.
+
+    Used under tile grids for grounding transparency (e.g. "Basis: Measured",
+    "Confidence: Medium"). ``pill_level`` is one of the SEV keys (Low /
+    Medium / High / Critical) OR any STATUS key — anything ``pill()`` accepts.
+    Pass ``description=None`` to render just the pill with no trailing text.
+
+    Wraps to a new line at narrow widths and keeps consistent gap + padding
+    so the row reads as one status bar rather than a caption soup.
+    """
+    parts = ['<div class="cs-meta-row">']
+    for label, pill_level, description in items:
+        parts.append(
+            '<span class="cs-meta-item">'
+            f'<span class="cs-meta-label">{label}</span>'
+            f"{pill(pill_level)}"
+        )
+        if description:
+            parts.append(f'<span class="cs-meta-text">{description}</span>')
+        parts.append("</span>")
+    parts.append("</div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
 
 
 def confidence_pill(confidence: str) -> str:

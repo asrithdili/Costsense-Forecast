@@ -19,7 +19,9 @@ from datetime import date, timedelta
 from src.ai_agent.agent import analyze_pr, narrate_pr_impact
 from src.aws.cost_explorer import fetch_daily_totals
 from src.aws.profiles import resolve_all
-from src.dashboard.costsense_theme import callout, metric, pill, section
+from src.dashboard.costsense_theme import (
+    callout, meta_row, metric, pill, section,
+)
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
 )
@@ -270,28 +272,24 @@ if verdict is not None:
     _measured = bool(verdict.measured)
     _conf = (verdict.confidence or "medium").lower()
     if _basis == "measured" and _measured:
-        _basis_pill_level, _basis_text = "Low", "Measured (CloudWatch / Cost Explorer)"
+        _basis_pill_level = "Low"
+        _basis_text = "Measured (CloudWatch / Cost Explorer)"
     elif _basis == "sibling_account":
-        _basis_pill_level, _basis_text = "Medium", "Estimated from peer AWS account (historical precedent)"
+        _basis_pill_level = "Medium"
+        _basis_text = "Estimated from peer AWS account (historical precedent)"
     elif _basis == "unknown":
-        _basis_pill_level, _basis_text = "High", "Unquantifiable — no reachable AWS grounding"
+        _basis_pill_level = "High"
+        _basis_text = "Unquantifiable — no reachable AWS grounding"
     else:
-        _basis_pill_level, _basis_text = "Medium", "Basis unknown"
+        _basis_pill_level = "Medium"
+        _basis_text = "Basis unknown"
     _conf_pill_level = {"high": "Low", "medium": "Medium",
                         "low": "High"}.get(_conf, "Medium")
-    st.markdown(
-        '<div style="display:flex;gap:1.25rem;align-items:center;'
-        'padding:0.5rem 0;">'
-        f'<span style="opacity:0.7;font-size:0.9rem;">Basis:</span>'
-        f'{pill(_basis_pill_level)}'
-        f'<span style="opacity:0.85;font-size:0.9rem;">{_basis_text}</span>'
-        '<span style="width:1rem;"></span>'
-        f'<span style="opacity:0.7;font-size:0.9rem;">Confidence:</span>'
-        f'{pill(_conf_pill_level)}'
-        f'<span style="opacity:0.85;font-size:0.9rem;">{_conf.title()}</span>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
+
+    meta_row([
+        ("Basis", _basis_pill_level, _basis_text),
+        ("Confidence", _conf_pill_level, _conf.title()),
+    ])
     if not _measured or _basis != "measured":
         if _basis == "sibling_account":
             st.caption(
