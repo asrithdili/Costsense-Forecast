@@ -20,12 +20,13 @@ if str(_REPO_ROOT) not in sys.path:
 import streamlit as st
 
 from src.ai_agent.chat_agent import chat_step
-from src.dashboard.nav import render as render_nav
+from src.dashboard.nav import inject_css, render as render_nav
 from src.dashboard.nav import render_sidebar_footer, render_sidebar_header
 
 
 st.set_page_config(page_title="CostSense · AI Chat", layout="wide",
                    page_icon="🤖")
+inject_css()
 
 # Render the Diligent brand card FIRST — before any AWS calls — so it
 # appears instantly regardless of STS latency.

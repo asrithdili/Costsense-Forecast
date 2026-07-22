@@ -1,10 +1,10 @@
 """Shared top-of-page control bar + sidebar chrome for CostSense.
 
 Rules:
-- **No app-wide color overrides.** Streamlit's theme system (System /
-  Light / Dark from the ⋮ menu) needs to work, so we don't lock the
-  background or text colors. Only structural CSS (spacing, borders,
-  layout) and per-widget accents live in `_CSS`.
+- **Theme + shell.** ``inject_css()`` composes the shared design system
+  (``costsense_theme.inject_css()``) with structural shell CSS in ``_CSS``
+  below. Shell rules win on layout conflicts (sidebar flex footer, wider
+  max-width) so navigation and footer pinning stay stable.
 - The Diligent brand card renders as a real widget inside
   `st.sidebar` via `render_sidebar_header()`; it's called from each
   page's `with st.sidebar:` block. This is more reliable than
@@ -20,6 +20,7 @@ from typing import Iterable
 import streamlit as st
 
 from src.aws.profiles import ProfileInfo, resolve_all
+from src.dashboard.costsense_theme import inject_css as inject_theme_css
 
 
 DEFAULT_MODELS = (
@@ -263,7 +264,8 @@ class TopBarSelection:
 
 
 def inject_css() -> None:
-    """Inject the shared CSS. Safe to call multiple times per page."""
+    """Inject shared theme + shell CSS. Safe to call multiple times per page."""
+    inject_theme_css()
     st.markdown(_CSS, unsafe_allow_html=True)
 
 

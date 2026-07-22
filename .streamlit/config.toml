@@ -1,3 +1,13 @@
+[theme]
+# Native Streamlit palette — costsense_theme.inject_css() adds finer styling
+# (cards, metrics, buttons, tabular numerals) on top of this.
+base = "light"
+primaryColor = "#0C7C74"              # brand teal — buttons, links, active states
+backgroundColor = "#F6F7F9"             # app canvas (warm off-white)
+secondaryBackgroundColor = "#FFFFFF"    # cards / sidebar
+textColor = "#14181F"                  # ink
+font = "sans serif"
+
 [client]
 # Hides the "Deploy" button in the top-right toolbar (Streamlit Community Cloud
 # shortcut, not used by this app). The "⋮" menu and everything else is unaffected.
