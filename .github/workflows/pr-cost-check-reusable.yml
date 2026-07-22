@@ -4,8 +4,13 @@ on:
   workflow_call:
     inputs:
       aws_profile:
-        description: AWS profile name for Cost Explorer / CloudWatch / Bedrock
-        required: true
+        description: >-
+          Optional. Only pass a value when the runner has a locally
+          configured AWS profile of that name (rare in GitHub Actions).
+          Leave empty and boto3 will pick up the OIDC-injected env-var
+          credentials from `aws-actions/configure-aws-credentials`.
+        required: false
+        default: ""
         type: string
       aws_region:
         description: AWS region for OIDC credentials
@@ -76,19 +81,25 @@ jobs:
       - name: Run PR cost check
         id: check
         working-directory: costsense
+        # AWS creds arrive as env vars from configure-aws-credentials
+        # (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN /
+        # AWS_REGION). Do NOT export AWS_PROFILE unless a matching profile
+        # actually exists on the runner — boto3 will fail with
+        # ProfileNotFound otherwise.
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          AWS_PROFILE: ${{ inputs.aws_profile }}
         run: |
           ARGS=(
             --pr-url "${{ github.event.pull_request.html_url }}"
-            --profile "${{ inputs.aws_profile }}"
             --model-id "${{ inputs.model_id }}"
             --max-daily-increase-usd "${{ inputs.max_daily_increase_usd }}"
             --min-tool-calls "${{ inputs.min_tool_calls }}"
             --history-days "${{ inputs.history_days }}"
             --output-json pr-cost-verdict.json
           )
+          if [ -n "${{ inputs.aws_profile }}" ]; then
+            ARGS+=(--profile "${{ inputs.aws_profile }}")
+          fi
           if [ "${{ inputs.include_forecast_chart }}" = "true" ]; then
             ARGS+=(--forecast-chart forecast.png)
           fi
