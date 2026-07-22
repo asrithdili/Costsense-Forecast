@@ -4,6 +4,12 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+# Caller must grant permissions the reusable workflow requests (OIDC + PR read).
+permissions:
+  contents: read
+  pull-requests: read
+  id-token: write
+
 jobs:
   cost-check:
     uses: ./.github/workflows/pr-cost-check-reusable.yml
