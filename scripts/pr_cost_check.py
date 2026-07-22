@@ -25,6 +25,7 @@ from src.ai_agent.agent import DEFAULT_MODEL
 from src.ci.pr_check import (
     PolicyConfig,
     run_pr_cost_check,
+    write_pr_comment,
     write_step_summary,
     write_verdict_json,
 )
@@ -53,6 +54,10 @@ def main() -> int:
         default=os.environ.get("GITHUB_STEP_SUMMARY"),
         help="Markdown output path (defaults to GITHUB_STEP_SUMMARY)",
     )
+    parser.add_argument(
+        "--pr-comment",
+        help="Markdown file for a sticky PR comment (e.g. pr-cost-comment.md)",
+    )
     args = parser.parse_args()
 
     result = run_pr_cost_check(
@@ -69,24 +74,23 @@ def main() -> int:
 
     write_verdict_json(result.verdict, args.output_json)
 
-    chart_name: str | None = None
-    if args.forecast_chart and result.chart_path is not None:
-        chart_path = result.chart_path.resolve()
-        workspace = os.environ.get("GITHUB_WORKSPACE")
-        if workspace:
-            try:
-                chart_name = str(chart_path.relative_to(Path(workspace)))
-            except ValueError:
-                chart_name = chart_path.name
-        else:
-            chart_name = chart_path.name
-
     if args.step_summary:
         write_step_summary(
             result,
             args.step_summary,
             pr_url=args.pr_url,
-            chart_filename=chart_name,
+        )
+
+    if args.pr_comment:
+        server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+        repo = os.environ.get("GITHUB_REPOSITORY", "")
+        run_id = os.environ.get("GITHUB_RUN_ID", "")
+        run_url = f"{server}/{repo}/actions/runs/{run_id}" if repo and run_id else ""
+        write_pr_comment(
+            result,
+            args.pr_comment,
+            pr_url=args.pr_url,
+            run_url=run_url,
         )
 
     if result.passed:

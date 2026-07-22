@@ -23,6 +23,7 @@ class PrCostCheckResult:
     failures: list[str] = field(default_factory=list)
     forecast: ForecastContext | None = None
     chart_path: Path | None = None
+    chart_warning: str | None = None
 
     @property
     def passed(self) -> bool:
@@ -66,14 +67,13 @@ def write_verdict_json(verdict: AgentVerdict, path: str | Path) -> Path:
     return out
 
 
-def write_step_summary(
+def _report_markdown_lines(
     result: PrCostCheckResult,
-    path: str | Path,
     *,
     pr_url: str,
-    chart_filename: str | None = None,
-) -> Path:
-    """Write markdown for GITHUB_STEP_SUMMARY (supports relative image paths)."""
+    run_url: str | None = None,
+    for_pr_comment: bool = False,
+) -> list[str]:
     verdict = result.verdict
     emoji = _direction_emoji(verdict.direction)
     status = "PASSED" if result.passed else "FAILED"
@@ -84,17 +84,23 @@ def write_step_summary(
         f"**Status:** {status}",
         f"**PR:** {pr_url}",
         "",
+    ]
+    if run_url:
+        lines.append(f"**Workflow run:** {run_url}")
+        lines.append("")
+
+    lines.extend([
         f"### {emoji} {verdict.verdict or 'No verdict'}",
         "",
-        f"| Metric | Value |",
-        f"|---|---:|",
+        "| Metric | Value |",
+        "|---|---:|",
         f"| Direction | {verdict.direction} |",
         f"| Est. daily impact | ${verdict.est_daily_delta_usd:+,.2f} |",
         f"| Est. monthly impact | ${verdict.est_daily_delta_usd * 30:+,.0f} |",
         f"| AWS tool calls | {verdict.tool_calls} |",
         f"| Model | {verdict.model_id or '—'} |",
         "",
-    ]
+    ])
 
     if verdict.detail:
         lines.extend([f"**In plain terms:** {verdict.detail}", ""])
@@ -137,11 +143,26 @@ def write_step_summary(
             lines.append(f"- Next 7d adjusted forecast total: **${next_7:,.0f}**")
         lines.append("")
 
-    if chart_filename and result.chart_path is not None:
+    if for_pr_comment and run_url:
         lines.extend([
-            "### Forecast chart",
+            "### Forecast chart & report files",
             "",
-            f"![Forecast with PR impact]({chart_filename})",
+            "Download the **`pr-cost-report`** artifact from the "
+            f"[workflow run]({run_url}). It contains:",
+            "",
+            "- `forecast.png` — cost forecast with PR impact",
+            "- `pr-cost-verdict.json` — full structured verdict",
+            "",
+        ])
+    elif for_pr_comment and result.chart_path is not None:
+        lines.extend([
+            "### Forecast chart & report files",
+            "",
+            "Download the **`pr-cost-report`** artifact from the workflow run "
+            "(see the Actions tab). It contains:",
+            "",
+            "- `forecast.png` — cost forecast with PR impact",
+            "- `pr-cost-verdict.json` — full structured verdict",
             "",
         ])
 
@@ -151,6 +172,41 @@ def write_step_summary(
             lines.append(f"- {failure}")
         lines.append("")
 
+    return lines
+
+
+def write_step_summary(
+    result: PrCostCheckResult,
+    path: str | Path,
+    *,
+    pr_url: str,
+) -> Path:
+    """Write markdown for GITHUB_STEP_SUMMARY."""
+    lines = _report_markdown_lines(result, pr_url=pr_url)
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(lines))
+    return out
+
+
+def write_pr_comment(
+    result: PrCostCheckResult,
+    path: str | Path,
+    *,
+    pr_url: str,
+    run_url: str,
+) -> Path:
+    """Write markdown for a sticky PR comment (updated each workflow run)."""
+    lines = [
+        "<!-- comment-tag: costsense-pr-cost-check -->",
+        "",
+        *_report_markdown_lines(
+            result,
+            pr_url=pr_url,
+            run_url=run_url,
+            for_pr_comment=True,
+        ),
+    ]
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines))
@@ -180,6 +236,7 @@ def run_pr_cost_check(
 
     forecast: ForecastContext | None = None
     chart_path: Path | None = None
+    chart_warning: str | None = None
     if forecast_chart_path is not None:
         try:
             forecast = build_forecast_context(
@@ -190,11 +247,12 @@ def run_pr_cost_check(
             )
             chart_path = save_forecast_chart(forecast, forecast_chart_path)
         except Exception as exc:  # noqa: BLE001
-            failures.append(f"forecast chart failed: {exc}")
+            chart_warning = f"forecast chart failed: {exc}"
 
     return PrCostCheckResult(
         verdict=verdict,
         failures=failures,
         forecast=forecast,
         chart_path=chart_path,
+        chart_warning=chart_warning,
     )
