@@ -22,6 +22,7 @@ import streamlit as st
 from src.aws.org_spend import fetch_org_spend, top_service_by_account
 from src.aws.profiles import resolve_all
 from src.dashboard.costsense_theme import callout, metric, money, section
+from src.dashboard.notifications_ui import NotificationDraft, render_notification_button
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
 )
@@ -237,6 +238,60 @@ st.dataframe(
 st.divider()
 
 # Top movers callout
+_ORG_TREND_PCT = 25.0
+_ORG_MIN_LAST7 = 500.0
+_org_risk_account = None
+if any(a.trend_pct() is not None for a in data):
+    _with_trend = [a for a in data if a.trend_pct() is not None]
+    for _a in _with_trend:
+        _trend = _a.trend_pct() or 0
+        _last7 = _a.spend_last_n_days(7)
+        if _trend < _ORG_TREND_PCT or _last7 < _ORG_MIN_LAST7:
+            continue
+        if (
+            _org_risk_account is None
+            or (_a.trend_pct() or 0) > (_org_risk_account.trend_pct() or 0)
+        ):
+            _org_risk_account = _a
+
+if _org_risk_account is not None:
+    _risk_last7 = _org_risk_account.spend_last_n_days(7)
+    _risk_last7_txt = (
+        money(_risk_last7) if _risk_last7 >= 1_000 else f"${_risk_last7:,.0f}"
+    )
+    _risk_trend = _org_risk_account.trend_pct() or 0
+    _risk_name = _org_risk_account.account_name or _org_risk_account.account_id
+    render_notification_button(
+        button_label="Notify org spend risk",
+        state_key=f"org::{active.profile}::{days}",
+        draft=NotificationDraft(
+            title="Org account spend spike",
+            severity="High",
+            reason=(
+                f"Account {_org_risk_account.account_id} ({_risk_name}) rose "
+                f"{_risk_trend:+.1f}% week-over-week with {_risk_last7_txt} "
+                f"in the last 7 days."
+            ),
+            recipient="finops-team@example.com",
+            subject=(
+                f"[CostSense] Org spend risk — {_org_risk_account.account_id} "
+                f"({_risk_trend:+.1f}%)"
+            ),
+            body=(
+                f"CostSense Org Level Impact flagged a material spend mover.\n\n"
+                f"Management account profile: {active.profile}\n"
+                f"Account ID: {_org_risk_account.account_id}\n"
+                f"Account name: {_risk_name}\n"
+                f"7-day trend: {_risk_trend:+.1f}%\n"
+                f"Last 7d spend: {_risk_last7_txt}\n"
+                f"Window: last {days} days\n\n"
+                f"Please review the account in CostSense Org Level Impact."
+            ),
+            source_page="Org Level Impact",
+            source_type="org_spend_spike",
+        ),
+    )
+
 if any(a.trend_pct() is not None for a in data):
     section(
         "Biggest movers",

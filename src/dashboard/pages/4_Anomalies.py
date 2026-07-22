@@ -34,6 +34,7 @@ from src.ai_agent.repo_sweep import sweep_repos
 from src.ai_agent.repo_sweep import sweep_to_summary as repo_summary
 from src.aws.profiles import resolve_all
 from src.dashboard.costsense_theme import callout, confidence_pill, metric, money, section
+from src.dashboard.notifications_ui import NotificationDraft, render_notification_button
 from src.pr_scanner.repos import gh_login, gh_orgs, repos_with_user_prs
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
@@ -328,6 +329,51 @@ with kpis[2]:
 if report.summary:
     with st.container(border=True):
         section("Summary", _plain(report.summary), kicker="Overview")
+
+_ANOM_MIN_SAVINGS = 10.0
+_top_high_action = None
+for _a in report.actions:
+    if (_a.confidence or "").lower() != "high":
+        continue
+    if (_a.est_daily_savings_usd or 0) < _ANOM_MIN_SAVINGS:
+        continue
+    if (
+        _top_high_action is None
+        or _a.est_daily_savings_usd > _top_high_action.est_daily_savings_usd
+    ):
+        _top_high_action = _a
+if _top_high_action is not None:
+    _save = _top_high_action.est_daily_savings_usd
+    _save_txt = money(_save) if _save >= 1_000 else f"${_save:,.2f}"
+    render_notification_button(
+        button_label="Notify anomaly",
+        state_key=report_key,
+        draft=NotificationDraft(
+            title="High-confidence cost anomaly",
+            severity="High",
+            reason=(
+                f"High-confidence recommendation with {_save_txt}/day potential "
+                f"savings: {_plain(_top_high_action.issue) or 'see scan results'}."
+            ),
+            recipient="finops-team@example.com",
+            subject=(
+                f"[CostSense] Anomaly — {_save_txt}/day savings "
+                f"({active.profile})"
+            ),
+            body=(
+                f"CostSense Anomalies scan found a high-confidence action.\n\n"
+                f"Account: {active.profile}\n"
+                f"Issue: {_plain(_top_high_action.issue)}\n"
+                f"Reason: {_plain(_top_high_action.reason)}\n"
+                f"Recommendation: {_plain(_top_high_action.recommendation)}\n"
+                f"Potential savings: {_save_txt}/day\n"
+                f"Total scan savings: {savings_display}/day\n\n"
+                f"Please review the ranked actions in CostSense Anomalies."
+            ),
+            source_page="Anomalies",
+            source_type="high_confidence_anomaly",
+        ),
+    )
 
 st.divider()
 

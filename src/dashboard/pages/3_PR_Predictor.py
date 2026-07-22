@@ -22,6 +22,7 @@ from src.aws.profiles import resolve_all
 from src.dashboard.costsense_theme import (
     callout, meta_row, metric, pill, section,
 )
+from src.dashboard.notifications_ui import NotificationDraft, render_notification_button
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
 )
@@ -258,6 +259,38 @@ if verdict is not None:
         )
     with cols[4]:
         metric("AWS tool calls", verdict.tool_calls)
+
+    _PR_MATERIAL_USD = 5.0
+    if verdict.direction == "increase" and _delta_headline >= _PR_MATERIAL_USD:
+        render_notification_button(
+            button_label="Notify PR cost risk",
+            state_key=f"prp::{active.profile}::{pr_url.strip()}",
+            draft=NotificationDraft(
+                title="PR cost increase risk",
+                severity="High",
+                reason=(
+                    f"PR analysis predicts a material cost increase of "
+                    f"${_delta_headline:+,.2f}/day ({verdict.verdict})."
+                ),
+                recipient="finops-team@example.com",
+                subject=(
+                    f"[CostSense] PR cost risk — ${_delta_headline:+,.0f}/day "
+                    f"({active.profile})"
+                ),
+                body=(
+                    f"CostSense PR Predictor flagged a material cost increase.\n\n"
+                    f"Account: {active.profile}\n"
+                    f"PR: {pr_url.strip()}\n"
+                    f"Verdict: {verdict.verdict}\n"
+                    f"Estimated daily impact: ${_delta_headline:+,.2f}\n"
+                    f"Estimated monthly impact: ${_monthly:+,.0f}\n"
+                    f"Confidence: {(verdict.confidence or 'medium').title()}\n\n"
+                    f"Please review the PR diff and recommendations in CostSense."
+                ),
+                source_page="PR Predictor",
+                source_type="pr_cost_increase",
+            ),
+        )
 
     if _has_range:
         _lo_signed, _hi_signed = min(_lo, _hi), max(_lo, _hi)

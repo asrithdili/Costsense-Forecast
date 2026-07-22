@@ -52,6 +52,7 @@ from src.dashboard.costsense_theme import (
     C, callout, metric, money, pill, plotly_layout, section,
 )
 from src.dashboard.live_cost_meter import render_live_cost_meter
+from src.dashboard.notifications_ui import NotificationDraft, render_notification_button
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
 )
@@ -657,6 +658,44 @@ render_live_cost_meter(
     delta_pct=delta_pct_kpi,
     account_label=account_id,
 )
+
+_FORECAST_SPIKE_PCT = 20.0
+if (
+    delta_pct_kpi is not None
+    and delta_pct_kpi > _FORECAST_SPIKE_PCT
+    and next_7_total is not None
+    and last_7_actual is not None
+    and last_7_actual > 0
+):
+    _next_avg_txt = f"${_next_7_avg:,.0f}/day" if _next_7_avg is not None else "—"
+    _last_avg_txt = f"${_last_7_avg:,.0f}/day" if _last_7_avg is not None else "—"
+    render_notification_button(
+        button_label="Notify forecast spike",
+        state_key=f"dashboard::{account_id}",
+        draft=NotificationDraft(
+            title="Forecast spend spike",
+            severity="High",
+            reason=(
+                f"Next 7-day forecast is {delta_pct_kpi:+.1f}% above the "
+                f"recent 7-day baseline for account {account_id}."
+            ),
+            recipient="finops-team@example.com",
+            subject=(
+                f"[CostSense] Forecast spike — {account_id} "
+                f"(+{delta_pct_kpi:.1f}% vs baseline)"
+            ),
+            body=(
+                f"CostSense flagged a material forecast increase on the Dashboard.\n\n"
+                f"Account: {account_id} ({active_profile})\n"
+                f"Last 7d actual (avg): {_last_avg_txt}\n"
+                f"Next 7d forecast (avg): {_next_avg_txt}\n"
+                f"Change vs baseline: {delta_pct_kpi:+.1f}%\n\n"
+                f"Please review the Dashboard forecast and recent PR / usage drivers."
+            ),
+            source_page="Dashboard",
+            source_type="forecast_spike",
+        ),
+    )
 
 st.divider()
 
