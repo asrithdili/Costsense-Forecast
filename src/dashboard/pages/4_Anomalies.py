@@ -21,7 +21,13 @@ if str(_REPO_ROOT) not in sys.path:
 
 import streamlit as st
 
-from src.ai_agent.anomaly_agent import analyze_anomalies
+from src.ai_agent.anomaly_agent import analyze_anomalies, Approach
+from src.ai_agent.pr_fix_agent import plan_pr_fix
+from src.pr_scanner.gh_write import (
+    apply_pr_plan,
+    build_diff_preview,
+    github_write_auth_status,
+)
 from src.ai_agent.aws_sweep import sweep_account
 from src.ai_agent.aws_sweep import sweep_to_summary as aws_summary
 from src.ai_agent.repo_sweep import sweep_repos
@@ -210,7 +216,11 @@ if _is_stale(report):
 # from an earlier schema" artifacts. Also clears any siblings (aws/repo).
 if run_btn:
     stale = [k for k in list(st.session_state.keys())
-             if isinstance(k, str) and k.startswith("anom::")]
+             if isinstance(k, str) and (
+                 k.startswith("anom::")
+                 or "::pr_plan::" in k
+                 or "::pr_result::" in k
+             )]
     for k in stale:
         del st.session_state[k]
     report = None
@@ -266,6 +276,28 @@ def _plain(text: str) -> str:
     if not text:
         return ""
     return text.replace("$", "\\$").strip()
+
+
+PR_ELIGIBLE_LANGUAGES = frozenset({
+    "terraform", "hcl", "typescript", "javascript", "python",
+    "yaml", "yml", "json",
+})
+
+
+def _approach_pr_eligible(ap: Approach) -> bool:
+    code = (getattr(ap, "code", "") or "").strip()
+    lang = (getattr(ap, "language", "") or "").strip().lower()
+    if lang == "yml":
+        lang = "yaml"
+    return bool(code) and lang in PR_ELIGIBLE_LANGUAGES
+
+
+def _pr_plan_key(report_key: str, action_idx: int) -> str:
+    return f"{report_key}::pr_plan::{action_idx}"
+
+
+def _pr_result_key(report_key: str, action_idx: int) -> str:
+    return f"{report_key}::pr_result::{action_idx}"
 
 
 section(
@@ -333,7 +365,8 @@ if report.actions:
         kicker="Actions",
     )
 
-    for i, a in enumerate(filtered, start=1):
+    for display_i, a in enumerate(filtered, start=1):
+        action_idx = report.actions.index(a)
         cat_label = CATEGORY_LABEL.get(
             a.category or "other", (a.category or "Other").title()
         )
@@ -343,7 +376,7 @@ if report.actions:
             head_l, head_r = st.columns([5, 1], gap="medium")
             with head_l:
                 st.markdown(
-                    f"**#{i} · {cat_label}**"
+                    f"**#{display_i} · {cat_label}**"
                     f"   ·   Save **{_plain(save_txt)}/day**"
                 )
             with head_r:
@@ -392,3 +425,100 @@ if report.actions:
                         st.markdown(_plain(desc))
                     if code:
                         st.code(code, language=lang)
+
+                # --- Draft PR flow (gated: IaC code + scanned repos) ---
+                if _approach_pr_eligible(best) and selected_repos:
+                    gh_ready, gh_msg = github_write_auth_status()
+                    plan_key = _pr_plan_key(report_key, action_idx)
+                    result_key = _pr_result_key(report_key, action_idx)
+                    pr_result = st.session_state.get(result_key)
+
+                    if pr_result:
+                        st.success(f"Draft PR opened: {pr_result}")
+                    else:
+                        if not gh_ready:
+                            st.caption(f"GitHub write: {gh_msg}")
+
+                        plan = st.session_state.get(plan_key)
+                        prepare_key = f"anom_prepare_pr_{report_key}_{action_idx}"
+                        confirm_key = f"anom_confirm_pr_{report_key}_{action_idx}"
+                        cancel_key = f"anom_cancel_pr_{report_key}_{action_idx}"
+
+                        if st.button(
+                            "Prepare draft PR",
+                            key=prepare_key,
+                            disabled=not gh_ready,
+                            type="secondary",
+                        ):
+                            with st.spinner(
+                                "Locating file in repo and building preview…"
+                            ):
+                                try:
+                                    plan = plan_pr_fix(
+                                        action=a,
+                                        approach=best,
+                                        allowed_repos=selected_repos,
+                                        model_id=model_id,
+                                    )
+                                    st.session_state[plan_key] = plan
+                                except Exception as e:  # noqa: BLE001
+                                    callout(f"PR planning failed: {e}", tone="error")
+                                    st.code(traceback.format_exc())
+
+                        plan = st.session_state.get(plan_key)
+                        if plan is not None:
+                            if plan.error:
+                                callout(
+                                    f"Could not prepare PR: {plan.error}",
+                                    tone="warning",
+                                )
+                            elif plan.repo and plan.files:
+                                st.markdown("**PR preview**")
+                                st.markdown(
+                                    f"- **Repo:** `{plan.repo}`\n"
+                                    f"- **Branch:** `{plan.branch}`\n"
+                                    f"- **Title:** {_plain(plan.title)}"
+                                )
+                                try:
+                                    diff_text = build_diff_preview(
+                                        plan.repo,
+                                        [{"path": f.path, "content": f.content}
+                                         for f in plan.files],
+                                    )
+                                except Exception as e:  # noqa: BLE001
+                                    diff_text = f"(diff preview failed: {e})"
+                                st.code(diff_text or "(no changes)", language="diff")
+
+                                btn_l, btn_r = st.columns(2)
+                                with btn_l:
+                                    if st.button(
+                                        "Open draft PR",
+                                        key=confirm_key,
+                                        type="primary",
+                                    ):
+                                        with st.spinner("Pushing branch and opening draft PR…"):
+                                            try:
+                                                url = apply_pr_plan(
+                                                    repo=plan.repo,
+                                                    branch=plan.branch,
+                                                    title=plan.title,
+                                                    body=plan.body,
+                                                    files=[
+                                                        {"path": f.path,
+                                                         "content": f.content}
+                                                        for f in plan.files
+                                                    ],
+                                                )
+                                                st.session_state[result_key] = url
+                                                del st.session_state[plan_key]
+                                                st.rerun()
+                                            except Exception as e:  # noqa: BLE001
+                                                callout(
+                                                    f"Failed to open draft PR: {e}",
+                                                    tone="error",
+                                                )
+                                                st.code(traceback.format_exc())
+                                with btn_r:
+                                    if st.button("Discard preview", key=cancel_key):
+                                        del st.session_state[plan_key]
+                                        st.rerun()

@@ -17,6 +17,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from src.env import load_env
+
+load_env()
+
 import streamlit as st
 
 from src.ai_agent.chat_agent import chat_step
