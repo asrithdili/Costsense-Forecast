@@ -14,7 +14,10 @@ jobs:
   cost-check:
     uses: ./.github/workflows/pr-cost-check-reusable.yml
     with:
-      aws_profile: dil-data-platform-dev
+      # aws_profile intentionally omitted — on GitHub-hosted runners no
+      # local AWS profile file exists. Credentials come from the OIDC
+      # role assumption in the reusable workflow, which exports the
+      # standard AWS_* env vars boto3 picks up automatically.
       max_daily_increase_usd: "5"
       include_forecast_chart: true
     secrets:

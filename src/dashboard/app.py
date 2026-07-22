@@ -24,12 +24,13 @@ load_env()
 import streamlit as st
 
 from src.ai_agent.chat_agent import chat_step
-from src.dashboard.nav import render as render_nav
+from src.dashboard.costsense_theme import section
+from src.dashboard.nav import inject_css, render as render_nav
 from src.dashboard.nav import render_sidebar_footer, render_sidebar_header
 
 
-st.set_page_config(page_title="CostSense · AI Chat", layout="wide",
-                   page_icon="🤖")
+st.set_page_config(page_title="CostSense · AI Chat", layout="wide")
+inject_css()
 
 # Render the Diligent brand card FIRST — before any AWS calls — so it
 # appears instantly regardless of STS latency.
@@ -37,11 +38,13 @@ render_sidebar_header()
 
 # Render title first so the page isn't blank while SSO/STS profile
 # resolution runs inside render_nav().
-st.title("CostSense AI")
-st.caption("Chat with a FinOps agent that has read-only access to your AWS "
-           "account. Ask anything about spend, resources, PRs, or "
-           "recommendations. The bot uses live AWS APIs and auto-redacts "
-           "anything that looks like a secret.")
+section(
+    "Ask CostSense",
+    "Chat with a FinOps agent that has read-only access to your AWS "
+    "account. Ask about spend, resources, PRs, or recommendations — "
+    "answers are grounded in live AWS APIs with secrets auto-redacted.",
+    kicker="Assistant",
+)
 
 with st.spinner("Resolving AWS profiles…"):
     sel = render_nav(include_model=True)
@@ -107,6 +110,11 @@ SUGGESTIONS = [
 ]
 
 
+def _safe_md(text: str) -> None:
+    """Render markdown without Streamlit treating $...$ as LaTeX math."""
+    st.markdown(text.replace("$", "\\$"))
+
+
 def _queue_question(q: str) -> None:
     """Echo the user's message right away and defer the (slow) agent call
     to the pending-question block below, which runs after this bubble is
@@ -140,7 +148,7 @@ def _run_pending_question(q: str) -> None:
     if turn.error:
         st.session_state.chat_display.append({
             "role": "assistant",
-            "text": f"❌ {turn.error}",
+            "text": f"Error: {turn.error}",
             "tool_calls": turn.tool_calls,
         })
         return
@@ -156,10 +164,7 @@ def _run_pending_question(q: str) -> None:
 
 for msg in st.session_state.chat_display:
     with st.chat_message(msg["role"]):
-        # Escape "$" so dollar figures (e.g. "$400-800") don't get parsed as
-        # LaTeX math by Streamlit's markdown renderer — that mangles the
-        # font (serif/italic, wrong size) for anything between two "$".
-        st.markdown(msg["text"].replace("$", "\\$"))
+        _safe_md(msg["text"])
         if msg.get("_trace"):
             with st.expander("Traceback"):
                 st.code(msg["_trace"])
@@ -168,15 +173,25 @@ for msg in st.session_state.chat_display:
 # ---------- suggested chips (only show when chat is empty) ----------
 
 if not st.session_state.chat_display:
-    st.markdown("**Try a suggested question:**")
-    cols = st.columns(3)
-    for i, s in enumerate(SUGGESTIONS):
-        if cols[i % 3].button(s, key=f"sug_{i}", use_container_width=True):
-            _queue_question(s)
-            st.rerun()
+    with st.container(border=True):
+        section(
+            "Suggested questions",
+            "Pick one to get started, or type your own below.",
+            kicker="Start here",
+        )
+        cols = st.columns(3, gap="medium")
+        for i, s in enumerate(SUGGESTIONS):
+            if cols[i % 3].button(
+                s, key=f"sug_{i}", use_container_width=True, type="secondary",
+            ):
+                _queue_question(s)
+                st.rerun()
 
 
 # ---------- input box ----------
+
+if st.session_state.chat_display:
+    st.divider()
 
 user_q = st.chat_input(
     "Ask about your AWS costs, resources, or PRs…",

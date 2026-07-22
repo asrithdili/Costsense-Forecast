@@ -1,3 +1,13 @@
+[theme]
+# Native Streamlit palette — costsense_theme.inject_css() adds finer styling
+# (cards, metrics, buttons, tabular numerals) on top of this.
+base = "light"
+primaryColor = "#0C7C74"              # brand teal — buttons, links, active states
+backgroundColor = "#F6F7F9"             # app canvas (warm off-white)
+secondaryBackgroundColor = "#FFFFFF"    # cards / sidebar
+textColor = "#14181F"                  # ink
+font = "sans serif"
+
 [client]
 # Hides the "Deploy" button in the top-right toolbar (Streamlit Community Cloud
 # shortcut, not used by this app). The "⋮" menu and everything else is unaffected.
@@ -5,8 +15,12 @@ toolbarMode = "viewer"
 # Suppress the "Show error details / warnings" and file-change chatter in the
 # UI so demos aren't cluttered by Streamlit toasts.
 showErrorDetails = false
+# Disable Streamlit's built-in multipage nav — we render custom page_link nav
+# below the brand card in nav.render_sidebar_header(). Prevents the default
+# sidebar from flashing before our CSS/script runs on page load/navigation.
+showSidebarNavigation = false
 
 [server]
 # Silently rerun on every file save instead of showing the
 # "File change. Rerun / Always rerun" toast at the top-right.
-runOnSave = true
+runOnSave = false
