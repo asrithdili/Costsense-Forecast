@@ -78,7 +78,8 @@ jobs:
         working-directory: costsense
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          AWS_PROFILE: ${{ inputs.aws_profile }}
+          # Logical account label for CostSense — not ~/.aws/config on GHA.
+          COSTSENSE_AWS_PROFILE: ${{ inputs.aws_profile }}
         run: |
           ARGS=(
             --pr-url "${{ github.event.pull_request.html_url }}"
