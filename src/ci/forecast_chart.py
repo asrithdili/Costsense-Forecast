@@ -1,7 +1,6 @@
 """Plotly forecast chart for GitHub Actions job summaries."""
 from __future__ import annotations
 
-from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -56,9 +55,26 @@ def build_forecast_figure(
             line=dict(color="#7B3F99", width=2.5, shape="spline",
                       smoothing=1.0),
         ))
-        fig.add_vline(
-            x=cutoff, line_dash="dash", line_color="#888",
-            annotation_text="cutoff", annotation_position="top",
+        # Plotly <6 crashes in add_vline(..., annotation_text=...) on date axes
+        # (TypeError: int + datetime.date). Use a shape + label instead.
+        cutoff_ts = pd.Timestamp(cutoff)
+        fig.add_shape(
+            type="line",
+            x0=cutoff_ts,
+            x1=cutoff_ts,
+            y0=0,
+            y1=1,
+            yref="paper",
+            line=dict(dash="dash", color="#888", width=1),
+        )
+        fig.add_annotation(
+            x=cutoff_ts,
+            y=1,
+            yref="paper",
+            text="cutoff",
+            showarrow=False,
+            yanchor="bottom",
+            font=dict(size=11, color="#888"),
         )
 
     if not pr_series_df.empty:
