@@ -27,19 +27,40 @@ def _env_credentials_available() -> bool:
     return bool(os.environ.get("AWS_ACCESS_KEY_ID"))
 
 
+def _session_from_environment() -> boto3.Session:
+    """Session backed by ``AWS_*`` env vars (OIDC, aws-vault, export).
+
+    A plain ``boto3.Session()`` still honours ``AWS_PROFILE`` in the
+    environment and tries to load that name from ``~/.aws/config``, which
+    fails on GitHub Actions runners where only ephemeral OIDC creds exist.
+    """
+    region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION")
+    return boto3.Session(
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
+        region_name=region,
+    )
+
+
+def _should_use_env_credentials(profile: str | None) -> bool:
+    if not _env_credentials_available():
+        return False
+    if not profile:
+        return True
+    vault = vault_profile()
+    if vault == profile:
+        return True
+    active = os.environ.get("AWS_PROFILE")
+    return active == profile and not vault
+
+
 def make_session(profile: str | None = None) -> boto3.Session:
     """Return a boto3 Session for *profile*, honoring aws-vault env creds."""
+    if _should_use_env_credentials(profile):
+        return _session_from_environment()
+
     if not profile:
-        return boto3.Session()
-
-    vault = vault_profile()
-    if vault == profile and _env_credentials_available():
-        return boto3.Session()
-
-    active = os.environ.get("AWS_PROFILE")
-    if (active == profile
-            and _env_credentials_available()
-            and not vault):
         return boto3.Session()
 
     return boto3.Session(profile_name=profile)
