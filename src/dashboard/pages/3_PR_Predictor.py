@@ -34,12 +34,15 @@ MODEL_OPTIONS = [
     ("anthropic.claude-3-haiku-20240307-v1:0", "Claude 3 Haiku"),
 ]
 
-# Streamlit's markdown renderer treats a "$...$" pair as inline LaTeX math,
-# which is exactly what raw "$57.60/day" style text looks like — it mangles
-# the font (serif/italic, wrong size) and garbles spacing. `_md` escapes the
-# "$" before anything AI-generated goes through st.markdown/st.write so all
-# body text renders in one consistent font. The CSS below is a second,
-# belt-and-suspenders normalizer for font-size across every text element.
+# Streamlit's markdown parser treats several characters as syntax that
+# mangle plain LLM prose:
+#   - "$…$" pair  → inline LaTeX (breaks font)
+#   - "~text~"    → strikethrough (crossed-out numbers like ~14,400 inv/day)
+#   - "*text*"    → italic (rare in LLM output but happens)
+# `_md` escapes them before anything AI-generated hits st.markdown so all
+# body text renders in one consistent font, un-styled. The CSS below is a
+# second, belt-and-suspenders normalizer for font-size across every text
+# element, plus a bit of polish on the metric tiles + badge captions.
 st.markdown("""
 <style>
 [data-testid="stMarkdownContainer"] p,
@@ -49,13 +52,46 @@ st.markdown("""
     line-height: 1.6 !important;
     font-style: normal !important;
 }
+/* Tighten the "range -X … -Y" caption under metric tiles so it reads
+   as an annotation, not a delta chip. */
+[data-testid="stMetricDelta"] {
+    font-weight: 400 !important;
+    opacity: 0.75;
+    font-size: 0.85rem !important;
+}
+/* Basis + Confidence badges: turn the caption line into a small chip
+   row that reads as a status bar, not body text. */
+.costsense-badge-row {
+    display: flex;
+    gap: 1.5rem;
+    align-items: center;
+    padding: 0.5rem 0.75rem;
+    border-radius: 8px;
+    background: rgba(120, 120, 120, 0.08);
+    border: 1px solid rgba(120, 120, 120, 0.15);
+    margin: 0.5rem 0 0.75rem 0;
+    font-size: 0.9rem;
+}
+.costsense-badge-row .label {
+    opacity: 0.6;
+    font-weight: 500;
+    margin-right: 0.3rem;
+}
 </style>
 """, unsafe_allow_html=True)
 
 
 def _md(text: str | None) -> str:
-    """Escape '$' so it never gets parsed as LaTeX math."""
-    return (text or "").replace("$", "\\$")
+    """Escape markdown syntax that mangles plain prose from the LLM:
+    "$" (LaTeX), "~" (strikethrough), "*" and "_" (emphasis)."""
+    if not text:
+        return ""
+    return (text
+            .replace("\\", "\\\\")
+            .replace("$", "\\$")
+            .replace("~", "\\~")
+            .replace("*", "\\*")
+            .replace("_", "\\_"))
 
 
 st.title("PR Predictor")
@@ -232,41 +268,44 @@ if verdict is not None:
         delta=f"{_delta_headline:+,.2f}",
         delta_color="inverse",
     )
-    cols[2].metric(
-        "Est. daily impact",
-        f"${_delta_headline:+,.2f}",
-        delta=(f"range ${min(_lo, _hi):+,.2f} … ${max(_lo, _hi):+,.2f}"
-               if _has_range else None),
-        delta_color="off",
-    )
+    cols[2].metric("Est. daily impact", f"${_delta_headline:+,.2f}")
     _monthly = _delta_headline * 30
-    cols[3].metric(
-        "Est. monthly impact",
-        f"${_monthly:+,.0f}",
-        delta=(f"range ${min(_lo, _hi) * 30:+,.0f} … "
-               f"${max(_lo, _hi) * 30:+,.0f}"
-               if _has_range else None),
-        delta_color="off",
-    )
+    cols[3].metric("Est. monthly impact", f"${_monthly:+,.0f}")
     cols[4].metric("AWS tool calls", verdict.tool_calls)
 
-    badge_cols = st.columns([3, 2])
-    badge_cols[0].caption(f"**Basis:** {_basis_label}")
-    badge_cols[1].caption(f"**Confidence:** {_conf_label}")
+    # Range caption sits underneath so it reads as an annotation on both
+    # daily + monthly tiles, not a directional chip. Only shown when the
+    # verdict actually carries a range.
+    if _has_range:
+        _lo_signed, _hi_signed = min(_lo, _hi), max(_lo, _hi)
+        st.caption(
+            f"Daily range \\${_lo_signed:+,.2f} to \\${_hi_signed:+,.2f}  ·  "
+            f"Monthly range \\${_lo_signed * 30:+,.0f} to "
+            f"\\${_hi_signed * 30:+,.0f}"
+        )
+
+    # Basis + Confidence badges in a single status-bar row.
+    st.markdown(
+        f'<div class="costsense-badge-row">'
+        f'<span><span class="label">Basis</span>{_basis_label}</span>'
+        f'<span><span class="label">Confidence</span>{_conf_label}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
     if not _measured or _basis != "measured":
         if _basis == "sibling_account":
             st.caption(
-                "⚠ This number is an estimate, not a measured cost. It "
-                "comes from historical precedent: a prior scope-expansion "
-                "PR in this repo, and the step change it caused in a "
-                "sibling AWS account around its merge date."
+                "This number is an estimate, not a measured cost. It comes "
+                "from historical precedent: a prior scope-expansion PR in "
+                "this repo, and the step change it caused in a sibling AWS "
+                "account around its merge date."
             )
         else:
             st.caption(
-                "⚠ No reachable AWS account runs the service this PR "
-                "affects, and no historical precedent was found in this "
-                "repo. The true cost delta is greater than $0/day but "
-                "cannot be quantified from available data."
+                "No reachable AWS account runs the service this PR affects, "
+                "and no historical precedent was found in this repo. The "
+                "true cost delta is greater than \\$0/day but cannot be "
+                "quantified from available data."
             )
 
     if narrative:
