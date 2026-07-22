@@ -407,6 +407,33 @@ from src.pr_scanner.cloudwatch_tool import (  # noqa: E402
 # Registry the agent iterates over
 # ---------------------------------------------------------------------------
 
+PRECEDENT_SPEC: dict = {
+    "name": "precedent_lookup",
+    "description": (
+        "Look up historical PRECEDENT cost impact for scope-expansion PRs "
+        "(PRs that onboard new tenants/orgs/customers by adding entries to "
+        "a whitelist/allowlist/config collection). Only call this when the "
+        "diff you were given actually onboards new entries into an "
+        "existing service — NOT for refactors, bug fixes, or PRs where "
+        "the added lines are function arguments, imports, or logic. "
+        "The tool re-analyses the current PR's diff, finds prior merged "
+        "PRs in the same repo that touched the same file(s), then measures "
+        "the step change in daily cost caused by those precedents in any "
+        "sibling AWS account (dev/staging/prod of the same repo) whose "
+        "credentials are locally reachable. Returns a measured "
+        "$/entry/day rate + sample details, or an explanation of why no "
+        "rate could be derived. This is the ONLY way to get a "
+        "measured (not fabricated) delta when the PR affects a service "
+        "that does not run in the current AWS account."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    },
+}
+
+
 TOOLS: dict[str, tuple[callable, dict]] = {
     "cloudtrail_lookup": (cloudtrail_lookup, CLOUDTRAIL_SPEC),
     "list_lambda_functions": (list_lambda_functions, LAMBDA_SPEC),
@@ -417,17 +444,69 @@ TOOLS: dict[str, tuple[callable, dict]] = {
     "rightsizing_recommendations": (rightsizing_recommendations, RIGHTSIZING_SPEC),
     "cost_by_service": (cost_by_service, COST_BY_SERVICE_SPEC),
     "get_cloudwatch_metric": (cloudwatch_metric, CLOUDWATCH_SPEC),
+    # precedent_lookup is registered via call_tool's special-case below;
+    # its spec is included in tool_specs() so the LLM sees it.
 }
 
 
 def tool_specs() -> list[dict]:
-    return [spec for _, spec in TOOLS.values()]
+    return [spec for _, spec in TOOLS.values()] + [PRECEDENT_SPEC]
+
+
+# `precedent_lookup` needs (repo, diff), which are per-invocation context
+# that the LLM shouldn't have to (and can't reliably) pass in args. The
+# agent loop stashes them here right before invoking the model.
+_precedent_ctx: dict = {"repo": None, "diff": None}
+
+
+def set_precedent_context(repo: str | None, diff: str | None) -> None:
+    _precedent_ctx["repo"] = repo
+    _precedent_ctx["diff"] = diff
+
+
+def _precedent_lookup_impl() -> dict:
+    from src.ai_agent.precedent import find_precedents
+    repo = _precedent_ctx.get("repo")
+    diff = _precedent_ctx.get("diff")
+    if not repo or not diff:
+        return {
+            "error": (
+                "precedent_lookup requires PR context. This tool is only "
+                "usable inside analyze_pr()."
+            )
+        }
+    try:
+        agg = find_precedents(repo, diff)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"precedent lookup failed: {e}"}
+    return {
+        "usable": agg.usable,
+        "note": agg.note,
+        "per_entry_daily_usd": agg.mean_per_tenant_daily_usd,
+        "range_low_per_entry_daily_usd": agg.low_per_tenant_daily_usd,
+        "range_high_per_entry_daily_usd": agg.high_per_tenant_daily_usd,
+        "samples": [
+            {
+                "pr_number": s.pr_number,
+                "pr_url": s.pr_url,
+                "merged_at": s.merged_at,
+                "entries_added": s.tenants_added,
+                "sibling_profile": s.sibling_profile,
+                "account_id": s.account_id,
+                "step_daily_usd": s.step_daily_usd,
+                "per_entry_daily_usd": s.per_tenant_daily_usd,
+            }
+            for s in agg.samples
+        ],
+    }
 
 
 def call_tool(name: str, args: dict, profile: str | None) -> dict:
     """Return a dict the caller can pass to Claude. Large results are
     shrunk structurally (drop long inner arrays) rather than truncated
     at byte-N, which would produce invalid JSON."""
+    if name == "precedent_lookup":
+        return _shrink(_precedent_lookup_impl())
     if name not in TOOLS:
         return {"error": f"unknown tool: {name}"}
     fn, _ = TOOLS[name]
