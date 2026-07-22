@@ -13,8 +13,9 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from functools import lru_cache
 
-import boto3
 from botocore.exceptions import BotoCoreError, ClientError
+
+from src.aws.session import make_session
 
 
 @dataclass
@@ -42,7 +43,7 @@ class AccountSpend:
 
 
 def _session(profile: str | None):
-    return boto3.Session(profile_name=profile) if profile else boto3.Session()
+    return make_session(profile)
 
 
 @lru_cache(maxsize=4)

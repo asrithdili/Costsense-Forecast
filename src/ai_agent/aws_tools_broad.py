@@ -12,14 +12,14 @@ import json
 import re
 from functools import lru_cache
 
-import boto3
 from botocore.exceptions import BotoCoreError, ClientError
+
+from src.aws.session import make_session
 
 
 @lru_cache(maxsize=64)
 def _client(profile: str | None, service: str, region: str):
-    session = (boto3.Session(profile_name=profile)
-               if profile else boto3.Session())
+    session = make_session(profile)
     return session.client(service, region_name=region)
 
 
@@ -169,7 +169,7 @@ COMPUTE_OPT_LAMBDA_SPEC = {
 
 @_safe
 def list_budgets(profile: str | None = None) -> dict:
-    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+    session = make_session(profile)
     sts = session.client("sts")
     account_id = sts.get_caller_identity()["Account"]
     b = session.client("budgets", region_name="us-east-1")
@@ -237,8 +237,7 @@ SERVICE_QUOTAS_SPEC = {
 
 @_safe
 def list_s3_buckets(profile: str | None = None) -> dict:
-    session = (boto3.Session(profile_name=profile)
-               if profile else boto3.Session())
+    session = make_session(profile)
     s3 = session.client("s3")
     resp = s3.list_buckets()
     buckets = []
@@ -261,8 +260,7 @@ S3_SPEC = {
 
 @_safe
 def s3_bucket_lifecycle(bucket: str, profile: str | None = None) -> dict:
-    session = (boto3.Session(profile_name=profile)
-               if profile else boto3.Session())
+    session = make_session(profile)
     s3 = session.client("s3")
     try:
         resp = s3.get_bucket_lifecycle_configuration(Bucket=bucket)

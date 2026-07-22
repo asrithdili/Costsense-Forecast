@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
 
-import boto3
+from src.aws.session import make_session
 
 
 @dataclass
@@ -14,8 +14,17 @@ class DailyCost:
     amount_usd: float
 
 
+@dataclass
+class ForecastDay:
+    """Single day from ``GetCostForecast``."""
+    target_date: date
+    predicted_usd: float
+    lower_usd: float
+    upper_usd: float
+
+
 def _client(profile: str | None, region: str = "us-east-1"):
-    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+    session = make_session(profile)
     return session.client("ce", region_name=region)
 
 
@@ -108,5 +117,64 @@ def fetch_actual_total(day: date, profile: str | None = None) -> float:
         if d == day:
             return amt
     return 0.0
+
+
+def fetch_cost_forecast(
+    cutoff: date,
+    horizon_days: int = 7,
+    profile: str | None = None,
+    region: str = "us-east-1",
+    service: str | None = None,
+    metric: str = "UNBLENDED_COST",
+    prediction_interval_level: int = 80,
+) -> list[ForecastDay]:
+    """Call ``GetCostForecast`` for daily spend after *cutoff*.
+
+    Returns one point per target day in ``(cutoff, cutoff + horizon_days]``.
+    AWS generates the forecast as-of the API call time (not as-of *cutoff*).
+    """
+    first_target = cutoff + timedelta(days=1)
+    last_target = cutoff + timedelta(days=horizon_days)
+    today = date.today()
+
+    # CE requires Start <= today; clamp when cutoff is today/tomorrow-boundary.
+    period_start = first_target if first_target <= today else today
+    period_end = last_target + timedelta(days=1)  # exclusive
+
+    if period_start > last_target:
+        return []
+
+    ce = _client(profile, region)
+    kwargs: dict = {
+        "TimePeriod": {
+            "Start": period_start.isoformat(),
+            "End": period_end.isoformat(),
+        },
+        "Metric": metric,
+        "Granularity": "DAILY",
+        "PredictionIntervalLevel": prediction_interval_level,
+    }
+    if service:
+        kwargs["Filter"] = {
+            "Dimensions": {"Key": "SERVICE", "Values": [service]},
+        }
+
+    resp = ce.get_cost_forecast(**kwargs)
+    out: list[ForecastDay] = []
+    for bucket in resp.get("ForecastResultsByTime", []):
+        target = date.fromisoformat(bucket["TimePeriod"]["Start"])
+        if target <= cutoff or target > last_target:
+            continue
+        mean = float(bucket.get("MeanValue", 0))
+        lower = float(bucket.get("PredictionIntervalLowerBound", mean))
+        upper = float(bucket.get("PredictionIntervalUpperBound", mean))
+        out.append(ForecastDay(
+            target_date=target,
+            predicted_usd=max(0.0, mean),
+            lower_usd=max(0.0, lower),
+            upper_usd=max(0.0, upper),
+        ))
+    out.sort(key=lambda p: p.target_date)
+    return out
 
 

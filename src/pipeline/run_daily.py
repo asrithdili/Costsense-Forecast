@@ -11,6 +11,8 @@ import pandas as pd
 from src.aws.cost_explorer import fetch_daily_totals
 from src.aws.profiles import resolve
 from src.forecast.ensemble import forecast_auto, tuned_params_dict
+from src.forecast.aws_forecast import forecast_from_ce
+from src.forecast.lightgbm_model import forecast_lightgbm
 from src.forecast.timeseries import (
     forecast_next_7_days,
     forecast_with_pr_regressor,
@@ -50,7 +52,7 @@ def run(
     analyzer: str = "hybrid",
     llm_model: str | None = None,
     service: str | None = None,
-    model: str = "ewm",
+    model: str = "lightgbm",
     include_open_prs: bool = True,
 ) -> Path:
     cutoff = cutoff or date.today()
@@ -109,6 +111,26 @@ def run(
             forecast = forecast_next_7_days(history_df, cutoff=cutoff)
     elif model == "ewm":
         forecast, tuned = forecast_auto(history_df, cutoff=cutoff)
+        if pr_steps:
+            from src.forecast.timeseries import build_step_series
+            step_df = build_step_series(
+                pr_steps,
+                start=history_df["day"].min().date(),
+                end=cutoff + timedelta(days=7),
+            )
+    elif model == "aws":
+        forecast = forecast_from_ce(
+            cutoff=cutoff, profile=profile, service=service,
+        )
+        if pr_steps:
+            from src.forecast.timeseries import build_step_series
+            step_df = build_step_series(
+                pr_steps,
+                start=history_df["day"].min().date(),
+                end=cutoff + timedelta(days=7),
+            )
+    elif model == "lightgbm":
+        forecast = forecast_lightgbm(history_df, cutoff=cutoff)
         if pr_steps:
             from src.forecast.timeseries import build_step_series
             step_df = build_step_series(

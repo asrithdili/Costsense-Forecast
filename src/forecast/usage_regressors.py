@@ -14,8 +14,9 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 
-import boto3
 import pandas as pd
+
+from src.aws.session import make_session
 
 
 # (namespace, metric_name, statistic) — extend as we find more accounts
@@ -40,7 +41,7 @@ class UsageSeries:
 
 @lru_cache(maxsize=16)
 def _cw_client(profile: str | None, region: str):
-    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+    session = make_session(profile)
     return session.client("cloudwatch", region_name=region)
 
 

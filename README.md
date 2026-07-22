@@ -42,8 +42,10 @@ Full positioning + honest limits: [docs/WHY_COSTSENSE.md](docs/WHY_COSTSENSE.md)
 # 1. Install
 pip install -r requirements.txt
 
-# 2. Log in to AWS SSO (any profile with Cost Explorer + read access)
+# 2. Log in to AWS (pick one)
 aws sso login --profile dil-data-platform-dev
+# or, if you use aws-vault:
+# aws-vault exec dil-data-platform-dev -- streamlit run src/dashboard/app.py --server.port 8501
 
 # 3. Log in to GitHub CLI (for PR / repo tools)
 gh auth login
