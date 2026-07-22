@@ -27,6 +27,7 @@ from src.ai_agent.aws_sweep import sweep_to_summary as aws_summary
 from src.ai_agent.repo_sweep import sweep_repos
 from src.ai_agent.repo_sweep import sweep_to_summary as repo_summary
 from src.aws.profiles import resolve_all
+from src.dashboard.costsense_theme import C, metric, money, section
 from src.pr_scanner.repos import gh_login, gh_orgs, repos_with_user_prs
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
@@ -38,10 +39,13 @@ st.set_page_config(page_title="CostSense · Anomalies", layout="wide",
 inject_css()
 render_sidebar_header()  # Diligent card renders before any AWS calls
 
-st.title("Anomalies & Recommendations")
-st.caption("Full-repo + full-AWS sweep. Ranked list of concrete cost-cutting "
-           "actions with $/day savings and confidence, grounded in real "
-           "AWS + GitHub data.")
+section(
+    "Anomalies & Recommendations",
+    "Full-repo + full-AWS sweep. Ranked list of concrete cost-cutting "
+    "actions with $/day savings and confidence, grounded in real "
+    "AWS + GitHub data.",
+    kicker="Analysis",
+)
 
 
 # ---------- top control bar ----------
@@ -112,7 +116,7 @@ from src.pr_scanner.profile_repo_match import match_repos as _match
 default_repos = _match(active_preview.profile, short_names_preview) or short_names_preview
 
 with top_bar(header):
-    c1, c2 = st.columns([3, 3])
+    c1, c2 = st.columns([3, 3], gap="medium", vertical_alignment="bottom")
     with c1:
         picked_label = st.selectbox(
             "Account", labels,
@@ -127,7 +131,7 @@ with top_bar(header):
             key="anom_model_idx",
         )
 
-    c3, c4 = st.columns([2, 5])
+    c3, c4 = st.columns([2, 5], gap="medium", vertical_alignment="bottom")
     with c3:
         if orgs:
             gh_org = st.selectbox(
@@ -253,6 +257,7 @@ if report.error:
     st.error(f"Agent error: {report.error}")
     st.stop()
 
+
 def _plain(text: str) -> str:
     """Escape dollar signs so Streamlit's markdown doesn't render $..$ as
     LaTeX math. Also strip leading/trailing whitespace."""
@@ -261,26 +266,63 @@ def _plain(text: str) -> str:
     return text.replace("$", "\\$").strip()
 
 
-# KPI row first — clean numbers at a glance.
-kpis = st.columns(3)
-kpis[0].metric("Recommended actions", len(report.actions))
-kpis[1].metric("Potential savings / day",
-               f"${report.total_daily_savings_usd:,.2f}")
-kpis[2].metric("AWS tool calls (drill-down)", report.tool_calls)
+def _confidence_pill(confidence: str) -> str:
+    """Confidence badge using shared tokens and cs-pill styling."""
+    conf_lower = (confidence or "medium").lower()
+    label = conf_lower.title()
+    color, soft = {
+        "high": (C.GOOD, C.SEV_SOFT["Low"]),
+        "medium": (C.SEV["Medium"], C.SEV_SOFT["Medium"]),
+        "low": (C.MUTED, "#F1F3F5"),
+    }.get(conf_lower, (C.MUTED, "#F1F3F5"))
+    return (
+        f'<span class="cs-pill" style="background:{soft};color:{color};">'
+        f'<span class="cs-dot" style="background:{color};"></span>{label}</span>'
+    )
 
-# Summary rendered as a subtle info block instead of a competing header.
-# This gives the page clear visual hierarchy:
-#   Page title (h1)  →  KPI numbers  →  Summary blurb  →  Card list.
+
+section(
+    "Scan results",
+    "Ranked actions from the latest AWS and repository sweep.",
+    kicker="Results",
+)
+
+# KPI row first — clean numbers at a glance.
+savings = report.total_daily_savings_usd
+savings_display = (
+    money(savings) if savings >= 1_000 else f"${savings:,.2f}"
+)
+kpis = st.columns(3, gap="medium")
+with kpis[0]:
+    metric("Recommended actions", len(report.actions))
+with kpis[1]:
+    metric(
+        "Potential savings / day",
+        savings_display,
+        delta="recurring",
+        good=True,
+    )
+with kpis[2]:
+    metric("AWS tool calls (drill-down)", report.tool_calls)
+
+# Summary — theme-consistent bordered card instead of heavy st.info banner.
 if report.summary:
-    st.info(f"**Summary** — {_plain(report.summary)}")
+    with st.container(border=True):
+        section("Summary", _plain(report.summary), kicker="Overview")
 
 st.divider()
 
 # Category filter
 if report.actions:
+    section(
+        "Filter actions",
+        "Narrow the list by recommendation category.",
+        kicker="Filters",
+    )
     cats = sorted({a.category or "other" for a in report.actions})
     picked_cats = st.multiselect(
         "Filter by category", cats, default=cats,
+        label_visibility="collapsed",
     )
     filtered = [a for a in report.actions
                 if (a.category or "other") in picked_cats]
@@ -296,31 +338,34 @@ if report.actions:
         "other": "Other",
     }
 
+    section(
+        "Recommended actions",
+        f"{len(filtered)} action(s) shown"
+        + (f" of {len(report.actions)} total." if len(filtered) != len(report.actions)
+           else "."),
+        kicker="Actions",
+    )
+
     for i, a in enumerate(filtered, start=1):
-        conf_lower = (a.confidence or "medium").lower()
-        conf_bg = {
-            "high": "#16a34a",
-            "medium": "#eab308",
-            "low": "#6b7280",
-        }.get(conf_lower, "#6b7280")
         cat_label = CATEGORY_LABEL.get(
             a.category or "other", (a.category or "Other").title()
         )
+        save_amt = a.est_daily_savings_usd
+        save_txt = money(save_amt) if save_amt >= 1_000 else f"${save_amt:,.2f}"
         with st.container(border=True):
-            head_l, head_r = st.columns([5, 1])
-            head_l.markdown(
-                f"**#{i} · {cat_label}**"
-                f"   ·  Save **\\${a.est_daily_savings_usd:,.2f}/day**"
-            )
-            head_r.markdown(
-                f"<div style='text-align:right;'>"
-                f"<span style='background:{conf_bg};color:white;"
-                f"padding:2px 10px;border-radius:12px;"
-                f"font-size:0.85em;font-weight:600;'>"
-                f"{a.confidence.title()}"
-                f"</span></div>",
-                unsafe_allow_html=True,
-            )
+            head_l, head_r = st.columns([5, 1], gap="medium")
+            with head_l:
+                st.markdown(
+                    f"**#{i} · {cat_label}**"
+                    f"   ·   Save **{_plain(save_txt)}/day**"
+                )
+            with head_r:
+                st.markdown(
+                    f"<div style='text-align:right;'>"
+                    f"{_confidence_pill(a.confidence)}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
             st.markdown(
                 f"- **Issue:** {_plain(a.issue) or '_—_'}\n"
@@ -360,6 +405,3 @@ if report.actions:
                         st.markdown(_plain(desc))
                     if code:
                         st.code(code, language=lang)
-
-
-
