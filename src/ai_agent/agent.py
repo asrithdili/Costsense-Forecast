@@ -24,7 +24,7 @@ from src.pr_scanner.gh_client import pr_diff, pr_view_json
 DEFAULT_MODEL = "anthropic.claude-3-haiku-20240307-v1:0"
 BEDROCK_REGION = "us-west-2"
 MAX_TOOL_TURNS = 16
-MAX_TOKENS = 3500
+MAX_TOKENS = 8000
 # 3 was too low: it lets Haiku call 3 shallow tools and declare "neutral".
 # 5 forces a real exploration path — at minimum: cost_by_service + one
 # CloudWatch call per major resource + verification of at least one metric.
@@ -240,9 +240,30 @@ Return ONLY a JSON object with this shape (no prose outside JSON):
   ]
 }
 Findings describe what the PR ALREADY DOES to cost.
-Recommendations describe what the PR SHOULD ALSO DO to reduce cost further \
-— always include current_code/recommended_code when the resource's config \
-is visible in the diff, so the PR author can copy-paste the fix."""
+
+Recommendations describe what the PR SHOULD ALSO DO to reduce cost \
+further or fix cost-relevant issues you spotted in the diff. \
+COMPLETENESS RULES for the `recommendations` array:
+  1. Return EVERY legitimate recommendation the diff admits — do not \
+     stop at 1 or 2. Walk through every file the PR touches and every \
+     resource it references. For each, ask: is there anything in the \
+     diff or in the AWS metrics that suggests a specific, actionable \
+     improvement? If yes, add it. Typical PRs produce 3–8 \
+     recommendations; complex ones produce more.
+  2. Each recommendation must be TRACEABLE to something concrete: a \
+     code smell in the diff, a measured metric from a tool call, or a \
+     documented AWS best practice for the exact resource class in \
+     play. Never invent generic advice ("consider adding caching") \
+     that isn't anchored to this PR's actual code.
+  3. Include `current_code` + `recommended_code` whenever the \
+     resource's configuration or a code snippet is visible in the \
+     diff, so the author can copy-paste. If the recommendation is \
+     architectural (e.g. "cache X in DynamoDB"), leave those null \
+     and let `rationale` carry the weight.
+  4. Order recommendations by ABSOLUTE $/day impact, largest first.
+  5. If there are truly NO cost-reduction opportunities in the diff \
+     (e.g. a bug-fix PR that already touched what it needed to), \
+     return an EMPTY recommendations array — do not pad it."""
 
 
 SYSTEM_ACCOUNT = """You are a senior AWS FinOps engineer auditing an AWS \
