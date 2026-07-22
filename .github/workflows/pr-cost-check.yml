@@ -1,0 +1,15 @@
+name: PR Cost Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  cost-check:
+    uses: ./.github/workflows/pr-cost-check-reusable.yml
+    with:
+      aws_profile: dil-data-platform-dev
+      max_daily_increase_usd: "5"
+      include_forecast_chart: true
+    secrets:
+      AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}

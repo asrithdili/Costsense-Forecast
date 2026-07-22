@@ -7,3 +7,4 @@ python-dateutil>=2.9
 PyGithub>=2.3
 streamlit>=1.36
 plotly>=5.22
+kaleido>=0.2.1
