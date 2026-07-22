@@ -16,14 +16,13 @@ import streamlit as st
 
 from src.ai_agent.agent import analyze_pr
 from src.aws.profiles import resolve_all
-from src.dashboard.costsense_theme import metric, pill, section
+from src.dashboard.costsense_theme import callout, metric, pill, section
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
 )
 
 
-st.set_page_config(page_title="CostSense · PR Predictor", layout="wide",
-                   page_icon="🔮")
+st.set_page_config(page_title="CostSense · PR Predictor", layout="wide")
 inject_css()
 render_sidebar_header()  # Diligent card renders before any AWS calls
 
@@ -36,21 +35,7 @@ MODEL_OPTIONS = [
 # which is exactly what raw "$57.60/day" style text looks like — it mangles
 # the font (serif/italic, wrong size) and garbles spacing. `_md` escapes the
 # "$" before anything AI-generated goes through st.markdown/st.write so all
-# body text renders in one consistent font. The CSS below is a second,
-# belt-and-suspenders normalizer for font-size across every text element.
-st.markdown("""
-<style>
-[data-testid="stMarkdownContainer"] p,
-[data-testid="stMarkdownContainer"] li,
-[data-testid="stMarkdownContainer"] span {
-    font-size: 1rem !important;
-    line-height: 1.6 !important;
-    font-style: normal !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
-
+# body text renders in one consistent font.
 def _md(text: str | None) -> str:
     """Escape '$' so it never gets parsed as LaTeX math."""
     return (text or "").replace("$", "\\$")
@@ -78,7 +63,11 @@ section(
 with st.spinner("Resolving profiles…"):
     profiles = [p for p in resolve_all() if p.account_id]
 if not profiles:
-    st.error("No AWS profiles reachable. Run `aws sso login` or launch via `aws-vault exec <profile> --` first.")
+    callout(
+        "No AWS profiles reachable. Run `aws sso login` or launch via "
+        "`aws-vault exec <profile> --` first.",
+        tone="error",
+    )
     st.stop()
 labels = [p.label for p in profiles]
 model_ids = [mid for mid, _ in MODEL_OPTIONS]
@@ -157,14 +146,14 @@ if run and pr_url.strip():
                 pr_url.strip(), profile=active.profile, model_id=model_id,
             )
         except Exception as e:  # noqa: BLE001
-            st.error(f"agent failed: {e}")
+            callout(f"agent failed: {e}", tone="error")
             st.code(traceback.format_exc())
             st.stop()
     st.session_state[verdict_key] = verdict
 
 if verdict is not None:
     if verdict.error:
-        st.error(f"Agent error: {verdict.error}")
+        callout(f"Agent error: {verdict.error}", tone="error")
         st.stop()
 
     st.divider()

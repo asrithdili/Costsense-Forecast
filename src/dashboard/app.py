@@ -25,8 +25,7 @@ from src.dashboard.nav import inject_css, render as render_nav
 from src.dashboard.nav import render_sidebar_footer, render_sidebar_header
 
 
-st.set_page_config(page_title="CostSense · AI Chat", layout="wide",
-                   page_icon="🤖")
+st.set_page_config(page_title="CostSense · AI Chat", layout="wide")
 inject_css()
 
 # Render the Diligent brand card FIRST — before any AWS calls — so it
@@ -145,7 +144,7 @@ def _run_pending_question(q: str) -> None:
     if turn.error:
         st.session_state.chat_display.append({
             "role": "assistant",
-            "text": f"❌ {turn.error}",
+            "text": f"Error: {turn.error}",
             "tool_calls": turn.tool_calls,
         })
         return

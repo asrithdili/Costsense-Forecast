@@ -47,6 +47,7 @@ class C:
     HAIRLINE = "#E6E8EC"  # borders, dividers
     CANVAS = "#F6F7F9"    # app background
     CARD = "#FFFFFF"      # surfaces
+    NEUTRAL_SOFT = "#F1F3F5"  # neutral pill / badge fills
 
     # brand
     BRAND = "#0C7C74"       # teal — primary accent, key numbers, active nav
@@ -172,6 +173,15 @@ h1{ font-size:1.55rem; } h2{ font-size:1.2rem; } h3{ font-size:1.02rem; }
   background:var(--card); border:1px solid var(--line); border-radius:12px;
 }
 
+/* ---- Markdown body: consistent sizing for AI output and chat ---- */
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li,
+[data-testid="stMarkdownContainer"] span {
+  font-size:1rem !important;
+  line-height:1.6 !important;
+  font-style:normal !important;
+}
+
 /* ---- Custom components: section header, kicker, severity pill ---- */
 .cs-section{ margin:0.2rem 0 0.9rem 0; }
 .cs-kicker{
@@ -241,7 +251,7 @@ def section(title: str, subtitle: str | None = None, kicker: str = "") -> None:
 def pill(level: str) -> str:
     """Return HTML for a severity/status pill. Wrap in ``st.markdown(..., True)``."""
     color = C.SEV.get(level) or C.STATUS.get(level) or C.MUTED
-    soft = C.SEV_SOFT.get(level, "#F1F3F5")
+    soft = C.SEV_SOFT.get(level, C.NEUTRAL_SOFT)
     return (
         f'<span class="cs-pill" style="background:{soft};color:{color};">'
         f'<span class="cs-dot" style="background:{color};"></span>{level}</span>'
@@ -285,3 +295,39 @@ def money(x: float, decimals: int = 0) -> str:
 def severity_color(level: str) -> str:
     """Single source of truth for severity colour (charts + pills agree)."""
     return C.SEV.get(level, C.SEV["Low"])
+
+
+def callout(body: str, *, tone: str = "info", title: str = "") -> None:
+    """Themed notice card — drop-in for st.info / warning / success / error."""
+    styles: dict[str, tuple[str, str, str]] = {
+        "info": (C.INFO, C.BRAND_SOFT, "Notice"),
+        "warning": (C.SEV["Medium"], C.SEV_SOFT["Medium"], "Warning"),
+        "success": (C.GOOD, C.SEV_SOFT["Low"], "Success"),
+        "error": (C.BAD, C.SEV_SOFT["Critical"], "Error"),
+    }
+    color, soft, label = styles.get(tone, styles["info"])
+    with st.container(border=True):
+        st.markdown(
+            f'<span class="cs-pill" style="background:{soft};color:{color};">'
+            f'<span class="cs-dot" style="background:{color};"></span>'
+            f"{label}</span>",
+            unsafe_allow_html=True,
+        )
+        if title:
+            st.markdown(f"**{title}**")
+        st.markdown(body)
+
+
+def confidence_pill(confidence: str) -> str:
+    """Confidence badge HTML for ranked recommendations."""
+    conf_lower = (confidence or "medium").lower()
+    label = conf_lower.title()
+    color, soft = {
+        "high": (C.GOOD, C.SEV_SOFT["Low"]),
+        "medium": (C.SEV["Medium"], C.SEV_SOFT["Medium"]),
+        "low": (C.MUTED, C.NEUTRAL_SOFT),
+    }.get(conf_lower, (C.MUTED, C.NEUTRAL_SOFT))
+    return (
+        f'<span class="cs-pill" style="background:{soft};color:{color};">'
+        f'<span class="cs-dot" style="background:{color};"></span>{label}</span>'
+    )

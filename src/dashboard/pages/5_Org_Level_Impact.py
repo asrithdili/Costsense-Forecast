@@ -21,14 +21,13 @@ import streamlit as st
 
 from src.aws.org_spend import fetch_org_spend, top_service_by_account
 from src.aws.profiles import resolve_all
-from src.dashboard.costsense_theme import metric, money, section
+from src.dashboard.costsense_theme import callout, metric, money, section
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
 )
 
 
-st.set_page_config(page_title="CostSense · Org Impact", layout="wide",
-                   page_icon="🏢")
+st.set_page_config(page_title="CostSense · Org Impact", layout="wide")
 inject_css()
 render_sidebar_header()  # Diligent card renders before any AWS calls
 
@@ -46,7 +45,7 @@ section(
 with st.spinner("Resolving profiles…"):
     profiles = [p for p in resolve_all() if p.account_id]
 if not profiles:
-    st.error("No AWS profiles reachable.")
+    callout("No AWS profiles reachable.", tone="error")
     st.stop()
 default_idx = 0
 for i, p in enumerate(profiles):
@@ -114,7 +113,7 @@ if run:
         try:
             data = fetch_org_spend(active.profile, days=days)
         except Exception as e:  # noqa: BLE001
-            st.error(f"Cost Explorer failed: {e}")
+            callout(f"Cost Explorer failed: {e}", tone="error")
             st.code(traceback.format_exc())
             st.stop()
         if include_top_service and data:
@@ -142,13 +141,19 @@ if run:
 
 
 if data is None:
-    st.info("Open **Controls** above, pick the management/payer profile, "
-            "and click **Fetch org spend**.")
+    callout(
+        "Open **Controls** above, pick the management/payer profile, "
+        "and click **Fetch org spend**.",
+        tone="info",
+    )
     st.stop()
 
 if not data:
-    st.warning("No linked-account spend data found. Is this profile the "
-               "AWS Organizations management account?")
+    callout(
+        "No linked-account spend data found. Is this profile the "
+        "AWS Organizations management account?",
+        tone="warning",
+    )
     st.stop()
 
 # KPI row
@@ -186,8 +191,11 @@ if search.strip():
     q = search.strip()
     filtered = [a for a in data if q in a.account_id]
     if not filtered:
-        st.warning(f"No account id contains `{q}`. "
-                   f"Showing top {TOP_N} by spend instead.")
+        callout(
+            f"No account id contains `{q}`. "
+            f"Showing top {TOP_N} by spend instead.",
+            tone="warning",
+        )
         filtered = data[:TOP_N]
     else:
         st.caption(f"{len(filtered)} match(es) for `{q}`.")

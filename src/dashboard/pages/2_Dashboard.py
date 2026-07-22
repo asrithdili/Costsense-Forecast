@@ -48,13 +48,16 @@ from src.pr_scanner.repos import (
     repo_default_branch,
     repos_with_user_prs,
 )
-from src.dashboard.costsense_theme import C, metric, money, pill, plotly_layout, section
+from src.dashboard.costsense_theme import (
+    C, callout, metric, money, pill, plotly_layout, section,
+)
+from src.dashboard.live_cost_meter import render_live_cost_meter
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
 )
 
 
-st.set_page_config(page_title="CostSense · forecast", layout="wide", page_icon="💸")
+st.set_page_config(page_title="CostSense · forecast", layout="wide")
 inject_css()
 # Render the Diligent brand card FIRST — before any AWS calls — so it
 # appears instantly instead of waiting for STS profile resolution.
@@ -167,7 +170,11 @@ with st.spinner("Resolving profiles…"):
     profiles: list[ProfileInfo] = resolve_all()
 reachable = [p for p in profiles if p.account_id]
 if not reachable:
-    st.error("No reachable AWS profiles. Run `aws sso login` or launch via `aws-vault exec <profile> --` first, then reload.")
+    callout(
+        "No reachable AWS profiles. Run `aws sso login` or launch via "
+        "`aws-vault exec <profile> --` first, then reload.",
+        tone="error",
+    )
     st.stop()
 
 labels = [p.label for p in reachable]
@@ -485,7 +492,7 @@ with st.spinner(f"Fetching cost history for `{active_profile}`… "
             service=selected_service,
         )
     except Exception as e:  # noqa: BLE001
-        st.error(f"Cost Explorer fetch failed: {e}")
+        callout(f"Cost Explorer fetch failed: {e}", tone="error")
         st.code(traceback.format_exc())
         st.stop()
 
@@ -513,10 +520,10 @@ if do_forecast:
                 model=model_choice,
                 include_open_prs=include_pr,
             )
-            st.success(f"Wrote {Path(out).name}")
+            callout(f"Wrote {Path(out).name}", tone="success")
             st.cache_data.clear()
         except Exception as e:  # noqa: BLE001
-            st.error(f"Pipeline failed: {e}")
+            callout(f"Pipeline failed: {e}", tone="error")
             st.code(traceback.format_exc())
 
 
@@ -592,7 +599,7 @@ if show_replay and not hist_df.empty:
                     lambda r: (r["abs_err"] / r["actual_usd"])
                     if r["actual_usd"] else None, axis=1)
         except Exception as e:  # noqa: BLE001
-            st.warning(f"Training fit overlay failed: {e}")
+            callout(f"Training fit overlay failed: {e}", tone="warning")
 
 
 # KPI row
@@ -642,6 +649,15 @@ with kpis[3]:
     )
     metric(wape_label, wape_display)
 
+_last_7_avg = (last_7_actual / 7) if last_7_actual else None
+_next_7_avg = (next_7_total / 7) if next_7_total is not None else None
+render_live_cost_meter(
+    daily_burn_usd=_last_7_avg,
+    forecast_daily_usd=_next_7_avg,
+    delta_pct=delta_pct_kpi,
+    account_label=account_id,
+)
+
 st.divider()
 
 section(
@@ -652,9 +668,12 @@ section(
 
 # Unified chart: past actuals + future band
 if hist_df.empty and fc_df.empty:
-    st.info(f"No Cost Explorer data for account **{account_id}** in the last "
-            f"{history_days} days, and no forecast on disk. If this is a fresh "
-            f"sandbox, spend may simply be $0.")
+    callout(
+        f"No Cost Explorer data for account **{account_id}** in the last "
+        f"{history_days} days, and no forecast on disk. If this is a fresh "
+        f"sandbox, spend may simply be $0.",
+        tone="info",
+    )
 else:
     fig = go.Figure()
     if not hist_df.empty:
@@ -695,9 +714,12 @@ else:
             annotation_text="cutoff", annotation_position="top",
         )
     else:
-        st.info("No saved future forecast yet — click **Run forecast** in "
-                "**Controls** above. Training fit below still shows how well "
-                "the model tracks history.")
+        callout(
+            "No saved future forecast yet — click **Run forecast** in "
+            "**Controls** above. Training fit below still shows how well "
+            "the model tracks history.",
+            tone="info",
+        )
 
     if not pr_series_df.empty:
         fig.add_trace(go.Scatter(
@@ -847,9 +869,12 @@ if latest and latest.get("pr_scan"):
     )
     impacts = pr_scan.get("impacts", [])
     if not impacts:
-        st.info(f"No IaC-touching PRs merged to `{pr_scan.get('base_branch')}` "
-                f"in the last {pr_scan.get('lookback_days')} days. "
-                "Forecast is baseline only.")
+        callout(
+            f"No IaC-touching PRs merged to `{pr_scan.get('base_branch')}` "
+            f"in the last {pr_scan.get('lookback_days')} days. "
+            "Forecast is baseline only.",
+            tone="info",
+        )
     else:
         analyzer_used = pr_scan.get("analyzer", "regex")
         model_used = pr_scan.get("llm_model") or ""
@@ -952,8 +977,11 @@ if bt.empty and not replay_df.empty:
     bt_source = "training fit (in-memory)"
 
 if bt.empty:
-    st.info("No backtest data yet — enable **Show training fit** in "
-            "the controls, or wait for saved forecasts to age past 7 days.")
+    callout(
+        "No backtest data yet — enable **Show training fit** in "
+        "the controls, or wait for saved forecasts to age past 7 days.",
+        tone="info",
+    )
 else:
     if bt_source != "saved":
         st.caption(f"Source: {bt_source} — computed from live history, "
@@ -1191,8 +1219,14 @@ if latest and latest.get("forecast"):
         for r in reasons:
             st.markdown(f"- {r}")
     else:
-        st.info("Not enough data yet to explain the forecast. Click "
-                "**Run forecast** in **Controls** first.")
+        callout(
+            "Not enough data yet to explain the forecast. Click "
+            "**Run forecast** in **Controls** first.",
+            tone="info",
+        )
 else:
-    st.info("No forecast on disk yet. Click **Run forecast** in **Controls** "
-            "to generate one.")
+    callout(
+        "No forecast on disk yet. Click **Run forecast** in **Controls** "
+        "to generate one.",
+        tone="info",
+    )

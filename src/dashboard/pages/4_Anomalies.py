@@ -27,15 +27,14 @@ from src.ai_agent.aws_sweep import sweep_to_summary as aws_summary
 from src.ai_agent.repo_sweep import sweep_repos
 from src.ai_agent.repo_sweep import sweep_to_summary as repo_summary
 from src.aws.profiles import resolve_all
-from src.dashboard.costsense_theme import C, metric, money, section
+from src.dashboard.costsense_theme import callout, confidence_pill, metric, money, section
 from src.pr_scanner.repos import gh_login, gh_orgs, repos_with_user_prs
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
 )
 
 
-st.set_page_config(page_title="CostSense · Anomalies", layout="wide",
-                   page_icon="🚨")
+st.set_page_config(page_title="CostSense · Anomalies", layout="wide")
 inject_css()
 render_sidebar_header()  # Diligent card renders before any AWS calls
 
@@ -53,7 +52,7 @@ section(
 with st.spinner("Resolving profiles…"):
     profiles = [p for p in resolve_all() if p.account_id]
 if not profiles:
-    st.error("No AWS profiles reachable.")
+    callout("No AWS profiles reachable.", tone="error")
     st.stop()
 labels = [p.label for p in profiles]
 
@@ -221,7 +220,7 @@ if run_btn:
             aws_raw = sweep_account(active.profile)
             aws_sum = aws_summary(aws_raw)
         except Exception as e:  # noqa: BLE001
-            st.error(f"AWS sweep failed: {e}")
+            callout(f"AWS sweep failed: {e}", tone="error")
             st.code(traceback.format_exc())
             st.stop()
     with st.spinner(f"Sweeping {len(selected_repos)} repo(s) via GitHub…"):
@@ -229,7 +228,7 @@ if run_btn:
             repo_raw = sweep_repos(selected_repos) if selected_repos else []
             repo_sum = repo_summary(repo_raw)
         except Exception as e:  # noqa: BLE001
-            st.error(f"Repo sweep failed: {e}")
+            callout(f"Repo sweep failed: {e}", tone="error")
             st.code(traceback.format_exc())
             st.stop()
     with st.spinner("Analyzing with Claude…"):
@@ -242,19 +241,22 @@ if run_btn:
             st.session_state[report_key + "::aws"] = aws_sum
             st.session_state[report_key + "::repo"] = repo_sum
         except Exception as e:  # noqa: BLE001
-            st.error(f"anomaly agent failed: {e}")
+            callout(f"anomaly agent failed: {e}", tone="error")
             st.code(traceback.format_exc())
 
 
 # ---------- render ----------
 
 if report is None:
-    st.info("Pick an AWS profile and repos in the sidebar, then click "
-            "**Analyze**.")
+    callout(
+        "Pick an AWS profile and repos in the sidebar, then click "
+        "**Analyze**.",
+        tone="info",
+    )
     st.stop()
 
 if report.error:
-    st.error(f"Agent error: {report.error}")
+    callout(f"Agent error: {report.error}", tone="error")
     st.stop()
 
 
@@ -264,21 +266,6 @@ def _plain(text: str) -> str:
     if not text:
         return ""
     return text.replace("$", "\\$").strip()
-
-
-def _confidence_pill(confidence: str) -> str:
-    """Confidence badge using shared tokens and cs-pill styling."""
-    conf_lower = (confidence or "medium").lower()
-    label = conf_lower.title()
-    color, soft = {
-        "high": (C.GOOD, C.SEV_SOFT["Low"]),
-        "medium": (C.SEV["Medium"], C.SEV_SOFT["Medium"]),
-        "low": (C.MUTED, "#F1F3F5"),
-    }.get(conf_lower, (C.MUTED, "#F1F3F5"))
-    return (
-        f'<span class="cs-pill" style="background:{soft};color:{color};">'
-        f'<span class="cs-dot" style="background:{color};"></span>{label}</span>'
-    )
 
 
 section(
@@ -362,7 +349,7 @@ if report.actions:
             with head_r:
                 st.markdown(
                     f"<div style='text-align:right;'>"
-                    f"{_confidence_pill(a.confidence)}"
+                    f"{confidence_pill(a.confidence)}"
                     f"</div>",
                     unsafe_allow_html=True,
                 )

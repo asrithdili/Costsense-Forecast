@@ -5,10 +5,11 @@ Rules:
   (``costsense_theme.inject_css()``) with structural shell CSS in ``_CSS``
   below. Shell rules win on layout conflicts (sidebar flex footer, wider
   max-width) so navigation and footer pinning stay stable.
-- The Diligent brand card renders as a real widget inside
-  `st.sidebar` via `render_sidebar_header()`; it's called from each
-  page's `with st.sidebar:` block. This is more reliable than
-  injecting from `inject_css()`.
+- **Sidebar order.** ``render_sidebar_header()`` renders the Diligent brand
+  card first, then custom ``st.page_link`` nav. Native multipage nav is
+  disabled via ``showSidebarNavigation = false`` in ``.streamlit/config.toml``
+  (with a CSS fallback). Page-specific sidebar widgets and
+  ``render_sidebar_footer()`` follow below.
 - The optional footer status card (`render_sidebar_footer()`) pins to
   the bottom of the sidebar.
 """
@@ -20,7 +21,7 @@ from typing import Iterable
 import streamlit as st
 
 from src.aws.profiles import ProfileInfo, resolve_all
-from src.dashboard.costsense_theme import inject_css as inject_theme_css
+from src.dashboard.costsense_theme import callout, inject_css as inject_theme_css
 
 
 DEFAULT_MODELS = (
@@ -34,7 +35,7 @@ DEFAULT_MODELS = (
 # `page_icon` from its own `set_page_config` automatically, so we don't
 # duplicate it here.
 _PAGES = [
-    ("app.py",                          "CostSense AI"),
+    ("app.py",                          "Ask CostSense"),
     ("pages/2_Dashboard.py",            "Dashboard"),
     ("pages/3_PR_Predictor.py",         "PR Predictor"),
     ("pages/4_Anomalies.py",            "Anomalies"),
@@ -65,15 +66,10 @@ section[data-testid="stSidebar"] > div {
 }
 .cs-sidebar-footer { margin-top: auto; }
 
-[data-testid="stSidebarNav"] ul { padding-left: 0; }
-[data-testid="stSidebarNav"] li a {
-  border-radius: 8px;
-  padding: 6px 12px !important;
-  margin: 2px 6px !important;
-  font-weight: 500 !important;
-}
+/* Hide Streamlit's auto page nav — custom nav renders below the brand card. */
+[data-testid="stSidebarNav"] { display: none !important; }
 
-/* --- "Pages" section label between the Diligent card and the links --- */
+/* --- "Pages" section label between the brand card and the links --- */
 .cs-pages-label {
   font-size: 10.5px;
   font-weight: 700;
@@ -81,14 +77,14 @@ section[data-testid="stSidebar"] > div {
   text-transform: uppercase;
   padding: 4px 4px 2px 4px;
   margin: 4px 0 4px 0;
-  opacity: 0.55;
+  color: var(--muted);
 }
 
 /* Separator between page links and the rest of the sidebar content. */
 .cs-nav-sep {
   height: 1px;
   margin: 12px 4px 8px 4px;
-  background: rgba(120, 120, 140, 0.22);
+  background: var(--line);
 }
 
 /* Style st.page_link entries in the sidebar as compact nav pills. */
@@ -101,25 +97,27 @@ section[data-testid="stSidebar"] [data-testid="stPageLink"] a {
   border-radius: 8px !important;
   font-size: 14px !important;
   font-weight: 500 !important;
+  color: var(--ink) !important;
+}
+section[data-testid="stSidebar"] [data-testid="stPageLink"] a:hover {
+  background: var(--brand-soft) !important;
+  color: var(--brand) !important;
+}
+section[data-testid="stSidebar"] [data-testid="stPageLink"] a[aria-current="page"] {
+  background: var(--brand-soft) !important;
+  color: var(--brand) !important;
+  font-weight: 600 !important;
 }
 
-/* --- Diligent brand bar — rendered at the top of the MAIN content
-   area (not the sidebar) so we're not fighting Streamlit's
-   stSidebarNav DOM ordering.
-   Fixed-position under Streamlit's header, spans the full main-area
-   width regardless of `.block-container` centering. */
-/* --- Diligent brand card — rendered as a normal sidebar block. Sits
-   below Streamlit's page-nav (natural DOM order). Clean, professional,
-   no absolute positioning. --- */
+/* --- Diligent brand card — teal-aligned, calm product chrome --- */
 .cs-brandbar {
-  padding: 14px 16px 14px 16px;
-  margin: 4px 0 12px 0;
-  border: 1px solid rgba(120, 120, 140, 0.18);
-  border-radius: 10px;
-  background: linear-gradient(180deg,
-              rgba(124, 92, 255, 0.06) 0%,
-              rgba(20, 22, 29, 0.0) 100%);
+  padding: 14px 16px;
+  margin: 0 0 10px 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: linear-gradient(180deg, var(--brand-soft) 0%, var(--card) 100%);
   text-align: center;
+  box-shadow: 0 1px 2px rgba(20, 24, 31, 0.04);
 }
 .cs-brandbar .cs-bb-row1 {
   display: flex;
@@ -130,8 +128,8 @@ section[data-testid="stSidebar"] [data-testid="stPageLink"] a {
 }
 .cs-brandbar .cs-bb-dot {
   width: 8px; height: 8px; border-radius: 50%;
-  background: linear-gradient(135deg, #7c5cff, #4dabf7);
-  box-shadow: 0 0 8px rgba(124, 92, 255, 0.6);
+  background: var(--brand);
+  box-shadow: 0 0 8px rgba(12, 124, 116, 0.35);
   flex-shrink: 0;
 }
 .cs-brandbar .cs-bb-name {
@@ -139,6 +137,7 @@ section[data-testid="stSidebar"] [data-testid="stPageLink"] a {
   font-size: 16px;
   letter-spacing: -0.015em;
   line-height: 1;
+  color: var(--ink);
 }
 .cs-brandbar .cs-bb-sub {
   display: block;
@@ -146,36 +145,16 @@ section[data-testid="stSidebar"] [data-testid="stPageLink"] a {
   font-size: 9.5px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
-  opacity: 0.55;
+  color: var(--muted);
   line-height: 1;
-}
-.cs-diligent-card .cs-dc-wordmark {
-  display: flex; align-items: center; gap: 10px;
-  font-weight: 800;
-  font-size: 18px;
-  letter-spacing: -0.015em;
-  line-height: 1;
-}
-.cs-diligent-card .cs-dc-dot {
-  width: 9px; height: 9px; border-radius: 50%;
-  background: linear-gradient(135deg, #7c5cff, #4dabf7);
-  box-shadow: 0 0 10px rgba(124, 92, 255, 0.6);
-}
-.cs-diligent-card .cs-dc-sub {
-  opacity: 0.55;
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  margin-top: 5px;
-  margin-left: 19px;
 }
 
 /* --- Controls-bar expander polish --- */
 [data-testid="stExpander"] {
-  border: 1px solid rgba(120, 120, 140, 0.22) !important;
-  border-radius: 8px !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 10px !important;
   margin-bottom: 16px !important;
+  box-shadow: 0 1px 2px rgba(20, 24, 31, 0.04);
 }
 [data-testid="stExpander"] summary,
 [data-testid="stExpander"] details > summary {
@@ -183,12 +162,13 @@ section[data-testid="stSidebar"] [data-testid="stPageLink"] a {
   min-height: 34px !important;
   font-size: 12.5px !important;
   font-weight: 500 !important;
+  color: var(--ink) !important;
 }
 .cs-controls-title {
   display: flex; align-items: center; height: 100%;
   padding: 0 12px;
   font-weight: 600; font-size: 13px;
-  opacity: 0.85;
+  color: var(--muted);
   white-space: nowrap; user-select: none;
 }
 
@@ -196,10 +176,10 @@ section[data-testid="stSidebar"] [data-testid="stPageLink"] a {
 .cs-sidebar-footer {
   margin-top: auto;
   padding: 14px 12px 16px 12px;
-  border-top: 1px solid rgba(120, 120, 140, 0.22);
+  border-top: 1px solid var(--line);
   font-size: 11.5px;
   line-height: 1.45;
-  opacity: 0.85;
+  color: var(--muted);
 }
 .cs-sidebar-footer .cs-sf-title {
   display: flex; align-items: center; gap: 8px;
@@ -207,40 +187,42 @@ section[data-testid="stSidebar"] [data-testid="stPageLink"] a {
   font-size: 12.5px;
   letter-spacing: 0.02em;
   margin-bottom: 6px;
-  opacity: 1;
+  color: var(--ink);
 }
 .cs-sidebar-footer .cs-sf-dot {
   width: 7px; height: 7px; border-radius: 50%;
-  background: linear-gradient(135deg, #7c5cff, #4dabf7);
-  box-shadow: 0 0 8px rgba(124, 92, 255, 0.55);
+  background: var(--brand);
+  box-shadow: 0 0 8px rgba(12, 124, 116, 0.35);
 }
 .cs-sidebar-footer .cs-sf-row {
   display: flex; justify-content: space-between; gap: 8px;
   padding: 2px 0;
 }
 .cs-sidebar-footer .cs-sf-row span:last-child {
-  text-align: right; word-break: break-all; opacity: 0.85;
+  text-align: right; word-break: break-all;
+  color: var(--ink);
 }
 .cs-sidebar-footer .cs-sf-pill {
   display: inline-flex; align-items: center; gap: 5px;
   padding: 2px 7px;
   border-radius: 999px;
-  background: rgba(120, 200, 120, 0.14);
-  border: 1px solid rgba(120, 200, 120, 0.4);
-  color: #7cc580;
+  background: var(--brand-soft);
+  border: 1px solid var(--brand);
+  color: var(--brand);
   font-size: 10.5px;
   font-weight: 600;
   letter-spacing: 0.02em;
 }
 .cs-sidebar-footer .cs-sf-pill::before {
   content: ""; width: 6px; height: 6px; border-radius: 50%;
-  background: #85c37b; box-shadow: 0 0 6px rgba(133, 195, 123, 0.7);
+  background: var(--brand);
+  box-shadow: 0 0 6px rgba(12, 124, 116, 0.4);
 }
 .cs-sidebar-footer .cs-sf-caption {
   font-size: 10.5px; margin-top: 8px;
   padding-top: 8px;
-  border-top: 1px dashed rgba(120, 120, 140, 0.22);
-  opacity: 0.7;
+  border-top: 1px dashed var(--line);
+  color: var(--faint);
 }
 </style>
 """
@@ -256,6 +238,16 @@ _TOP_BRAND_HTML = (
     '</div>'
 )
 
+# Fallback if config.toml showSidebarNavigation is ever re-enabled.
+_SIDEBAR_HIDE_CSS = (
+    '<style>[data-testid="stSidebarNav"]{display:none!important;}</style>'
+)
+
+
+def _inject_sidebar_hide_css() -> None:
+    """Inject nav-hide CSS into the sidebar stream (earlier than main-pane CSS)."""
+    st.sidebar.markdown(_SIDEBAR_HIDE_CSS, unsafe_allow_html=True)
+
 
 @dataclass
 class TopBarSelection:
@@ -266,19 +258,22 @@ class TopBarSelection:
 def inject_css() -> None:
     """Inject shared theme + shell CSS. Safe to call multiple times per page."""
     inject_theme_css()
+    _inject_sidebar_hide_css()
     st.markdown(_CSS, unsafe_allow_html=True)
 
 
 def render_sidebar_header() -> None:
-    """Render the Diligent brand card into the sidebar.
+    """Render brand card + page nav at the top of the sidebar.
 
-    Streamlit's built-in page-nav renders first (framework
-    behavior). Our card sits right below it. That's the reliable,
-    non-fragile DOM order — every attempt to force our card ABOVE
-    the nav failed on this Streamlit version, so we accept the
-    natural order and make the card look great.
+    Native multipage nav is disabled in config; custom links render here.
     """
-    st.sidebar.markdown(_TOP_BRAND_HTML, unsafe_allow_html=True)
+    _inject_sidebar_hide_css()
+    with st.sidebar:
+        st.markdown(_TOP_BRAND_HTML, unsafe_allow_html=True)
+        st.markdown('<div class="cs-pages-label">Pages</div>', unsafe_allow_html=True)
+        for path, label in _PAGES:
+            st.page_link(path, label=label, use_container_width=True)
+        st.markdown('<div class="cs-nav-sep"></div>', unsafe_allow_html=True)
 
 
 def render_top_brand() -> None:
@@ -355,7 +350,7 @@ def render(
 
     profiles = [p for p in resolve_all() if p.account_id]
     if not profiles:
-        st.error("No AWS profiles reachable.")
+        callout("No AWS profiles reachable.", tone="error")
         st.stop()
 
     labels = [p.label for p in profiles]
