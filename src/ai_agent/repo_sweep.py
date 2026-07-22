@@ -7,24 +7,18 @@ For each selected GitHub repo, extract:
   - Recently opened PRs (leading indicator of cost changes about to land)
   - Growing files or new resource declarations in the last 30 days
 
-Kept fast: everything routed through `gh` CLI, no repo cloning.
+Kept fast: everything routed through the GitHub REST API (GITHUB_TOKEN).
 """
 from __future__ import annotations
 
 import json
 import re
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from functools import lru_cache
 
-
-def _run(args: list[str]) -> str:
-    r = subprocess.run(args, capture_output=True, check=False)
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr.decode("utf-8", errors="replace").strip())
-    return r.stdout.decode("utf-8", errors="replace")
+from src.pr_scanner.gh_client import api_get, get_file, list_pull_requests
 
 
 @dataclass
@@ -42,13 +36,10 @@ def _fetch_config(repo: str) -> dict[str, str]:
     """Read infrastructure/config.json if present. Returns {env: account_id}."""
     for path in ("infrastructure/config.json", "cdk/infrastructure/config.json"):
         try:
-            raw = _run(["gh", "api", f"repos/{repo}/contents/{path}"])
+            text = get_file(repo, path)
         except RuntimeError:
             continue
         try:
-            import base64
-            content = json.loads(raw).get("content", "")
-            text = base64.b64decode(content).decode("utf-8", errors="replace")
             doc = json.loads(text)
         except Exception:  # noqa: BLE001
             continue
@@ -61,12 +52,7 @@ def _open_prs(repo: str, limit: int = 50) -> list[dict]:
     """Recently updated open PRs. These are the leading indicator of what
     might merge and shift cost next."""
     try:
-        raw = _run([
-            "gh", "pr", "list", "--repo", repo,
-            "--state", "open", "--limit", str(limit),
-            "--json", "number,title,author,updatedAt,url,additions,deletions",
-        ])
-        return json.loads(raw)
+        return list_pull_requests(repo, state="open", limit=limit)
     except RuntimeError:
         return []
 
@@ -76,11 +62,10 @@ def _recent_iac_files(repo: str, days: int = 30, limit: int = 30) -> list[str]:
     commits API to walk recent changes."""
     since = (date.today() - timedelta(days=days)).isoformat()
     try:
-        raw = _run([
-            "gh", "api",
-            f"repos/{repo}/commits?since={since}T00:00:00Z&per_page=30",
-        ])
-        commits = json.loads(raw)
+        commits = api_get(f"repos/{repo}/commits", {
+            "since": f"{since}T00:00:00Z",
+            "per_page": "30",
+        }) or []
     except RuntimeError:
         return []
 
@@ -96,7 +81,7 @@ def _recent_iac_files(repo: str, days: int = 30, limit: int = 30) -> list[str]:
         if not sha:
             continue
         try:
-            det = json.loads(_run(["gh", "api", f"repos/{repo}/commits/{sha}"]))
+            det = api_get(f"repos/{repo}/commits/{sha}") or {}
             for f in det.get("files", []) or []:
                 p = f.get("filename", "")
                 if iac_pat.search(p):
@@ -112,12 +97,13 @@ def _scheduled_rules(repo: str) -> list[str]:
     """Search the repo for EventBridge / cron declarations. These commit the
     account to recurring compute."""
     try:
-        raw = _run([
-            "gh", "api",
-            f"search/code?q=repo:{repo}+Schedule.rate+OR+Schedule.cron"
-            "+OR+aws_cloudwatch_event_rule&per_page=15",
-        ])
-        data = json.loads(raw)
+        data = api_get("search/code", {
+            "q": (
+                f"repo:{repo} Schedule.rate OR Schedule.cron "
+                "OR aws_cloudwatch_event_rule"
+            ),
+            "per_page": "15",
+        }) or {}
     except RuntimeError:
         return []
     return [item.get("path", "") for item in data.get("items", [])][:15]
