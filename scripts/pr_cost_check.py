@@ -24,7 +24,6 @@ if str(_REPO_ROOT) not in sys.path:
 from src.ai_agent.agent import DEFAULT_MODEL
 from src.ci.pr_check import (
     PolicyConfig,
-    embed_chart_for_summary,
     run_pr_cost_check,
     write_pr_comment,
     write_step_summary,
@@ -75,18 +74,11 @@ def main() -> int:
 
     write_verdict_json(result.verdict, args.output_json)
 
-    chart_name: str | None = None
-    if args.step_summary and result.chart_path is not None:
-        chart_name = embed_chart_for_summary(
-            result.chart_path.resolve(), args.step_summary,
-        )
-
     if args.step_summary:
         write_step_summary(
             result,
             args.step_summary,
             pr_url=args.pr_url,
-            chart_filename=chart_name,
         )
 
     if args.pr_comment:

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
@@ -68,24 +67,10 @@ def write_verdict_json(verdict: AgentVerdict, path: str | Path) -> Path:
     return out
 
 
-def embed_chart_for_summary(
-    chart_path: Path,
-    summary_path: str | Path,
-) -> str | None:
-    """Copy *chart_path* beside GITHUB_STEP_SUMMARY so inline images render."""
-    if not chart_path.is_file():
-        return None
-    summary = Path(summary_path)
-    dest = summary.parent / chart_path.name
-    shutil.copy2(chart_path, dest)
-    return f"./{dest.name}"
-
-
 def _report_markdown_lines(
     result: PrCostCheckResult,
     *,
     pr_url: str,
-    chart_filename: str | None = None,
     run_url: str | None = None,
     for_pr_comment: bool = False,
 ) -> list[str]:
@@ -158,40 +143,26 @@ def _report_markdown_lines(
             lines.append(f"- Next 7d adjusted forecast total: **${next_7:,.0f}**")
         lines.append("")
 
-    if chart_filename and result.chart_path is not None:
-        lines.extend([
-            "### Forecast chart",
-            "",
-            f"![Forecast with PR impact]({chart_filename})",
-            "",
-        ])
-    elif for_pr_comment and result.chart_path is not None and run_url:
-        lines.extend([
-            "### Forecast chart",
-            "",
-            f"View the chart inline in the [job summary]({run_url}) "
-            f"(open the run → **Summary** tab), or download `forecast.png` "
-            "from the **pr-cost-report** artifact on that run.",
-            "",
-        ])
-
-    if result.chart_warning:
-        lines.extend([
-            "### Forecast chart (skipped)",
-            "",
-            f"_{result.chart_warning}_",
-            "",
-        ])
-
     if for_pr_comment and run_url:
         lines.extend([
-            "### Report files",
+            "### Forecast chart & report files",
+            "",
+            "Download the **`pr-cost-report`** artifact from the "
+            f"[workflow run]({run_url}). It contains:",
+            "",
+            "- `forecast.png` — cost forecast with PR impact",
+            "- `pr-cost-verdict.json` — full structured verdict",
+            "",
+        ])
+    elif for_pr_comment and result.chart_path is not None:
+        lines.extend([
+            "### Forecast chart & report files",
             "",
             "Download the **`pr-cost-report`** artifact from the workflow run "
-            f"above. It contains:",
+            "(see the Actions tab). It contains:",
             "",
-            "- `forecast.png` — cost forecast chart",
-            "- `pr-cost-verdict.json` — structured agent verdict",
+            "- `forecast.png` — cost forecast with PR impact",
+            "- `pr-cost-verdict.json` — full structured verdict",
             "",
         ])
 
@@ -209,12 +180,9 @@ def write_step_summary(
     path: str | Path,
     *,
     pr_url: str,
-    chart_filename: str | None = None,
 ) -> Path:
-    """Write markdown for GITHUB_STEP_SUMMARY (supports relative image paths)."""
-    lines = _report_markdown_lines(
-        result, pr_url=pr_url, chart_filename=chart_filename,
-    )
+    """Write markdown for GITHUB_STEP_SUMMARY."""
+    lines = _report_markdown_lines(result, pr_url=pr_url)
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines))
