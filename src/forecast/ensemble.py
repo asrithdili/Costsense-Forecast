@@ -207,3 +207,40 @@ def tuned_params_dict(p: TunedParams) -> dict:
         "tuning_days_scored": p.tuning_days_scored,
         "dow_ratios": {int(k): round(v, 3) for k, v in p.dow_ratios.items()},
     }
+
+
+def in_sample_fit_ewm(
+    history: pd.DataFrame,
+    cutoff: date,
+    lookback_days: int = 30,
+) -> list[ForecastPoint]:
+    """Train once at *cutoff*, then score 1-day-ahead predictions on recent
+    training days using the frozen tuned params (no re-tune per day)."""
+    hist = history.copy()
+    hist["day"] = pd.to_datetime(hist["day"])
+    hist = hist.sort_values("day").reset_index(drop=True)
+    train = hist[hist["day"] < pd.Timestamp(cutoff)]
+    if train.empty:
+        return []
+
+    params = tune_params(hist, cutoff)
+    recent = train.tail(params.trim_window)["amount_usd"]
+    std = float(recent.std()) if len(recent) >= 3 else 0.0
+    lookback_start = pd.Timestamp(cutoff - timedelta(days=lookback_days))
+
+    out: list[ForecastPoint] = []
+    for _, row in train[train["day"] >= lookback_start].iterrows():
+        target = row["day"].date()
+        sub = train[train["day"] < pd.Timestamp(target)]
+        if len(sub) < 7:
+            continue
+        near, far = _fast_level(sub, params)
+        ratio = params.dow_ratios.get(target.weekday(), 1.0)
+        level = near * ratio
+        out.append(ForecastPoint(
+            target_date=target,
+            predicted_usd=max(0.0, level),
+            lower_usd=max(0.0, level - 1.28 * std),
+            upper_usd=max(0.0, level + 1.28 * std),
+        ))
+    return out

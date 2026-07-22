@@ -140,3 +140,42 @@ def forecast_with_pr_regressor(
         for _, row in fc.iterrows()
     ]
     return points, step_df
+
+
+def in_sample_fit_prophet(
+    history: pd.DataFrame,
+    cutoff: date,
+    lookback_days: int = 30,
+) -> list[ForecastPoint]:
+    """Train Prophet once at *cutoff*, return in-sample fit on recent days."""
+    if Prophet is None:
+        raise RuntimeError("prophet is not installed. `pip install prophet`.")
+
+    train = history[history["day"] < pd.Timestamp(cutoff)].copy()
+    if train.empty:
+        return []
+
+    train = train.rename(columns={"day": "ds", "amount_usd": "y"})
+    model = Prophet(
+        daily_seasonality=False,
+        weekly_seasonality="auto",
+        changepoint_prior_scale=0.15,
+        changepoint_range=0.9,
+        seasonality_prior_scale=1.0,
+    )
+    model.fit(train)
+    fitted = model.predict(train)
+
+    lookback_start = cutoff - timedelta(days=lookback_days)
+    out: list[ForecastPoint] = []
+    for _, row in fitted.iterrows():
+        target = row["ds"].date()
+        if target < lookback_start:
+            continue
+        out.append(ForecastPoint(
+            target_date=target,
+            predicted_usd=max(0.0, float(row["yhat"])),
+            lower_usd=max(0.0, float(row["yhat_lower"])),
+            upper_usd=max(0.0, float(row["yhat_upper"])),
+        ))
+    return out

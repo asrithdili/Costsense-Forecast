@@ -30,12 +30,13 @@ import streamlit as st
 from src.aws.cost_explorer import fetch_daily_by_service, fetch_daily_totals
 from src.aws.profiles import ProfileInfo, resolve_all
 from src.backtest.scorer import score_for_target
-from src.forecast.backtest_replay import walk_forward
+from src.forecast.backtest_replay import training_fit_replay
 from src.pipeline.paths import actuals_dir, backtest_dir, predictions_dir
 from src.pipeline.run_daily import run as run_pipeline
 
 
 FORECAST_MODEL_OPTIONS: dict[str, str] = {
+    "lightgbm": "LightGBM",
     "ewm": "EWM (auto-tuned)",
     "prophet": "Prophet",
     "aws": "AWS native (GetCostForecast)",
@@ -190,7 +191,7 @@ _widget_ver = st.session_state.get("dash_widget_ver", 0)
 # Read defaults for other controls up front so the header can reflect them.
 _cutoff = st.session_state.get("dash_cutoff", date.today())
 _history_days = st.session_state.get("dash_history_days", 90)
-_model_choice = st.session_state.get("dash_model", "ewm")
+_model_choice = st.session_state.get("dash_model", "lightgbm")
 
 # Service list (used both for dropdown + header).
 try:
@@ -282,10 +283,11 @@ with top_bar(header):
             format_func=lambda m: FORECAST_MODEL_OPTIONS[m],
             index=_model_idx,
             key="dash_model",
-            help="EWM adapts to level shifts fast (default). Prophet "
-                 "handles weekly seasonality. AWS native calls Cost "
-                 "Explorer GetCostForecast — billing history only, no PR "
-                 "awareness in the model itself.",
+            help="LightGBM learns lag + calendar features (default). EWM "
+                 "adapts to level shifts fast. Prophet handles weekly "
+                 "seasonality. AWS native calls Cost Explorer "
+                 "GetCostForecast — billing history only, no PR awareness "
+                 "in the model itself.",
         )
 
     # Row 2 — service filter + optional PR layer
@@ -390,24 +392,20 @@ with top_bar(header):
             )
 
     # Row 5 — backtest controls
-    r5c1, r5c2, r5c3 = st.columns([2, 2, 2])
+    r5c1, r5c2 = st.columns([2, 2])
     with r5c1:
         show_replay = st.checkbox(
-            "Show backtest", value=True, key="dash_show_backtest",
+            "Show training fit", value=True, key="dash_show_backtest",
             disabled=(model_choice == "aws"),
-            help="Walk-forward past predictions on the chart. Unavailable "
-                 "for AWS native — GetCostForecast only returns a forward "
-                 "forecast as-of today.",
+            help="Train once at the cutoff and overlay in-sample fit on "
+                 "recent history — did the model track actual spend? "
+                 "Unavailable for AWS native.",
         )
     with r5c2:
-        n_origins = st.slider(
-            "Backtest origins", 2, 12, 6, step=1,
-            disabled=not show_replay, key="dash_n_origins",
-        )
-    with r5c3:
-        stride_days = st.slider(
-            "Stride (d)", 3, 14, 7, step=1,
-            disabled=not show_replay, key="dash_stride",
+        fit_lookback_days = st.slider(
+            "Fit window (d)", 7, 60, 30, step=1,
+            disabled=not show_replay, key="dash_fit_lookback",
+            help="How many days of training history to score the fit on.",
         )
 
     _forecast_help = (
@@ -517,7 +515,7 @@ pr_series_df = pd.DataFrame()
 if selected_service is None and latest and latest.get("pr_daily_series"):
     pr_series_df = pd.DataFrame(latest["pr_daily_series"])
 
-# Reconstruct PrSteps from the saved impacts so walk-forward can use them.
+# Reconstruct PrSteps from the saved impacts (account-wide PR layer).
 # IMPORTANT: PR deltas are estimated for the WHOLE account. Applying them
 # to a service-filtered backtest would inflate predictions relative to the
 # filtered actuals (e.g. a NAT-gateway PR worth $32/day would be added to
@@ -538,22 +536,20 @@ if selected_service is None and latest and latest.get("pr_scan", {}).get("impact
             pr_id=f"{imp['repo']}#{imp['pr_number']}",
         ))
 
-# Walk-forward replay for "past predictions" overlay + trust metric
+# In-sample training fit overlay + trust metric (single train at cutoff)
 replay_points: list = []
 replay_df = pd.DataFrame()
 if show_replay and not hist_df.empty:
-    with st.spinner(f"Retraining {model_choice} at {n_origins} past origins…"):
+    with st.spinner(f"Fitting {model_choice} on training data…"):
         try:
             hist_for_replay = pd.DataFrame({
                 "day": pd.to_datetime(hist_df["day"]),
                 "amount_usd": hist_df["actual_usd"],
             })
-            replay_points = walk_forward(
+            replay_points = training_fit_replay(
                 hist_for_replay,
-                end=cutoff,
-                n_origins=n_origins,
-                stride_days=stride_days,
-                horizon_days=7,
+                cutoff=cutoff,
+                lookback_days=fit_lookback_days,
                 pr_steps=saved_pr_steps or None,
                 model=model_choice,
             )
@@ -573,22 +569,21 @@ if show_replay and not hist_df.empty:
                     lambda r: (r["abs_err"] / r["actual_usd"])
                     if r["actual_usd"] else None, axis=1)
         except Exception as e:  # noqa: BLE001
-            st.warning(f"Walk-forward replay failed: {e}")
+            st.warning(f"Training fit overlay failed: {e}")
 
 
 # KPI row
 kpis = st.columns(4)
 next_7_total = fc_df["adjusted_usd"].sum() if not fc_df.empty else None
 last_7_actual = hist_df.tail(7)["actual_usd"].sum() if not hist_df.empty else None
-mape_val = (bt["ape"].dropna().tail(30).mean() * 100
-            if not bt.empty and bt["ape"].notna().any() else None)
-replay_mape = (replay_df["ape"].dropna().mean() * 100
-               if not replay_df.empty and replay_df["ape"].notna().any() else None)
-# WAPE is the trustworthy version when actuals include near-zero days.
 _replay_valid = replay_df.dropna(subset=["actual_usd"]) if not replay_df.empty else replay_df
 _replay_total_actual = _replay_valid["actual_usd"].abs().sum() if not _replay_valid.empty else 0.0
 replay_wape = ((_replay_valid["abs_err"].sum() / _replay_total_actual * 100)
                if _replay_total_actual else None)
+_bt_valid = bt.dropna(subset=["actual_usd"]).tail(30) if not bt.empty else bt
+_bt_total_actual = _bt_valid["actual_usd"].abs().sum() if not _bt_valid.empty else 0.0
+wape_val = ((_bt_valid["abs_error_usd"].sum() / _bt_total_actual * 100)
+            if _bt_total_actual else None)
 
 kpis[0].metric("Last 7d actual",
                f"${last_7_actual:,.0f}" if last_7_actual is not None else "—")
@@ -603,12 +598,12 @@ kpis[2].metric(
     if delta is not None and last_7_actual else None,
 )
 kpis[3].metric(
-    "Trust check (walk-forward WAPE)"
-    if replay_wape is not None else "Rolling 30d MAPE",
+    "Trust check (training-fit WAPE)"
+    if replay_wape is not None else "Rolling 30d WAPE",
     f"{replay_wape:.1f}%" if replay_wape is not None
-    else (f"{mape_val:.1f}%" if mape_val is not None else "—"),
-    help="WAPE = Σ|err| / Σ|actual| across all past predictions. Robust "
-         "when daily spend is near zero (unlike MAPE). Lower = better.",
+    else (f"{wape_val:.1f}%" if wape_val is not None else "—"),
+    help="WAPE = Σ|err| / Σ|actual| on in-sample training days. "
+         "Stable when daily spend is near zero. Lower = better.",
 )
 
 st.divider()
@@ -660,7 +655,8 @@ else:
         )
     else:
         st.info("No saved future forecast yet — click **Run forecast** in "
-                "**Controls** above. Past predictions below still validate the model.")
+                "**Controls** above. Training fit below still shows how well "
+                "the model tracks history.")
 
     if not pr_series_df.empty:
         fig.add_trace(go.Scatter(
@@ -673,15 +669,15 @@ else:
         fig.add_trace(go.Scatter(
             x=replay_df["target_date"], y=replay_df["predicted_usd"],
             mode="markers",
-            name="past prediction (walk-forward)",
+            name="training fit (in-sample)",
             marker=dict(color="#C0504D", size=8, symbol="diamond",
                         line=dict(color="white", width=1)),
             customdata=replay_df[["origin", "horizon", "actual_usd",
                                   "abs_err"]].values,
-            hovertemplate=("Target %{x}<br>"
-                           "Predicted $%{y:,.2f}<br>"
+            hovertemplate=("Day %{x}<br>"
+                           "Fitted $%{y:,.2f}<br>"
                            "Actual $%{customdata[2]:,.2f}<br>"
-                           "Origin %{customdata[0]} (h+%{customdata[1]})<br>"
+                           "Trained at %{customdata[0]}<br>"
                            "Abs err $%{customdata[3]:,.2f}"
                            "<extra></extra>"),
         ))
@@ -695,8 +691,8 @@ else:
 
     if not replay_df.empty:
         with st.expander(
-            f"Walk-forward detail  ·  {len(replay_df)} past predictions"
-            + (f"  ·  MAPE {replay_mape:.1f}%" if replay_mape is not None else ""),
+            f"Training fit detail  ·  {len(replay_df)} in-sample days"
+            + (f"  ·  WAPE {replay_wape:.1f}%" if replay_wape is not None else ""),
             expanded=False,
         ):
             display = replay_df.copy()
@@ -704,13 +700,11 @@ else:
                 lambda v: f"{v * 100:.1f}%" if v is not None else "—"
             )
             st.dataframe(
-                display[["origin", "target_date", "horizon",
-                         "predicted_usd", "actual_usd", "abs_err", "ape_pct"]]
+                display[["target_date", "predicted_usd", "actual_usd",
+                         "abs_err", "ape_pct"]]
                 .rename(columns={
-                    "origin": "Origin (train cutoff)",
-                    "target_date": "Target",
-                    "horizon": "Days ahead",
-                    "predicted_usd": "Predicted",
+                    "target_date": "Day",
+                    "predicted_usd": "Fitted",
                     "actual_usd": "Actual",
                     "abs_err": "Abs error",
                     "ape_pct": "APE",
@@ -891,7 +885,7 @@ st.divider()
 st.subheader("Backtest — predicted vs actual")
 
 # If we have saved daily backtest scores, use them. Otherwise fall back to the
-# walk-forward replay we just computed, which gives the same shape.
+# in-sample training fit we just computed.
 bt_source = "saved"
 if bt.empty and not replay_df.empty:
     bt = replay_df.rename(columns={
@@ -900,43 +894,34 @@ if bt.empty and not replay_df.empty:
     }).copy()
     bt["abs_error_usd"] = bt["abs_err"]
     bt = bt.dropna(subset=["actual_usd"])
-    bt_source = "walk-forward (in-memory)"
+    bt_source = "training fit (in-memory)"
 
 if bt.empty:
-    st.info("No backtest data yet — enable **Show walk-forward backtest** in "
-            "the sidebar, or wait for saved forecasts to age past 7 days.")
+    st.info("No backtest data yet — enable **Show training fit** in "
+            "the controls, or wait for saved forecasts to age past 7 days.")
 else:
     if bt_source != "saved":
         st.caption(f"Source: {bt_source} — computed from live history, "
                    "not persisted.")
     bt = bt.sort_values("target_date").reset_index(drop=True)
-    # WAPE = sum(|err|) / sum(actual). Robust to near-zero days where MAPE
-    # explodes. This is the honest number when spend is sparse.
     total_abs_err = bt["abs_error_usd"].sum()
     total_actual = bt["actual_usd"].abs().sum()
-    wape_val = (total_abs_err / total_actual * 100) if total_actual else None
+    wape_val_bt = (total_abs_err / total_actual * 100) if total_actual else None
 
-    bcols = st.columns(4)
+    bcols = st.columns(3)
     bcols[0].metric("Days scored", len(bt))
     bcols[1].metric("MAE", f"${bt['abs_error_usd'].mean():.2f}")
     bcols[2].metric(
         "WAPE",
-        f"{wape_val:.1f}%" if wape_val is not None else "—",
+        f"{wape_val_bt:.1f}%" if wape_val_bt is not None else "—",
         help="Weighted APE = Σ|err| / Σ|actual|. Robust when daily spend "
-             "is near zero — use this instead of MAPE for sandbox accounts.",
-    )
-    bcols[3].metric(
-        "MAPE (raw)",
-        f"{bt['ape'].dropna().mean() * 100:.1f}%"
-        if bt["ape"].notna().any() else "—",
-        help="Simple mean(|err| / actual). Blows up on near-zero days; "
-             "WAPE is more trustworthy.",
+             "is near zero.",
     )
 
     fig2 = go.Figure()
     fig2.add_trace(go.Scatter(
         x=bt["target_date"], y=bt["predicted_usd"],
-        mode="lines+markers", name="past prediction",
+        mode="lines+markers", name="fitted (training)",
         line=dict(color="#7B3F99", width=2.5, shape="spline", smoothing=1.0),
     ))
     fig2.add_trace(go.Scatter(
@@ -985,16 +970,18 @@ else:
                                    y=1.02, xanchor="right", x=1))
     st.plotly_chart(fig2, use_container_width=True)
 
-    bt["ape_pct"] = bt["ape"] * 100
+    err_roll = bt["abs_error_usd"].rolling(7, min_periods=1).sum()
+    act_roll = bt["actual_usd"].abs().rolling(7, min_periods=1).sum()
+    bt["wape_pct"] = (err_roll / act_roll * 100).where(act_roll > 0)
     fig3 = go.Figure()
     fig3.add_trace(go.Scatter(
         x=bt["target_date"],
-        y=bt["ape_pct"].rolling(7, min_periods=1).mean(),
-        mode="lines+markers", name="rolling 7-day MAPE",
+        y=bt["wape_pct"],
+        mode="lines+markers", name="rolling 7-day WAPE",
         line=dict(color="#C0504D", width=2.5, shape="spline", smoothing=1.0),
     ))
     fig3.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=10),
-                       yaxis_title="MAPE %", hovermode="x unified")
+                       yaxis_title="WAPE %", hovermode="x unified")
     st.plotly_chart(fig3, use_container_width=True)
 
 
