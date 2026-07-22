@@ -209,33 +209,45 @@ if verdict is not None:
     _conf_label = {"high": "🟢 High", "medium": "🟡 Medium",
                    "low": "🟠 Low"}.get(_conf, "⚪")
 
+    # Collapse the range to a signed midpoint for the headline number and
+    # keep the low/high band as a supporting caption. Streamlit's `delta`
+    # kwarg colors negative red / positive green — which is BACKWARDS for
+    # cost (savings = negative delta = good). We use `delta_color="inverse"`
+    # so a savings delta renders green.
+    if _has_range:
+        _delta_headline = (_lo + _hi) / 2.0
+    else:
+        _delta_headline = verdict.est_daily_delta_usd
+    _projected_headline = float(current_daily or 0.0) + _delta_headline
+
     cols = st.columns(5)
     cols[0].metric(
         "Current account $/day",
         f"${current_daily:,.2f}" if current_daily is not None else "—",
         help="7-day average from Cost Explorer for the selected account.",
     )
-    _proj_delta_label = (
-        f"{_lo:+,.2f} → {_hi:+,.2f}"
-        if _has_range else f"{verdict.est_daily_delta_usd:+,.2f}"
-    )
     cols[1].metric(
         "Projected $/day after merge",
-        f"${projected_daily:,.2f}",
-        delta=_proj_delta_label,
+        f"${_projected_headline:,.2f}",
+        delta=f"{_delta_headline:+,.2f}",
+        delta_color="inverse",
     )
-    _daily_impact_label = (
-        f"${_lo:+,.2f} to ${_hi:+,.2f}"
-        if _has_range else f"${verdict.est_daily_delta_usd:+,.2f}"
+    cols[2].metric(
+        "Est. daily impact",
+        f"${_delta_headline:+,.2f}",
+        delta=(f"range ${min(_lo, _hi):+,.2f} … ${max(_lo, _hi):+,.2f}"
+               if _has_range else None),
+        delta_color="off",
     )
-    cols[2].metric("Est. daily impact", _daily_impact_label)
-    _monthly_low = (_lo * 30) if _has_range else verdict.est_daily_delta_usd * 30
-    _monthly_high = (_hi * 30) if _has_range else verdict.est_daily_delta_usd * 30
-    _monthly_label = (
-        f"${_monthly_low:+,.0f} to ${_monthly_high:+,.0f}"
-        if _has_range else f"${verdict.est_daily_delta_usd * 30:+,.0f}"
+    _monthly = _delta_headline * 30
+    cols[3].metric(
+        "Est. monthly impact",
+        f"${_monthly:+,.0f}",
+        delta=(f"range ${min(_lo, _hi) * 30:+,.0f} … "
+               f"${max(_lo, _hi) * 30:+,.0f}"
+               if _has_range else None),
+        delta_color="off",
     )
-    cols[3].metric("Est. monthly impact", _monthly_label)
     cols[4].metric("AWS tool calls", verdict.tool_calls)
 
     badge_cols = st.columns([3, 2])

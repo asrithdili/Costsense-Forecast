@@ -202,7 +202,13 @@ Do NOT return "logs are free" — they are not.
 
 Return ONLY a JSON object with this shape (no prose outside JSON):
 {
-  "verdict": "one-line summary — 'this PR will INCREASE daily cost by ~$X'",
+  "verdict": "one-line summary. The dollar figure MUST match the range in
+              est_daily_delta_low_usd/high_usd. If it's a single-point
+              measured number, quote that number exactly (e.g.
+              'INCREASE daily cost by $1.39'). If it's a range, quote the
+              range (e.g. 'INCREASE daily cost by $0.70–$2.78/day'). Do
+              NOT write a rounded midpoint that disagrees with the range
+              fields — the UI shows both and users notice the mismatch.",
   "direction": "increase" | "decrease" | "neutral",
   "est_daily_delta_usd": <signed number, negative = savings>,
   "est_daily_delta_low_usd": <lower bound of the estimate range, omit or
