@@ -47,8 +47,9 @@ aws sso login --profile dil-data-platform-dev
 # or, if you use aws-vault:
 # aws-vault exec dil-data-platform-dev -- streamlit run src/dashboard/app.py --server.port 8501
 
-# 3. Log in to GitHub CLI (for PR / repo tools)
-gh auth login
+# 3. Set GitHub token (for repo tools + draft PRs)
+export GITHUB_TOKEN=ghp_...   # or GH_TOKEN — never commit this
+or set in an .env file as GITHUB_TOKEN or GH_TOKEN
 
 # 4. Run
 streamlit run src/dashboard/app.py --server.port 8501
@@ -56,6 +57,22 @@ streamlit run src/dashboard/app.py --server.port 8501
 
 Open http://localhost:8501, pick a profile from the sidebar, and start
 clicking. Every page auto-discovers your available AWS profiles.
+
+**GitHub credentials** — set **`GITHUB_TOKEN`** or **`GH_TOKEN`** in your
+environment. The app **auto-loads** `.env` from the project root or `src/.env`
+on startup (shell exports take precedence). Never commit tokens to the repo.
+
+| Where | Scopes needed |
+|---|---|
+| **`<repo>/.env`** or **`<repo>/src/.env`** | `repo` (classic), or fine-grained **Contents: Read and write** + **Pull requests: Read and write** |
+| Shell: `export GITHUB_TOKEN=…` before `streamlit run` | same |
+| GitHub Actions / CI secrets | same |
+
+Read-only features need read access. **Anomalies → Open draft PR** needs
+write access. Use **Prepare draft PR** to preview the diff first; **Open draft
+PR** only pushes after you confirm.
+
+`gh auth login` still works as a fallback when no token env var is set.
 
 **Bedrock access**: the app calls `us.anthropic.claude-sonnet-4-6`
 inference profile in `us-west-2` on Diligent's shared Bedrock sandbox

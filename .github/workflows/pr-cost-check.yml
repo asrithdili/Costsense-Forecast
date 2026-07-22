@@ -1,0 +1,24 @@
+name: PR Cost Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Caller must grant permissions the reusable workflow requests (OIDC + PR comment).
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  cost-check:
+    uses: ./.github/workflows/pr-cost-check-reusable.yml
+    with:
+      # aws_profile intentionally omitted — on GitHub-hosted runners no
+      # local AWS profile file exists. Credentials come from the OIDC
+      # role assumption in the reusable workflow, which exports the
+      # standard AWS_* env vars boto3 picks up automatically.
+      max_daily_increase_usd: "5"
+      include_forecast_chart: true
+    secrets:
+      AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}

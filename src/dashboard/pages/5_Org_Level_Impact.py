@@ -21,20 +21,23 @@ import streamlit as st
 
 from src.aws.org_spend import fetch_org_spend, top_service_by_account
 from src.aws.profiles import resolve_all
+from src.dashboard.costsense_theme import callout, metric, money, section
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
 )
 
 
-st.set_page_config(page_title="CostSense · Org Impact", layout="wide",
-                   page_icon="🏢")
+st.set_page_config(page_title="CostSense · Org Impact", layout="wide")
 inject_css()
 render_sidebar_header()  # Diligent card renders before any AWS calls
 
-st.title("Org-Level Impact")
-st.caption("Per-account spend across every linked account in the AWS "
-           "Organization. Data comes from Cost Explorer's `LINKED_ACCOUNT` "
-           "dimension on the management/payer profile.")
+section(
+    "Org-Level Impact",
+    "Per-account spend across every linked account in the AWS "
+    "Organization. Data comes from Cost Explorer's `LINKED_ACCOUNT` "
+    "dimension on the management/payer profile.",
+    kicker="Organization",
+)
 
 
 # ---------- top control bar ----------
@@ -42,7 +45,7 @@ st.caption("Per-account spend across every linked account in the AWS "
 with st.spinner("Resolving profiles…"):
     profiles = [p for p in resolve_all() if p.account_id]
 if not profiles:
-    st.error("No AWS profiles reachable.")
+    callout("No AWS profiles reachable.", tone="error")
     st.stop()
 default_idx = 0
 for i, p in enumerate(profiles):
@@ -59,7 +62,9 @@ picked_days = st.session_state.get("orglvl_days", 30)
 header = (f"Controls  ·  Account: {picked_label}  ·  "
           f"History: {picked_days}d")
 with top_bar(header):
-    c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+    c1, c2, c3, c4 = st.columns(
+        [3, 2, 2, 2], gap="medium", vertical_alignment="bottom",
+    )
     with c1:
         picked_label = st.selectbox(
             "Management profile", labels,
@@ -108,7 +113,7 @@ if run:
         try:
             data = fetch_org_spend(active.profile, days=days)
         except Exception as e:  # noqa: BLE001
-            st.error(f"Cost Explorer failed: {e}")
+            callout(f"Cost Explorer failed: {e}", tone="error")
             st.code(traceback.format_exc())
             st.stop()
         if include_top_service and data:
@@ -136,22 +141,32 @@ if run:
 
 
 if data is None:
-    st.info("Open **Controls** above, pick the management/payer profile, "
-            "and click **Fetch org spend**.")
+    callout(
+        "Open **Controls** above, pick the management/payer profile, "
+        "and click **Fetch org spend**.",
+        tone="info",
+    )
     st.stop()
 
 if not data:
-    st.warning("No linked-account spend data found. Is this profile the "
-               "AWS Organizations management account?")
+    callout(
+        "No linked-account spend data found. Is this profile the "
+        "AWS Organizations management account?",
+        tone="warning",
+    )
     st.stop()
 
 # KPI row
 total = sum(a.total_usd for a in data)
 active_count = sum(1 for a in data if a.total_usd > 0)
-kpi = st.columns(3)
-kpi[0].metric("Linked accounts", len(data))
-kpi[1].metric("Accounts with spend", active_count)
-kpi[2].metric(f"Total org spend ({days}d)", f"${total:,.0f}")
+kpi = st.columns(3, gap="medium")
+with kpi[0]:
+    metric("Linked accounts", len(data))
+with kpi[1]:
+    metric("Accounts with spend", active_count)
+with kpi[2]:
+    spend_display = money(total) if total >= 1_000 else f"${total:,.0f}"
+    metric(f"Total org spend ({days}d)", spend_display)
 
 st.divider()
 
@@ -159,18 +174,28 @@ st.divider()
 # other account by ID substring, so users can look up accounts outside the
 # top 30 without loading all 676+ rows.
 TOP_N = 30
+section(
+    "Account spend",
+    "Browse the top accounts by spend or search by account ID to jump "
+    "outside the default view.",
+    kicker="Results",
+)
 search = st.text_input(
     "Search account ID",
     placeholder="Enter part of an account id (e.g. 972575) to look up "
                 "accounts outside the top 30",
+    label_visibility="collapsed",
 )
 
 if search.strip():
     q = search.strip()
     filtered = [a for a in data if q in a.account_id]
     if not filtered:
-        st.warning(f"No account id contains `{q}`. "
-                   f"Showing top {TOP_N} by spend instead.")
+        callout(
+            f"No account id contains `{q}`. "
+            f"Showing top {TOP_N} by spend instead.",
+            tone="warning",
+        )
         filtered = data[:TOP_N]
     else:
         st.caption(f"{len(filtered)} match(es) for `{q}`.")
@@ -198,11 +223,6 @@ for a in filtered:
     rows.append(row)
 
 df = pd.DataFrame(rows)
-st.caption(
-    "Every linked account under this Organization payer. Total spend for "
-    "the window, last-7d vs prior-7d, trend %. Use the search above to "
-    "look up any account outside the top 30 shown here."
-)
 st.dataframe(
     df,
     use_container_width=True, hide_index=True,
@@ -218,26 +238,34 @@ st.divider()
 
 # Top movers callout
 if any(a.trend_pct() is not None for a in data):
-    st.subheader("Biggest movers — last 7 days vs prior 7 days")
+    section(
+        "Biggest movers",
+        "Last 7 days vs prior 7 days — largest spend shifts across the org.",
+        kicker="Trends",
+    )
     with_trend = [a for a in data if a.trend_pct() is not None]
     biggest_up = sorted(with_trend, key=lambda a: -(a.trend_pct() or 0))[:3]
     biggest_down = sorted(with_trend, key=lambda a: (a.trend_pct() or 0))[:3]
-    c1, c2 = st.columns(2)
+    c1, c2 = st.columns(2, gap="medium")
     with c1:
         st.markdown("**↗ Trending up**")
         for a in biggest_up:
             if (a.trend_pct() or 0) <= 0:
                 continue
+            last7 = a.spend_last_n_days(7)
+            last7_txt = money(last7) if last7 >= 1_000 else f"${last7:,.0f}"
             st.markdown(
                 f"- **{a.account_id}** — trend `{a.trend_pct():+.1f}%`, "
-                f"last 7d ${a.spend_last_n_days(7):,.0f}"
+                f"last 7d {last7_txt}"
             )
     with c2:
         st.markdown("**↘ Trending down**")
         for a in biggest_down:
             if (a.trend_pct() or 0) >= 0:
                 continue
+            last7 = a.spend_last_n_days(7)
+            last7_txt = money(last7) if last7 >= 1_000 else f"${last7:,.0f}"
             st.markdown(
                 f"- **{a.account_id}** — trend `{a.trend_pct():+.1f}%`, "
-                f"last 7d ${a.spend_last_n_days(7):,.0f}"
+                f"last 7d {last7_txt}"
             )

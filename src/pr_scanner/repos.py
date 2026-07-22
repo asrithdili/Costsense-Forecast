@@ -1,4 +1,4 @@
-"""Enumerate GitHub repos the current `gh` user has interacted with.
+"""Enumerate GitHub repos the current token user has interacted with.
 
 Two lenses are useful for the UI:
   - repos where the user has authored PRs (best signal of "repos I work on")
@@ -6,28 +6,21 @@ Two lenses are useful for the UI:
 """
 from __future__ import annotations
 
-import json
-import subprocess
 from functools import lru_cache
 
-
-def _run(args: list[str]) -> str:
-    r = subprocess.run(args, capture_output=True, check=False)
-    if r.returncode != 0:
-        err = r.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"gh failed ({args}): {err}")
-    return r.stdout.decode("utf-8", errors="replace")
+from src.pr_scanner.gh_client import api_get, list_pull_requests
 
 
 @lru_cache(maxsize=8)
 def repos_with_user_prs(org: str, limit: int = 100) -> tuple[str, ...]:
     """Repos in `org` where the authenticated user has authored PRs."""
-    login = json.loads(_run(["gh", "api", "user"]))["login"]
-    resp = _run([
-        "gh", "api",
-        f"search/issues?q=author:{login}+org:{org}+is:pr&per_page={limit}",
-    ])
-    data = json.loads(resp)
+    login = (api_get("user") or {}).get("login", "")
+    if not login:
+        return ()
+    data = api_get("search/issues", {
+        "q": f"author:{login} org:{org} is:pr",
+        "per_page": str(limit),
+    }) or {}
     repos: list[str] = []
     seen: set[str] = set()
     for item in data.get("items", []):
@@ -47,32 +40,27 @@ def repos_with_user_prs(org: str, limit: int = 100) -> tuple[str, ...]:
 
 @lru_cache(maxsize=1)
 def gh_login() -> str:
-    return json.loads(_run(["gh", "api", "user"]))["login"]
+    return (api_get("user") or {}).get("login", "?")
 
 
 @lru_cache(maxsize=1)
 def gh_orgs() -> tuple[str, ...]:
     """Orgs the authenticated user is a member of."""
-    resp = _run(["gh", "api", "user/orgs"])
-    return tuple(o["login"] for o in json.loads(resp))
+    data = api_get("user/orgs") or []
+    return tuple(o["login"] for o in data if o.get("login"))
 
 
 @lru_cache(maxsize=64)
 def repo_default_branch(repo: str) -> str:
     """Default branch of `org/repo` (e.g. main, master, develop)."""
-    resp = _run(["gh", "api", f"repos/{repo}"])
-    return json.loads(resp).get("default_branch", "main")
+    data = api_get(f"repos/{repo}") or {}
+    return data.get("default_branch", "main")
 
 
 @lru_cache(maxsize=64)
 def recent_base_branches(repo: str, limit: int = 30) -> tuple[str, ...]:
     """Base branches that have received merged PRs recently — ranked by count."""
-    resp = _run([
-        "gh", "pr", "list",
-        "--repo", repo, "--state", "merged", "--limit", str(limit),
-        "--json", "baseRefName",
-    ])
-    prs = json.loads(resp)
+    prs = list_pull_requests(repo, state="closed", limit=limit)
     counts: dict[str, int] = {}
     for p in prs:
         b = p.get("baseRefName") or ""

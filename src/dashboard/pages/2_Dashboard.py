@@ -48,12 +48,16 @@ from src.pr_scanner.repos import (
     repo_default_branch,
     repos_with_user_prs,
 )
+from src.dashboard.costsense_theme import (
+    C, callout, metric, money, pill, plotly_layout, section,
+)
+from src.dashboard.live_cost_meter import render_live_cost_meter
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
 )
 
 
-st.set_page_config(page_title="CostSense · forecast", layout="wide", page_icon="💸")
+st.set_page_config(page_title="CostSense · forecast", layout="wide")
 inject_css()
 # Render the Diligent brand card FIRST — before any AWS calls — so it
 # appears instantly instead of waiting for STS profile resolution.
@@ -142,12 +146,22 @@ def _auto_score(account_id: str, profile: str) -> int:
     return n
 
 
+def _rgba(hex_color: str, alpha: float) -> str:
+    """Hex token → rgba() string for Plotly fill colors."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
 # ---------- page title (rendered first so the page never looks blank) ----------
 
-st.title("CostSense — daily cost forecast")
-st.caption("Read-only cost forecast for the selected AWS account. "
-           "Open **Controls** below — enable **Include PR impact** only when "
-           "you want merged/open PRs layered on top of the billing forecast.")
+section(
+    "CostSense — daily cost forecast",
+    "Read-only cost forecast for the selected AWS account. "
+    "Open **Controls** below — enable **Include PR impact** only when "
+    "you want merged/open PRs layered on top of the billing forecast.",
+    kicker="Forecast",
+)
 
 
 # ---------- top control bar ----------
@@ -156,7 +170,11 @@ with st.spinner("Resolving profiles…"):
     profiles: list[ProfileInfo] = resolve_all()
 reachable = [p for p in profiles if p.account_id]
 if not reachable:
-    st.error("No reachable AWS profiles. Run `aws sso login` or launch via `aws-vault exec <profile> --` first, then reload.")
+    callout(
+        "No reachable AWS profiles. Run `aws sso login` or launch via "
+        "`aws-vault exec <profile> --` first, then reload.",
+        tone="error",
+    )
     st.stop()
 
 labels = [p.label for p in reachable]
@@ -256,7 +274,9 @@ header = (f"Controls  ·  Account: {picked_label}  ·  "
 
 with top_bar(header):
     # Row 1 — AWS
-    r1c1, r1c2, r1c3, r1c4 = st.columns([3, 2, 2, 2])
+    r1c1, r1c2, r1c3, r1c4 = st.columns(
+        [3, 2, 2, 2], gap="medium", vertical_alignment="bottom",
+    )
     with r1c1:
         picked_label = st.selectbox(
             "Account", labels,
@@ -291,7 +311,7 @@ with top_bar(header):
         )
 
     # Row 2 — service filter + optional PR layer
-    r2c1, r2c2 = st.columns([4, 2])
+    r2c1, r2c2 = st.columns([4, 2], gap="medium", vertical_alignment="bottom")
     with r2c1:
         pick_svc = st.selectbox(
             "Service filter", svc_options,
@@ -319,7 +339,9 @@ with top_bar(header):
 
     if include_pr:
         # Row 3 — GitHub
-        r3c1, r3c2, r3c3, r3c4 = st.columns([2, 4, 2, 2])
+        r3c1, r3c2, r3c3, r3c4 = st.columns(
+            [2, 4, 2, 2], gap="medium", vertical_alignment="bottom",
+        )
         with r3c1:
             if orgs:
                 gh_org = st.selectbox(
@@ -371,7 +393,9 @@ with top_bar(header):
             )
 
         # Row 4 — PR analyzer
-        r4c1, r4c2, _, _ = st.columns([2, 3, 2, 2])
+        r4c1, r4c2, _, _ = st.columns(
+            [2, 3, 2, 2], gap="medium", vertical_alignment="bottom",
+        )
         with r4c1:
             analyzer_choice = st.selectbox(
                 "PR analyzer", options=["hybrid", "llm", "regex"],
@@ -392,7 +416,7 @@ with top_bar(header):
             )
 
     # Row 5 — backtest controls
-    r5c1, r5c2 = st.columns([2, 2])
+    r5c1, r5c2 = st.columns([2, 2], gap="medium", vertical_alignment="bottom")
     with r5c1:
         show_replay = st.checkbox(
             "Show training fit", value=True, key="dash_show_backtest",
@@ -415,7 +439,9 @@ with top_bar(header):
         "Fetch Cost Explorer, fit the model, and save the next-7-day "
         "forecast to disk (billing history only)."
     )
-    r6c1, r6c2, _ = st.columns([2, 2, 8])
+    r6c1, r6c2, _ = st.columns(
+        [2, 2, 8], gap="medium", vertical_alignment="bottom",
+    )
     with r6c1:
         do_forecast = st.button(
             "Run forecast", type="primary", key="dash_run_forecast",
@@ -446,10 +472,14 @@ with st.sidebar:
 
 # ---------- main pane ----------
 
-svc_label = f"**{selected_service}**" if selected_service else "**All services**"
-st.info(f"Live account: **{account_id}** via profile `{active_profile}`  ·  "
-        f"scope: {svc_label}  ·  cutoff {cutoff.isoformat()}  ·  "
-        f"history {history_days}d")
+scope_label = selected_service or "All services"
+with st.container(border=True):
+    section(
+        "Active scope",
+        f"Account **{account_id}** via `{active_profile}` · scope: {scope_label} · "
+        f"cutoff {cutoff.isoformat()} · history {history_days}d",
+        kicker="Live",
+    )
 
 
 # History — always fetched live. Show a spinner in the gap so the
@@ -462,7 +492,7 @@ with st.spinner(f"Fetching cost history for `{active_profile}`… "
             service=selected_service,
         )
     except Exception as e:  # noqa: BLE001
-        st.error(f"Cost Explorer fetch failed: {e}")
+        callout(f"Cost Explorer fetch failed: {e}", tone="error")
         st.code(traceback.format_exc())
         st.stop()
 
@@ -490,10 +520,10 @@ if do_forecast:
                 model=model_choice,
                 include_open_prs=include_pr,
             )
-            st.success(f"Wrote {Path(out).name}")
+            callout(f"Wrote {Path(out).name}", tone="success")
             st.cache_data.clear()
         except Exception as e:  # noqa: BLE001
-            st.error(f"Pipeline failed: {e}")
+            callout(f"Pipeline failed: {e}", tone="error")
             st.code(traceback.format_exc())
 
 
@@ -569,11 +599,11 @@ if show_replay and not hist_df.empty:
                     lambda r: (r["abs_err"] / r["actual_usd"])
                     if r["actual_usd"] else None, axis=1)
         except Exception as e:  # noqa: BLE001
-            st.warning(f"Training fit overlay failed: {e}")
+            callout(f"Training fit overlay failed: {e}", tone="warning")
 
 
 # KPI row
-kpis = st.columns(4)
+kpis = st.columns(4, gap="medium")
 next_7_total = fc_df["adjusted_usd"].sum() if not fc_df.empty else None
 last_7_actual = hist_df.tail(7)["actual_usd"].sum() if not hist_df.empty else None
 _replay_valid = replay_df.dropna(subset=["actual_usd"]) if not replay_df.empty else replay_df
@@ -585,42 +615,72 @@ _bt_total_actual = _bt_valid["actual_usd"].abs().sum() if not _bt_valid.empty el
 wape_val = ((_bt_valid["abs_error_usd"].sum() / _bt_total_actual * 100)
             if _bt_total_actual else None)
 
-kpis[0].metric("Last 7d actual",
-               f"${last_7_actual:,.0f}" if last_7_actual is not None else "—")
-kpis[1].metric("Next 7d forecast",
-               f"${next_7_total:,.0f}" if next_7_total is not None else "—")
+with kpis[0]:
+    last_display = money(last_7_actual) if last_7_actual is not None and last_7_actual >= 1_000 else (
+        f"${last_7_actual:,.0f}" if last_7_actual is not None else "—"
+    )
+    metric("Last 7d actual", last_display)
+with kpis[1]:
+    next_display = money(next_7_total) if next_7_total is not None and next_7_total >= 1_000 else (
+        f"${next_7_total:,.0f}" if next_7_total is not None else "—"
+    )
+    metric("Next 7d forecast", next_display)
 delta = (next_7_total - last_7_actual
          if next_7_total is not None and last_7_actual is not None else None)
-kpis[2].metric(
-    "Forecast vs last 7d",
-    f"${delta:+,.0f}" if delta is not None else "—",
-    delta=f"{(delta / last_7_actual * 100):+.1f}%"
-    if delta is not None and last_7_actual else None,
-)
-kpis[3].metric(
-    "Trust check (training-fit WAPE)"
-    if replay_wape is not None else "Rolling 30d WAPE",
-    f"{replay_wape:.1f}%" if replay_wape is not None
-    else (f"{wape_val:.1f}%" if wape_val is not None else "—"),
-    help="WAPE = Σ|err| / Σ|actual| on in-sample training days. "
-         "Stable when daily spend is near zero. Lower = better.",
+delta_pct_kpi = (delta / last_7_actual * 100) if delta is not None and last_7_actual else None
+with kpis[2]:
+    delta_display = f"${delta:+,.0f}" if delta is not None else "—"
+    delta_label = f"{delta_pct_kpi:+.1f}%" if delta_pct_kpi is not None else None
+    delta_good = None if delta is None or delta == 0 else delta < 0
+    metric(
+        "Forecast vs last 7d",
+        delta_display,
+        delta=delta_label,
+        good=delta_good,
+    )
+with kpis[3]:
+    wape_label = (
+        "Trust check (training-fit WAPE)"
+        if replay_wape is not None else "Rolling 30d WAPE"
+    )
+    wape_display = (
+        f"{replay_wape:.1f}%" if replay_wape is not None
+        else (f"{wape_val:.1f}%" if wape_val is not None else "—")
+    )
+    metric(wape_label, wape_display)
+
+_last_7_avg = (last_7_actual / 7) if last_7_actual else None
+_next_7_avg = (next_7_total / 7) if next_7_total is not None else None
+render_live_cost_meter(
+    daily_burn_usd=_last_7_avg,
+    forecast_daily_usd=_next_7_avg,
+    delta_pct=delta_pct_kpi,
+    account_label=account_id,
 )
 
 st.divider()
 
+section(
+    "Cost forecast",
+    "Past actuals from Cost Explorer plus the saved future forecast band.",
+    kicker="Overview",
+)
 
 # Unified chart: past actuals + future band
 if hist_df.empty and fc_df.empty:
-    st.info(f"No Cost Explorer data for account **{account_id}** in the last "
-            f"{history_days} days, and no forecast on disk. If this is a fresh "
-            f"sandbox, spend may simply be $0.")
+    callout(
+        f"No Cost Explorer data for account **{account_id}** in the last "
+        f"{history_days} days, and no forecast on disk. If this is a fresh "
+        f"sandbox, spend may simply be $0.",
+        tone="info",
+    )
 else:
     fig = go.Figure()
     if not hist_df.empty:
         fig.add_trace(go.Scatter(
             x=hist_df["day"], y=hist_df["actual_usd"],
             mode="lines+markers", name="actual (Cost Explorer)",
-            line=dict(color="#2E86AB", width=2.5, shape="spline",
+            line=dict(color=C.BRAND, width=2.5, shape="spline",
                       smoothing=1.0),
         ))
     if not fc_df.empty:
@@ -634,35 +694,38 @@ else:
             x=fc_df["target_date"], y=fc_df["lower_usd"],
             mode="lines", fill="tonexty", name="forecast interval",
             line=dict(width=0, shape="spline", smoothing=1.0),
-            fillcolor="rgba(160,120,220,0.20)",
+            fillcolor=_rgba(C.BRAND, 0.15),
             hoverinfo="skip",
         ))
         fig.add_trace(go.Scatter(
             x=fc_df["target_date"], y=fc_df["baseline_usd"],
             mode="lines+markers", name="baseline forecast",
-            line=dict(color="#A17DB5", width=2, dash="dot",
+            line=dict(color=C.INFO, width=2, dash="dot",
                       shape="spline", smoothing=1.0),
         ))
         fig.add_trace(go.Scatter(
             x=fc_df["target_date"], y=fc_df["adjusted_usd"],
             mode="lines+markers", name="adjusted (baseline + PR delta)",
-            line=dict(color="#7B3F99", width=2.5, shape="spline",
+            line=dict(color=C.BRAND_DARK, width=2.5, shape="spline",
                       smoothing=1.0),
         ))
         fig.add_vline(
-            x=latest["run_cutoff"], line_dash="dash", line_color="#888",
+            x=latest["run_cutoff"], line_dash="dash", line_color=C.FAINT,
             annotation_text="cutoff", annotation_position="top",
         )
     else:
-        st.info("No saved future forecast yet — click **Run forecast** in "
-                "**Controls** above. Training fit below still shows how well "
-                "the model tracks history.")
+        callout(
+            "No saved future forecast yet — click **Run forecast** in "
+            "**Controls** above. Training fit below still shows how well "
+            "the model tracks history.",
+            tone="info",
+        )
 
     if not pr_series_df.empty:
         fig.add_trace(go.Scatter(
             x=pr_series_df["day"], y=pr_series_df["pr_cum_usd"],
             mode="lines", name="PR-attributable ($/day)",
-            line=dict(color="#E27D60", width=1.5, dash="dot"),
+            line=dict(color=C.SEV["High"], width=1.5, dash="dot"),
             hovertemplate="%{x}<br>PR delta $%{y:,.2f}<extra></extra>",
         ))
     if not replay_df.empty:
@@ -670,7 +733,7 @@ else:
             x=replay_df["target_date"], y=replay_df["predicted_usd"],
             mode="markers",
             name="training fit (in-sample)",
-            marker=dict(color="#C0504D", size=8, symbol="diamond",
+            marker=dict(color=C.BAD, size=8, symbol="diamond",
                         line=dict(color="white", width=1)),
             customdata=replay_df[["origin", "horizon", "actual_usd",
                                   "abs_err"]].values,
@@ -682,10 +745,9 @@ else:
                            "<extra></extra>"),
         ))
     fig.update_layout(
-        height=440, margin=dict(l=10, r=10, t=30, b=10),
-        yaxis_title="USD / day", hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="right", x=1),
+        **plotly_layout(height=440),
+        yaxis_title="USD / day",
+        hovermode="x unified",
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -713,7 +775,11 @@ else:
             )
 
     if latest:
-        st.subheader("Forecast detail")
+        section(
+            "Forecast detail",
+            "Daily baseline, PR delta, and confidence band.",
+            kicker="Breakdown",
+        )
         st.dataframe(
             fc_df[["target_date", "baseline_usd", "pr_delta_usd",
                    "adjusted_usd", "lower_usd", "upper_usd"]]
@@ -734,17 +800,20 @@ else:
 if latest and latest.get("open_pr_scan", {}).get("count"):
     ops = latest["open_pr_scan"]
     st.divider()
-    st.subheader("PRs about to land — future cost pressure")
     total = ops.get("total_expected_daily_delta_usd", 0.0)
-    arrow_color = st.error if total > 5 else st.success if total < -5 else st.info
-    arrow_color(
-        f"**{ops['count']}** open PR(s) analyzed  ·  "
-        f"probability-weighted expected impact **${total:+,.2f}/day** "
-        "once they merge"
+    impact_pill = (
+        "High" if total > 5 else "Low" if total < -5 else "Medium"
     )
-    st.caption("Each open PR is analyzed with the same deep AWS-tool pipeline "
-               "as merged PRs. Impact is weighted by merge likelihood "
-               "(review state × CI status × draft/age).")
+    with st.container(border=True):
+        st.markdown(pill(impact_pill), unsafe_allow_html=True)
+        section(
+            "PRs about to land — future cost pressure",
+            f"**{ops['count']}** open PR(s) analyzed · probability-weighted expected "
+            f"impact **${total:+,.2f}/day** once they merge. Each open PR uses the "
+            "same deep AWS-tool pipeline as merged PRs; impact is weighted by merge "
+            "likelihood (review state × CI status × draft/age).",
+            kicker="Upcoming",
+        )
     open_rows = []
     for p in ops.get("prs", []):
         arrow = "↗" if p["direction"] == "increase" else \
@@ -788,20 +857,24 @@ if latest and latest.get("open_pr_scan", {}).get("count"):
 if latest and latest.get("pr_scan"):
     pr_scan = latest["pr_scan"]
     st.divider()
-    st.subheader("PRs driving this forecast")
     at_cutoff = latest.get("pr_delta_daily_usd_at_cutoff", 0.0)
-    st.caption(
+    section(
+        "PRs driving this forecast",
         f"Scanned {len(pr_scan.get('repos', []))} repo(s) · base "
         f"`{pr_scan.get('base_branch', '—')}` · "
         f"last {pr_scan.get('lookback_days', 0)}d · "
         f"cumulative PR delta at cutoff **${at_cutoff:+,.2f}/day** "
-        "(list prices; upper bound)"
+        "(list prices; upper bound)",
+        kicker="Merged PRs",
     )
     impacts = pr_scan.get("impacts", [])
     if not impacts:
-        st.info(f"No IaC-touching PRs merged to `{pr_scan.get('base_branch')}` "
-                f"in the last {pr_scan.get('lookback_days')} days. "
-                "Forecast is baseline only.")
+        callout(
+            f"No IaC-touching PRs merged to `{pr_scan.get('base_branch')}` "
+            f"in the last {pr_scan.get('lookback_days')} days. "
+            "Forecast is baseline only.",
+            tone="info",
+        )
     else:
         analyzer_used = pr_scan.get("analyzer", "regex")
         model_used = pr_scan.get("llm_model") or ""
@@ -853,10 +926,13 @@ if latest and latest.get("pr_scan"):
 # ---------- cost driver breakdown ----------
 if svc_map and not selected_service:
     st.divider()
-    st.subheader("Cost drivers — what moved recently")
-    st.caption("Compare last 7 days vs the prior 7 days. Big movers here that "
-               "aren't in your PR list are likely non-code (console changes, "
-               "trials expiring, RIs). No model can predict those from git.")
+    section(
+        "Cost drivers — what moved recently",
+        "Compare last 7 days vs the prior 7 days. Big movers here that "
+        "aren't in your PR list are likely non-code (console changes, "
+        "trials expiring, RIs). No model can predict those from git.",
+        kicker="Drivers",
+    )
 
     rows = []
     for svc, points in svc_map.items():
@@ -882,7 +958,11 @@ if svc_map and not selected_service:
         )
 
 st.divider()
-st.subheader("Backtest — predicted vs actual")
+section(
+    "Backtest — predicted vs actual",
+    "How past predictions tracked against realized spend.",
+    kicker="Accuracy",
+)
 
 # If we have saved daily backtest scores, use them. Otherwise fall back to the
 # in-sample training fit we just computed.
@@ -897,8 +977,11 @@ if bt.empty and not replay_df.empty:
     bt_source = "training fit (in-memory)"
 
 if bt.empty:
-    st.info("No backtest data yet — enable **Show training fit** in "
-            "the controls, or wait for saved forecasts to age past 7 days.")
+    callout(
+        "No backtest data yet — enable **Show training fit** in "
+        "the controls, or wait for saved forecasts to age past 7 days.",
+        tone="info",
+    )
 else:
     if bt_source != "saved":
         st.caption(f"Source: {bt_source} — computed from live history, "
@@ -908,26 +991,29 @@ else:
     total_actual = bt["actual_usd"].abs().sum()
     wape_val_bt = (total_abs_err / total_actual * 100) if total_actual else None
 
-    bcols = st.columns(3)
-    bcols[0].metric("Days scored", len(bt))
-    bcols[1].metric("MAE", f"${bt['abs_error_usd'].mean():.2f}")
-    bcols[2].metric(
-        "WAPE",
-        f"{wape_val_bt:.1f}%" if wape_val_bt is not None else "—",
-        help="Weighted APE = Σ|err| / Σ|actual|. Robust when daily spend "
-             "is near zero.",
-    )
+    bcols = st.columns(3, gap="medium")
+    with bcols[0]:
+        metric("Days scored", len(bt))
+    with bcols[1]:
+        mae_val = bt["abs_error_usd"].mean()
+        mae_display = money(mae_val) if mae_val >= 1_000 else f"${mae_val:.2f}"
+        metric("MAE", mae_display)
+    with bcols[2]:
+        metric(
+            "WAPE",
+            f"{wape_val_bt:.1f}%" if wape_val_bt is not None else "—",
+        )
 
     fig2 = go.Figure()
     fig2.add_trace(go.Scatter(
         x=bt["target_date"], y=bt["predicted_usd"],
         mode="lines+markers", name="fitted (training)",
-        line=dict(color="#7B3F99", width=2.5, shape="spline", smoothing=1.0),
+        line=dict(color=C.BRAND_DARK, width=2.5, shape="spline", smoothing=1.0),
     ))
     fig2.add_trace(go.Scatter(
         x=bt["target_date"], y=bt["actual_usd"],
         mode="lines+markers", name="actual",
-        line=dict(color="#2E86AB", width=2.5, shape="spline", smoothing=1.0),
+        line=dict(color=C.BRAND, width=2.5, shape="spline", smoothing=1.0),
     ))
     # Extend chart with the future 7-day forecast so past + future live on
     # one axis. Future comes from `latest["forecast"]` (already persisted by
@@ -951,23 +1037,24 @@ else:
                 x=future_x, y=lower_y, mode="lines", fill="tonexty",
                 name="future forecast band",
                 line=dict(width=0, shape="spline", smoothing=1.0),
-                fillcolor="rgba(160,120,220,0.20)", hoverinfo="skip",
+                fillcolor=_rgba(C.BRAND, 0.15), hoverinfo="skip",
             ))
             fig2.add_trace(go.Scatter(
                 x=future_x, y=future_y,
                 mode="lines+markers", name="future prediction (next 7d)",
-                line=dict(color="#7B3F99", width=2.5, dash="dot",
+                line=dict(color=C.BRAND_DARK, width=2.5, dash="dot",
                           shape="spline", smoothing=1.0),
             ))
             fig2.add_vline(
                 x=str(last_past["target_date"]),
-                line_dash="dash", line_color="#888",
+                line_dash="dash", line_color=C.FAINT,
                 annotation_text="now", annotation_position="top",
             )
-    fig2.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10),
-                       yaxis_title="USD / day", hovermode="x unified",
-                       legend=dict(orientation="h", yanchor="bottom",
-                                   y=1.02, xanchor="right", x=1))
+    fig2.update_layout(
+        **plotly_layout(height=340),
+        yaxis_title="USD / day",
+        hovermode="x unified",
+    )
     st.plotly_chart(fig2, use_container_width=True)
 
     err_roll = bt["abs_error_usd"].rolling(7, min_periods=1).sum()
@@ -978,16 +1065,23 @@ else:
         x=bt["target_date"],
         y=bt["wape_pct"],
         mode="lines+markers", name="rolling 7-day WAPE",
-        line=dict(color="#C0504D", width=2.5, shape="spline", smoothing=1.0),
+        line=dict(color=C.BAD, width=2.5, shape="spline", smoothing=1.0),
     ))
-    fig3.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=10),
-                       yaxis_title="WAPE %", hovermode="x unified")
+    fig3.update_layout(
+        **plotly_layout(height=260),
+        yaxis_title="WAPE %",
+        hovermode="x unified",
+    )
     st.plotly_chart(fig3, use_container_width=True)
 
 
 # ---------- Future forecast summary (no LLM, computed from data) ----------
 st.divider()
-st.subheader("What will happen next — and why")
+section(
+    "What will happen next — and why",
+    "Direction and drivers behind the next 7-day forecast.",
+    kicker="Outlook",
+)
 
 if latest and latest.get("forecast"):
     fc_rows = latest["forecast"]
@@ -999,18 +1093,28 @@ if latest and latest.get("forecast"):
     last7_avg = last7_actual / 7 if last7_actual else 0.0
     delta_pct = ((future_avg - last7_avg) / last7_avg * 100) if last7_avg else None
 
-    # Direction banner
+    # Direction summary
     if delta_pct is None:
-        direction, arrow, color = "flat", "→", st.info
+        direction_pill = "Medium"
     elif delta_pct > 5:
-        direction, arrow, color = "up", "↗", st.warning
+        direction_pill = "High"
     elif delta_pct < -5:
-        direction, arrow, color = "down", "↘", st.success
+        direction_pill = "Low"
     else:
-        direction, arrow, color = "flat", "→", st.info
+        direction_pill = "Medium"
 
-    color(f"### {arrow} Next 7 days — est. **\\${future_avg:,.0f}/day** "
-          f"(\\${future_total:,.0f} total)")
+    future_avg_display = (
+        money(future_avg) if future_avg >= 1_000 else f"${future_avg:,.0f}"
+    )
+    future_total_display = (
+        money(future_total) if future_total >= 1_000 else f"${future_total:,.0f}"
+    )
+    with st.container(border=True):
+        st.markdown(pill(direction_pill), unsafe_allow_html=True)
+        st.markdown(
+            f"### Next 7 days — est. **{future_avg_display}/day** "
+            f"({future_total_display} total)"
+        )
 
     # Concrete reasons pulled from the forecast payload
     tuned = latest.get("tuned_params") or {}
@@ -1115,8 +1219,14 @@ if latest and latest.get("forecast"):
         for r in reasons:
             st.markdown(f"- {r}")
     else:
-        st.info("Not enough data yet to explain the forecast. Click "
-                "**Run forecast** in **Controls** first.")
+        callout(
+            "Not enough data yet to explain the forecast. Click "
+            "**Run forecast** in **Controls** first.",
+            tone="info",
+        )
 else:
-    st.info("No forecast on disk yet. Click **Run forecast** in **Controls** "
-            "to generate one.")
+    callout(
+        "No forecast on disk yet. Click **Run forecast** in **Controls** "
+        "to generate one.",
+        tone="info",
+    )

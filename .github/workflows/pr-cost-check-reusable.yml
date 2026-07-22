@@ -1,0 +1,137 @@
+name: PR Cost Check (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      aws_profile:
+        description: >-
+          Optional. Only pass a value when the runner has a locally
+          configured AWS profile of that name (rare in GitHub Actions).
+          Leave empty and boto3 will pick up the OIDC-injected env-var
+          credentials from `aws-actions/configure-aws-credentials`.
+        required: false
+        default: ""
+        type: string
+      aws_region:
+        description: AWS region for OIDC credentials
+        default: us-west-2
+        type: string
+      model_id:
+        description: Bedrock model ID for PR analysis
+        default: us.anthropic.claude-sonnet-4-6
+        type: string
+      max_daily_increase_usd:
+        description: Fail when estimated daily increase exceeds this USD amount
+        default: "5"
+        type: string
+      min_tool_calls:
+        description: Minimum AWS tool calls required for a valid verdict
+        default: "5"
+        type: string
+      history_days:
+        description: Days of Cost Explorer history for the forecast chart
+        default: "60"
+        type: string
+      include_forecast_chart:
+        description: Render forecast.png and embed it in the job summary
+        default: true
+        type: boolean
+      post_pr_comment:
+        description: Post or update a sticky PR comment with the report
+        default: true
+        type: boolean
+      costsense_repository:
+        description: >-
+          Repo containing CostSense code (org/name). Leave empty when the
+          reusable workflow runs inside this repository.
+        required: false
+        type: string
+    secrets:
+      AWS_ROLE_TO_ASSUME:
+        description: IAM role ARN for OIDC (Bedrock + read-only AWS APIs)
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  pr-cost-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout CostSense
+        uses: actions/checkout@v4
+        with:
+          repository: >-
+            ${{ inputs.costsense_repository != '' && inputs.costsense_repository || github.repository }}
+          path: costsense
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: costsense
+        run: pip install -r requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Run PR cost check
+        id: check
+        working-directory: costsense
+        # AWS creds arrive as env vars from configure-aws-credentials
+        # (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN /
+        # AWS_REGION). Do NOT export AWS_PROFILE unless a matching profile
+        # actually exists on the runner — boto3 will fail with
+        # ProfileNotFound otherwise.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          # Logical account label for CostSense — not ~/.aws/config on GHA.
+          COSTSENSE_AWS_PROFILE: ${{ inputs.aws_profile }}
+        run: |
+          ARGS=(
+            --pr-url "${{ github.event.pull_request.html_url }}"
+            --model-id "${{ inputs.model_id }}"
+            --max-daily-increase-usd "${{ inputs.max_daily_increase_usd }}"
+            --min-tool-calls "${{ inputs.min_tool_calls }}"
+            --history-days "${{ inputs.history_days }}"
+            --output-json pr-cost-verdict.json
+          )
+          if [ -n "${{ inputs.aws_profile }}" ]; then
+            ARGS+=(--profile "${{ inputs.aws_profile }}")
+          fi
+          if [ "${{ inputs.include_forecast_chart }}" = "true" ]; then
+            ARGS+=(--forecast-chart forecast.png)
+          fi
+          if [ "${{ inputs.post_pr_comment }}" = "true" ]; then
+            ARGS+=(--pr-comment pr-cost-comment.md)
+          fi
+          python scripts/pr_cost_check.py "${ARGS[@]}"
+
+      - name: Post PR comment
+        if: >-
+          always() &&
+          inputs.post_pr_comment &&
+          github.event_name == 'pull_request' &&
+          hashFiles('costsense/pr-cost-comment.md') != ''
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: costsense/pr-cost-comment.md
+          comment-tag: costsense-pr-cost-check
+
+      - name: Upload report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-cost-report
+          path: |
+            costsense/pr-cost-verdict.json
+            costsense/forecast.png
+          if-no-files-found: ignore

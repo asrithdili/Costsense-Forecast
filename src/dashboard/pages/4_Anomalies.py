@@ -21,27 +21,36 @@ if str(_REPO_ROOT) not in sys.path:
 
 import streamlit as st
 
-from src.ai_agent.anomaly_agent import analyze_anomalies
+from src.ai_agent.anomaly_agent import analyze_anomalies, Approach
+from src.ai_agent.pr_fix_agent import plan_pr_fix
+from src.pr_scanner.gh_write import (
+    apply_pr_plan,
+    build_diff_preview,
+    github_write_auth_status,
+)
 from src.ai_agent.aws_sweep import sweep_account
 from src.ai_agent.aws_sweep import sweep_to_summary as aws_summary
 from src.ai_agent.repo_sweep import sweep_repos
 from src.ai_agent.repo_sweep import sweep_to_summary as repo_summary
 from src.aws.profiles import resolve_all
+from src.dashboard.costsense_theme import callout, confidence_pill, metric, money, section
 from src.pr_scanner.repos import gh_login, gh_orgs, repos_with_user_prs
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
 )
 
 
-st.set_page_config(page_title="CostSense · Anomalies", layout="wide",
-                   page_icon="🚨")
+st.set_page_config(page_title="CostSense · Anomalies", layout="wide")
 inject_css()
 render_sidebar_header()  # Diligent card renders before any AWS calls
 
-st.title("Anomalies & Recommendations")
-st.caption("Full-repo + full-AWS sweep. Ranked list of concrete cost-cutting "
-           "actions with $/day savings and confidence, grounded in real "
-           "AWS + GitHub data.")
+section(
+    "Anomalies & Recommendations",
+    "Full-repo + full-AWS sweep. Ranked list of concrete cost-cutting "
+    "actions with $/day savings and confidence, grounded in real "
+    "AWS + GitHub data.",
+    kicker="Analysis",
+)
 
 
 # ---------- top control bar ----------
@@ -49,7 +58,7 @@ st.caption("Full-repo + full-AWS sweep. Ranked list of concrete cost-cutting "
 with st.spinner("Resolving profiles…"):
     profiles = [p for p in resolve_all() if p.account_id]
 if not profiles:
-    st.error("No AWS profiles reachable.")
+    callout("No AWS profiles reachable.", tone="error")
     st.stop()
 labels = [p.label for p in profiles]
 
@@ -112,7 +121,7 @@ from src.pr_scanner.profile_repo_match import match_repos as _match
 default_repos = _match(active_preview.profile, short_names_preview) or short_names_preview
 
 with top_bar(header):
-    c1, c2 = st.columns([3, 3])
+    c1, c2 = st.columns([3, 3], gap="medium", vertical_alignment="bottom")
     with c1:
         picked_label = st.selectbox(
             "Account", labels,
@@ -127,7 +136,7 @@ with top_bar(header):
             key="anom_model_idx",
         )
 
-    c3, c4 = st.columns([2, 5])
+    c3, c4 = st.columns([2, 5], gap="medium", vertical_alignment="bottom")
     with c3:
         if orgs:
             gh_org = st.selectbox(
@@ -207,7 +216,11 @@ if _is_stale(report):
 # from an earlier schema" artifacts. Also clears any siblings (aws/repo).
 if run_btn:
     stale = [k for k in list(st.session_state.keys())
-             if isinstance(k, str) and k.startswith("anom::")]
+             if isinstance(k, str) and (
+                 k.startswith("anom::")
+                 or "::pr_plan::" in k
+                 or "::pr_result::" in k
+             )]
     for k in stale:
         del st.session_state[k]
     report = None
@@ -217,7 +230,7 @@ if run_btn:
             aws_raw = sweep_account(active.profile)
             aws_sum = aws_summary(aws_raw)
         except Exception as e:  # noqa: BLE001
-            st.error(f"AWS sweep failed: {e}")
+            callout(f"AWS sweep failed: {e}", tone="error")
             st.code(traceback.format_exc())
             st.stop()
     with st.spinner(f"Sweeping {len(selected_repos)} repo(s) via GitHub…"):
@@ -225,7 +238,7 @@ if run_btn:
             repo_raw = sweep_repos(selected_repos) if selected_repos else []
             repo_sum = repo_summary(repo_raw)
         except Exception as e:  # noqa: BLE001
-            st.error(f"Repo sweep failed: {e}")
+            callout(f"Repo sweep failed: {e}", tone="error")
             st.code(traceback.format_exc())
             st.stop()
     with st.spinner("Analyzing with Claude…"):
@@ -238,20 +251,24 @@ if run_btn:
             st.session_state[report_key + "::aws"] = aws_sum
             st.session_state[report_key + "::repo"] = repo_sum
         except Exception as e:  # noqa: BLE001
-            st.error(f"anomaly agent failed: {e}")
+            callout(f"anomaly agent failed: {e}", tone="error")
             st.code(traceback.format_exc())
 
 
 # ---------- render ----------
 
 if report is None:
-    st.info("Pick an AWS profile and repos in the sidebar, then click "
-            "**Analyze**.")
+    callout(
+        "Pick an AWS profile and repos in the sidebar, then click "
+        "**Analyze**.",
+        tone="info",
+    )
     st.stop()
 
 if report.error:
-    st.error(f"Agent error: {report.error}")
+    callout(f"Agent error: {report.error}", tone="error")
     st.stop()
+
 
 def _plain(text: str) -> str:
     """Escape dollar signs so Streamlit's markdown doesn't render $..$ as
@@ -261,26 +278,70 @@ def _plain(text: str) -> str:
     return text.replace("$", "\\$").strip()
 
 
-# KPI row first — clean numbers at a glance.
-kpis = st.columns(3)
-kpis[0].metric("Recommended actions", len(report.actions))
-kpis[1].metric("Potential savings / day",
-               f"${report.total_daily_savings_usd:,.2f}")
-kpis[2].metric("AWS tool calls (drill-down)", report.tool_calls)
+PR_ELIGIBLE_LANGUAGES = frozenset({
+    "terraform", "hcl", "typescript", "javascript", "python",
+    "yaml", "yml", "json",
+})
 
-# Summary rendered as a subtle info block instead of a competing header.
-# This gives the page clear visual hierarchy:
-#   Page title (h1)  →  KPI numbers  →  Summary blurb  →  Card list.
+
+def _approach_pr_eligible(ap: Approach) -> bool:
+    code = (getattr(ap, "code", "") or "").strip()
+    lang = (getattr(ap, "language", "") or "").strip().lower()
+    if lang == "yml":
+        lang = "yaml"
+    return bool(code) and lang in PR_ELIGIBLE_LANGUAGES
+
+
+def _pr_plan_key(report_key: str, action_idx: int) -> str:
+    return f"{report_key}::pr_plan::{action_idx}"
+
+
+def _pr_result_key(report_key: str, action_idx: int) -> str:
+    return f"{report_key}::pr_result::{action_idx}"
+
+
+section(
+    "Scan results",
+    "Ranked actions from the latest AWS and repository sweep.",
+    kicker="Results",
+)
+
+# KPI row first — clean numbers at a glance.
+savings = report.total_daily_savings_usd
+savings_display = (
+    money(savings) if savings >= 1_000 else f"${savings:,.2f}"
+)
+kpis = st.columns(3, gap="medium")
+with kpis[0]:
+    metric("Recommended actions", len(report.actions))
+with kpis[1]:
+    metric(
+        "Potential savings / day",
+        savings_display,
+        delta="recurring",
+        good=True,
+    )
+with kpis[2]:
+    metric("AWS tool calls (drill-down)", report.tool_calls)
+
+# Summary — theme-consistent bordered card instead of heavy st.info banner.
 if report.summary:
-    st.info(f"**Summary** — {_plain(report.summary)}")
+    with st.container(border=True):
+        section("Summary", _plain(report.summary), kicker="Overview")
 
 st.divider()
 
 # Category filter
 if report.actions:
+    section(
+        "Filter actions",
+        "Narrow the list by recommendation category.",
+        kicker="Filters",
+    )
     cats = sorted({a.category or "other" for a in report.actions})
     picked_cats = st.multiselect(
         "Filter by category", cats, default=cats,
+        label_visibility="collapsed",
     )
     filtered = [a for a in report.actions
                 if (a.category or "other") in picked_cats]
@@ -296,31 +357,35 @@ if report.actions:
         "other": "Other",
     }
 
-    for i, a in enumerate(filtered, start=1):
-        conf_lower = (a.confidence or "medium").lower()
-        conf_bg = {
-            "high": "#16a34a",
-            "medium": "#eab308",
-            "low": "#6b7280",
-        }.get(conf_lower, "#6b7280")
+    section(
+        "Recommended actions",
+        f"{len(filtered)} action(s) shown"
+        + (f" of {len(report.actions)} total." if len(filtered) != len(report.actions)
+           else "."),
+        kicker="Actions",
+    )
+
+    for display_i, a in enumerate(filtered, start=1):
+        action_idx = report.actions.index(a)
         cat_label = CATEGORY_LABEL.get(
             a.category or "other", (a.category or "Other").title()
         )
+        save_amt = a.est_daily_savings_usd
+        save_txt = money(save_amt) if save_amt >= 1_000 else f"${save_amt:,.2f}"
         with st.container(border=True):
-            head_l, head_r = st.columns([5, 1])
-            head_l.markdown(
-                f"**#{i} · {cat_label}**"
-                f"   ·  Save **\\${a.est_daily_savings_usd:,.2f}/day**"
-            )
-            head_r.markdown(
-                f"<div style='text-align:right;'>"
-                f"<span style='background:{conf_bg};color:white;"
-                f"padding:2px 10px;border-radius:12px;"
-                f"font-size:0.85em;font-weight:600;'>"
-                f"{a.confidence.title()}"
-                f"</span></div>",
-                unsafe_allow_html=True,
-            )
+            head_l, head_r = st.columns([5, 1], gap="medium")
+            with head_l:
+                st.markdown(
+                    f"**#{display_i} · {cat_label}**"
+                    f"   ·   Save **{_plain(save_txt)}/day**"
+                )
+            with head_r:
+                st.markdown(
+                    f"<div style='text-align:right;'>"
+                    f"{confidence_pill(a.confidence)}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
             st.markdown(
                 f"- **Issue:** {_plain(a.issue) or '_—_'}\n"
@@ -361,5 +426,99 @@ if report.actions:
                     if code:
                         st.code(code, language=lang)
 
+                # --- Draft PR flow (gated: IaC code + scanned repos) ---
+                if _approach_pr_eligible(best) and selected_repos:
+                    gh_ready, gh_msg = github_write_auth_status()
+                    plan_key = _pr_plan_key(report_key, action_idx)
+                    result_key = _pr_result_key(report_key, action_idx)
+                    pr_result = st.session_state.get(result_key)
 
+                    if pr_result:
+                        st.success(f"Draft PR opened: {pr_result}")
+                    else:
+                        if not gh_ready:
+                            st.caption(f"GitHub write: {gh_msg}")
 
+                        plan = st.session_state.get(plan_key)
+                        prepare_key = f"anom_prepare_pr_{report_key}_{action_idx}"
+                        confirm_key = f"anom_confirm_pr_{report_key}_{action_idx}"
+                        cancel_key = f"anom_cancel_pr_{report_key}_{action_idx}"
+
+                        if st.button(
+                            "Prepare draft PR",
+                            key=prepare_key,
+                            disabled=not gh_ready,
+                            type="secondary",
+                        ):
+                            with st.spinner(
+                                "Locating file in repo and building preview…"
+                            ):
+                                try:
+                                    plan = plan_pr_fix(
+                                        action=a,
+                                        approach=best,
+                                        allowed_repos=selected_repos,
+                                        model_id=model_id,
+                                    )
+                                    st.session_state[plan_key] = plan
+                                except Exception as e:  # noqa: BLE001
+                                    callout(f"PR planning failed: {e}", tone="error")
+                                    st.code(traceback.format_exc())
+
+                        plan = st.session_state.get(plan_key)
+                        if plan is not None:
+                            if plan.error:
+                                callout(
+                                    f"Could not prepare PR: {plan.error}",
+                                    tone="warning",
+                                )
+                            elif plan.repo and plan.files:
+                                st.markdown("**PR preview**")
+                                st.markdown(
+                                    f"- **Repo:** `{plan.repo}`\n"
+                                    f"- **Branch:** `{plan.branch}`\n"
+                                    f"- **Title:** {_plain(plan.title)}"
+                                )
+                                try:
+                                    diff_text = build_diff_preview(
+                                        plan.repo,
+                                        [{"path": f.path, "content": f.content}
+                                         for f in plan.files],
+                                    )
+                                except Exception as e:  # noqa: BLE001
+                                    diff_text = f"(diff preview failed: {e})"
+                                st.code(diff_text or "(no changes)", language="diff")
+
+                                btn_l, btn_r = st.columns(2)
+                                with btn_l:
+                                    if st.button(
+                                        "Open draft PR",
+                                        key=confirm_key,
+                                        type="primary",
+                                    ):
+                                        with st.spinner("Pushing branch and opening draft PR…"):
+                                            try:
+                                                url = apply_pr_plan(
+                                                    repo=plan.repo,
+                                                    branch=plan.branch,
+                                                    title=plan.title,
+                                                    body=plan.body,
+                                                    files=[
+                                                        {"path": f.path,
+                                                         "content": f.content}
+                                                        for f in plan.files
+                                                    ],
+                                                )
+                                                st.session_state[result_key] = url
+                                                del st.session_state[plan_key]
+                                                st.rerun()
+                                            except Exception as e:  # noqa: BLE001
+                                                callout(
+                                                    f"Failed to open draft PR: {e}",
+                                                    tone="error",
+                                                )
+                                                st.code(traceback.format_exc())
+                                with btn_r:
+                                    if st.button("Discard preview", key=cancel_key):
+                                        del st.session_state[plan_key]
+                                        st.rerun()

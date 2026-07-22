@@ -4,8 +4,8 @@ Lets CostSense AI answer questions about a repo directly — find it by name,
 list its files, read a file, and list/diff pull requests — instead of
 saying it has no GitHub access.
 
-Uses the `gh` CLI when installed and authenticated, otherwise falls back to
-the GitHub REST API via `GITHUB_TOKEN`/`GH_TOKEN` (see `src.pr_scanner.gh_client`).
+Uses the GitHub REST API via `GITHUB_TOKEN`/`GH_TOKEN` (see `src.pr_scanner.gh_client`).
+Falls back to the `gh` CLI only when no token env var is set.
 Every result still passes through the chat agent's secret scrubber before
 Claude sees it.
 """
