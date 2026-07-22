@@ -1,4 +1,4 @@
-"""GitHub access — prefers `gh` CLI when installed, falls back to REST API."""
+"""GitHub access — uses GITHUB_TOKEN / GH_TOKEN when set, else `gh` CLI."""
 from __future__ import annotations
 
 import base64
@@ -9,6 +9,10 @@ import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from src.env import load_env
+
+load_env()
 
 
 # Common Windows install locations — checked as a fallback when `gh` isn't
@@ -42,6 +46,15 @@ def gh_available() -> bool:
     return _resolve_gh() is not None
 
 
+def _github_token() -> str | None:
+    return os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+
+
+def token_configured() -> bool:
+    """True when GITHUB_TOKEN or GH_TOKEN is set in the environment."""
+    return bool(_github_token())
+
+
 def _run_cli(args: list[str]) -> str:
     gh_path = _resolve_gh() or "gh"
     resolved_args = [gh_path, *args[1:]] if args and args[0] == "gh" else args
@@ -52,11 +65,13 @@ def _run_cli(args: list[str]) -> str:
     return r.stdout.decode("utf-8", errors="replace")
 
 
-def _github_token() -> str | None:
-    return os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-
-
-def _api_request(path: str, *, accept: str = "application/vnd.github+json") -> bytes:
+def _api_request(
+    path: str,
+    *,
+    accept: str = "application/vnd.github+json",
+    method: str = "GET",
+    body: bytes | None = None,
+) -> bytes:
     headers = {
         "Accept": accept,
         "User-Agent": "costsense-forecast",
@@ -65,28 +80,114 @@ def _api_request(path: str, *, accept: str = "application/vnd.github+json") -> b
     token = _github_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    elif not gh_available():
+        raise RuntimeError(
+            "GitHub auth not configured. Set GITHUB_TOKEN (or GH_TOKEN) "
+            "in your environment, or install the GitHub CLI (`gh`) and run "
+            "`gh auth login`."
+        )
+    if body is not None:
+        headers["Content-Type"] = "application/json"
 
-    req = urllib.request.Request(f"https://api.github.com{path}", headers=headers)
+    req = urllib.request.Request(
+        f"https://api.github.com{path}",
+        data=body,
+        headers=headers,
+        method=method,
+    )
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             return resp.read()
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
+        err_body = e.read().decode("utf-8", errors="replace")
         if e.code in (401, 403):
             raise RuntimeError(
                 "GitHub API auth failed. Set GITHUB_TOKEN (or GH_TOKEN) "
-                "with repo read access, or install the GitHub CLI (`gh`) "
-                "and run `gh auth login`."
+                "with repo access in your environment."
             ) from e
         if e.code == 404:
             raise RuntimeError(
                 f"GitHub resource not found or not accessible: {path}. "
                 "Check the PR URL and token permissions."
             ) from e
-        raise RuntimeError(f"GitHub API error {e.code}: {body[:500]}") from e
+        raise RuntimeError(f"GitHub API error {e.code}: {err_body[:500]}") from e
+
+
+def api_get(path: str, params: dict | None = None,
+           accept: str = "application/vnd.github+json"):
+    """GET a GitHub REST API path (no leading slash). Returns parsed JSON."""
+    query = f"?{urllib.parse.urlencode(params)}" if params else ""
+    if token_configured():
+        data = _api_request(f"/{path}{query}", accept=accept)
+        return json.loads(data) if data.strip() else None
+    if gh_available():
+        args = ["gh", "api", f"{path}{query}"]
+        if accept != "application/vnd.github+json":
+            args += ["-H", f"Accept: {accept}"]
+        out = _run_cli(args)
+        return json.loads(out) if out.strip() else None
+    data = _api_request(f"/{path}{query}", accept=accept)
+    return json.loads(data) if data.strip() else None
+
+
+def api_post(path: str, payload: dict) -> dict:
+    """POST to a GitHub REST API path (no leading slash)."""
+    if token_configured():
+        data = _api_request(
+            f"/{path}", method="POST", body=json.dumps(payload).encode(),
+        )
+        return json.loads(data) if data.strip() else {}
+    if gh_available():
+        import subprocess
+        gh_path = _resolve_gh() or "gh"
+        r = subprocess.run(
+            [gh_path, "api", path, "-X", "POST", "--input", "-"],
+            input=json.dumps(payload).encode(),
+            capture_output=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            err = r.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"gh api POST failed: {err}")
+        out = r.stdout.decode("utf-8", errors="replace")
+        return json.loads(out) if out.strip() else {}
+    data = _api_request(
+        f"/{path}", method="POST", body=json.dumps(payload).encode(),
+    )
+    return json.loads(data) if data.strip() else {}
+
+
+def api_put(path: str, payload: dict) -> dict:
+    """PUT to a GitHub REST API path (no leading slash)."""
+    if token_configured():
+        data = _api_request(
+            f"/{path}", method="PUT", body=json.dumps(payload).encode(),
+        )
+        return json.loads(data) if data.strip() else {}
+    if gh_available():
+        import subprocess
+        gh_path = _resolve_gh() or "gh"
+        r = subprocess.run(
+            [gh_path, "api", path, "-X", "PUT", "--input", "-"],
+            input=json.dumps(payload).encode(),
+            capture_output=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            err = r.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"gh api PUT failed: {err}")
+        out = r.stdout.decode("utf-8", errors="replace")
+        return json.loads(out) if out.strip() else {}
+    data = _api_request(
+        f"/{path}", method="PUT", body=json.dumps(payload).encode(),
+    )
+    return json.loads(data) if data.strip() else {}
 
 
 def pr_view_json(repo: str, number: int) -> dict:
+    if token_configured():
+        data = json.loads(_api_request(f"/repos/{repo}/pulls/{number}"))
+        return {"title": data.get("title", "")}
     if gh_available():
         return json.loads(_run_cli([
             "gh", "pr", "view", str(number),
@@ -97,6 +198,11 @@ def pr_view_json(repo: str, number: int) -> dict:
 
 
 def pr_diff(repo: str, number: int) -> str:
+    if token_configured():
+        return _api_request(
+            f"/repos/{repo}/pulls/{number}",
+            accept="application/vnd.github.diff",
+        ).decode("utf-8", errors="replace")
     if gh_available():
         return _run_cli(["gh", "pr", "diff", str(number), "--repo", repo])
     return _api_request(
@@ -108,20 +214,6 @@ def pr_diff(repo: str, number: int) -> str:
 # ---------------------------------------------------------------------------
 # Generic repo browsing — used by the chat agent's GitHub tools
 # ---------------------------------------------------------------------------
-
-def api_get(path: str, params: dict | None = None,
-           accept: str = "application/vnd.github+json"):
-    """GET a GitHub REST API path (no leading slash), via `gh api` when
-    available, else the raw REST API. Returns parsed JSON."""
-    query = f"?{urllib.parse.urlencode(params)}" if params else ""
-    if gh_available():
-        args = ["gh", "api", f"{path}{query}"]
-        if accept != "application/vnd.github+json":
-            args += ["-H", f"Accept: {accept}"]
-        out = _run_cli(args)
-        return json.loads(out) if out.strip() else None
-    data = _api_request(f"/{path}{query}", accept=accept)
-    return json.loads(data) if data.strip() else None
 
 
 def search_repositories(query: str, limit: int = 10,
@@ -180,6 +272,19 @@ def get_file(repo: str, path: str, ref: str | None = None) -> str:
 
 
 def list_pull_requests(repo: str, state: str = "open", limit: int = 20) -> list[dict]:
+    if token_configured():
+        data = api_get(f"repos/{repo}/pulls", {"state": state, "per_page": limit}) or []
+        return [{
+            "number": p.get("number"),
+            "title": p.get("title"),
+            "author": (p.get("user") or {}).get("login"),
+            "createdAt": p.get("created_at"),
+            "updatedAt": p.get("updated_at"),
+            "url": p.get("html_url"),
+            "baseRefName": (p.get("base") or {}).get("ref"),
+            "additions": p.get("additions"),
+            "deletions": p.get("deletions"),
+        } for p in data]
     if gh_available():
         out = _run_cli([
             "gh", "pr", "list", "--repo", repo, "--state", state,
