@@ -1,0 +1,21 @@
+name: PR Cost Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Caller must grant permissions the reusable workflow requests (OIDC + PR comment).
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  cost-check:
+    uses: ./.github/workflows/pr-cost-check-reusable.yml
+    with:
+      aws_profile: dil-data-platform-dev
+      max_daily_increase_usd: "5"
+      include_forecast_chart: true
+    secrets:
+      AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
