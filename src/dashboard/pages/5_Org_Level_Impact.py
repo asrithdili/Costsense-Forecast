@@ -289,8 +289,39 @@ st.divider()
 # ============================================================================
 def _render_ownership(org: OrgSpend) -> None:
     st.markdown("##### Where the money sits")
+
+    # Explain up front WHY the ownership charts might be sparse. Without
+    # this banner, a payer profile that lacks Organizations permissions
+    # shows a giant "Unallocated" bar and there's no way to tell whether
+    # that's a real tagging-hygiene issue or an auth problem on our end.
+    if org.ownership_source == "unavailable":
+        callout(
+            "This profile can't read AWS Organizations (`ListAccounts` "
+            "denied), so we don't have team/OU/environment info for these "
+            "accounts. **Group by Account** is the accurate view. To get "
+            "the other groupings, ask DevOps to grant "
+            "`organizations:ListAccounts` and "
+            "`organizations:ListTagsForResource` on this role.",
+            tone="warning",
+        )
+    elif org.ownership_source == "names":
+        st.caption(
+            "Team and Environment inferred from account NAMES because "
+            "`organizations:ListTagsForResource` isn't granted on this "
+            "role. Accuracy is only as good as your account naming "
+            "convention — expect some Unallocated."
+        )
+
+    # Default the Group by selector based on how much ownership signal we
+    # got. When Organizations is fully denied, Account is the only
+    # dimension that carries useful information.
+    default_dim = ("Account" if org.ownership_source == "unavailable"
+                   else "Team")
+    dim_options = list(GROUP_DIMENSIONS.keys())
+    if "orgv2_group_by" not in st.session_state:
+        st.session_state["orgv2_group_by"] = default_dim
     dim_label = st.radio(
-        "Group by", list(GROUP_DIMENSIONS.keys()),
+        "Group by", dim_options,
         horizontal=True, key="orgv2_group_by",
     )
     grouped = org.group_by(GROUP_DIMENSIONS[dim_label])

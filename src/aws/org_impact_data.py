@@ -94,6 +94,14 @@ class OrgSpend:
     prior_month_total: float = 0.0
     budget_monthly: Optional[float] = None
     profile: str = ""
+    # Signals how the team/OU/environment fields were populated:
+    #   "tags"        - real AWS Organizations tags were read
+    #   "names"       - inferred from AWS account names
+    #   "static"      - only the hand-maintained DEFAULT_OWNERS matched
+    #   "unavailable" - the payer profile can't reach Organizations at all
+    # The page uses this to explain why Team/OU/Environment charts are
+    # sparse or empty, and to pick a sensible default Group by.
+    ownership_source: str = "static"
 
     # --- derived -----------------------------------------------------------
     @property
@@ -335,6 +343,10 @@ class DemoOrgSpendProvider:
             prior_month_total=prior_month,
             budget_monthly=self.budget_monthly,
             profile=profile,
+            # Demo data always has full ownership signal — treat it as if
+            # tags were read successfully so the page never shows the
+            # "no Organizations access" warning against the demo view.
+            ownership_source="tags",
         )
 
 
@@ -606,6 +618,17 @@ class CostExplorerProvider:
             if self.fetch_org_tags else {}
         )
 
+        # Classify how much ownership signal we actually got. This
+        # matters because the page will explain the difference to the
+        # user — "no tags" and "no Organizations access at all" are
+        # different problems with different fixes.
+        if any(tags_by_account.values()):
+            ownership_source = "tags"
+        elif account_meta:
+            ownership_source = "names"
+        else:
+            ownership_source = "unavailable"
+
         # Build the account list without service mix (fast — no extra
         # Cost Explorer calls). Ownership comes from tags → account name
         # → static map, cascading via _tags_to_owner().
@@ -666,7 +689,7 @@ class CostExplorerProvider:
             linked_accounts=linked, window_days=window_days,
             data_through=data_through, dates=dates, month_to_date=mtd,
             prior_month_total=0.0, budget_monthly=self.budget_monthly,
-            profile=profile,
+            profile=profile, ownership_source=ownership_source,
         )
 
     @staticmethod
