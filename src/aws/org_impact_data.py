@@ -364,16 +364,79 @@ class CostExplorerProvider:
         owners: Optional[Dict[str, Dict[str, str]]] = None,
         budget_monthly: Optional[float] = None,
         include_service_mix: bool = True,
+        fetch_org_tags: bool = True,
     ):
         self.owners = owners if owners is not None else DEFAULT_OWNERS
         self.budget_monthly = budget_monthly
         # Set False to save one Cost Explorer call per linked account
         # (n × ~$0.01) when the mix isn't rendered anywhere.
         self.include_service_mix = include_service_mix
+        # When True, pulls team / OU / environment tags via
+        # organizations:ListTagsForResource in parallel. Static `owners`
+        # map is used as a fallback for accounts missing tags. Set False
+        # for testing or environments where the permission is unavailable.
+        self.fetch_org_tags = fetch_org_tags
 
     @property
     def cache_key(self) -> str:
-        return f"{len(self.owners)}|{self.budget_monthly}|{self.include_service_mix}"
+        return (f"{len(self.owners)}|{self.budget_monthly}|"
+                f"{self.include_service_mix}|{self.fetch_org_tags}")
+
+    # Common tag-key aliases seen in the wild. First match wins per role.
+    _TAG_ALIASES = {
+        "team": ("Team", "team", "TeamName", "OwnerTeam", "Owner"),
+        "ou": ("OU", "ou", "Department", "Org", "OrgUnit", "BusinessUnit"),
+        "environment": ("Environment", "environment", "Env", "env", "Stage"),
+        "name": ("Name", "AccountName", "name", "DisplayName"),
+    }
+
+    def _tags_to_owner(self, tags: Dict[str, str],
+                        account_id: str) -> Dict[str, str]:
+        """Map an account's raw tag dict onto our owner shape. Missing
+        fields fall through to the static owners map, then to Unallocated."""
+        static = resolve_owner(account_id, self.owners)
+        picked: Dict[str, str] = {}
+        for role, aliases in self._TAG_ALIASES.items():
+            for key in aliases:
+                if key in tags and tags[key]:
+                    picked[role] = tags[key]
+                    break
+        return {
+            "name": picked.get("name") or static.get("name", account_id),
+            "team": picked.get("team") or static.get("team", "Unallocated"),
+            "ou": picked.get("ou") or static.get("ou", "Unallocated"),
+            "environment": (picked.get("environment") or
+                             static.get("environment", "unknown")),
+        }
+
+    def _fetch_org_tags_bulk(
+        self, profile: str, account_ids: List[str],
+    ) -> Dict[str, Dict[str, str]]:
+        """Return {account_id: {tag_key: tag_value}} for the given accounts.
+
+        Uses `organizations:ListTagsForResource` in parallel. Any account
+        the API rejects (permissions, throttle, missing) silently returns
+        an empty tag dict so a single failure never takes down the page.
+        Skipped when the payer profile can't reach Organizations at all —
+        that's normal outside the management account.
+        """
+        try:
+            orgs = self._client(profile, "organizations")
+        except Exception:  # noqa: BLE001
+            return {}
+
+        def _one(acct_id: str) -> tuple[str, Dict[str, str]]:
+            try:
+                resp = orgs.list_tags_for_resource(ResourceId=acct_id)
+                return acct_id, {
+                    t["Key"]: t["Value"] for t in resp.get("Tags", [])
+                }
+            except Exception:  # noqa: BLE001
+                return acct_id, {}
+
+        workers = min(8, max(1, len(account_ids)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return dict(pool.map(_one, account_ids))
 
     def _client(self, profile: str, service: str):
         # Late import so this module stays importable without boto3
@@ -413,11 +476,26 @@ class CostExplorerProvider:
 
         dates = [start + timedelta(days=i) for i in range(window_days)]
 
-        # Build the account list without service mix first (no extra CE
-        # calls). This is instant — everything below is just Python.
+        # Pull real ownership tags from AWS Organizations first. The
+        # static owners map (DEFAULT_OWNERS) is only used as a fallback
+        # for accounts that don't have the expected tag keys. This is
+        # what makes the Team / OU / Environment charts actually differ
+        # from each other — without real tags, everything was collapsing
+        # into a single Unallocated bar.
+        account_ids = list(daily_by_account.keys())
+        tags_by_account: Dict[str, Dict[str, str]] = (
+            self._fetch_org_tags_bulk(profile, account_ids)
+            if self.fetch_org_tags else {}
+        )
+
+        # Build the account list without service mix (fast — no extra
+        # Cost Explorer calls). Ownership comes from fetched tags with
+        # static-map fallback via _tags_to_owner().
         accounts: List[AccountSpend] = []
         for acct_id, by_day in daily_by_account.items():
-            owner = resolve_owner(acct_id, self.owners)
+            owner = self._tags_to_owner(
+                tags_by_account.get(acct_id, {}), acct_id,
+            )
             daily = [by_day.get(d.isoformat(), 0.0) for d in dates]
             accounts.append(AccountSpend(
                 account_id=acct_id, name=owner["name"], team=owner["team"],

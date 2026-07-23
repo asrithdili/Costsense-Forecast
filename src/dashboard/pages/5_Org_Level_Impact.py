@@ -371,9 +371,18 @@ def _render_actions(
                 )
                 st.code(question, language="text")
     with ac2:
+        # Only enabled when we have a local SSO profile for this account —
+        # otherwise the Anomalies page can't actually analyze it.
+        has_profile = _profile_label_for_account(acct.account_id) is not None
+        anom_help = (
+            None if has_profile
+            else f"Log in to account {acct.account_id} with "
+                 f"`aws sso login` to enable this."
+        )
         if st.button(
             "View anomalies", key=f"orgv2_anom_{acct.account_id}",
-            use_container_width=True,
+            use_container_width=True, disabled=not has_profile,
+            help=anom_help,
         ):
             if on_anomalies:
                 on_anomalies(acct.account_id)
@@ -469,12 +478,46 @@ def _on_ask(question: str) -> None:
         st.code(question, language="text")
 
 
+def _profile_label_for_account(account_id: str) -> Optional[str]:
+    """Find the Anomalies-page label ('<profile> (<account>)') for this
+    account. Anomalies keys its selectbox by *label*, not raw profile.
+    Returns None when we don't have local SSO into that account — in
+    which case the button shouldn't be clickable at all."""
+    for p in profiles:
+        if p.account_id == account_id:
+            return p.label
+    return None
+
+
 def _on_anomalies(account_id: str) -> None:
-    st.session_state["anomaly_account_filter"] = account_id
+    """Deep-link into the Anomalies page:
+      1. Force its account selectbox to this account_id.
+      2. Set an auto-run flag so it kicks off Analyze on landing.
+    Anomalies reads both keys on load; if either is missing it renders
+    its normal UX."""
+    target_label = _profile_label_for_account(account_id)
+    if not target_label:
+        # Extra safety — this branch shouldn't be reachable because the
+        # button is disabled when no matching profile exists.
+        st.warning(
+            f"No local AWS profile has account {account_id}. Log into "
+            f"it with `aws sso login` first, then reload."
+        )
+        return
+    st.session_state["anom_profile"] = target_label
+    st.session_state["anom_autorun"] = True
+    # Bump the widget-version counter so the repos multiselect and any
+    # other account-sensitive widgets re-instantiate cleanly.
+    st.session_state["anom_widget_ver"] = (
+        st.session_state.get("anom_widget_ver", 0) + 1
+    )
+    st.session_state["anom_last_profile"] = None  # force account-change path
     try:
         st.switch_page("pages/4_Anomalies.py")
     except Exception:  # noqa: BLE001
-        st.info(f"Open Anomalies and filter to {account_id}.")
+        st.info(
+            f"Open Anomalies manually — pre-selected profile: {target_label}"
+        )
 
 
 if len(org.accounts_with_spend) < SMALL_N:

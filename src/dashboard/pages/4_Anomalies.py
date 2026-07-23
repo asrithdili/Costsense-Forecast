@@ -213,6 +213,13 @@ if _is_stale(report):
         del st.session_state[k]
     report = None
 
+# Deep-link auto-run: another page (Org-Level Impact) can drop the user
+# here with `anom_autorun=True` in session state after setting the
+# account context via `anom_profile`. We treat that as a synthetic click
+# on Analyze, then clear the flag so subsequent reruns don't loop.
+if st.session_state.pop("anom_autorun", False):
+    run_btn = True
+
 # Every Analyze click nukes prior anomaly caches — prevents "half-populated
 # from an earlier schema" artifacts. Also clears any siblings (aws/repo).
 if run_btn:
