@@ -384,6 +384,9 @@ Resources:
               - Sid: EcsDeploy
                 Effect: Allow
                 Action:
+                  - ecs:CreateCluster
+                  - ecs:DescribeClusters
+                  - ecs:CreateService
                   - ecs:DescribeServices
                   - ecs:DescribeTaskDefinition
                   - ecs:DescribeTasks
