@@ -35,6 +35,7 @@ from src.ai_agent.repo_sweep import sweep_to_summary as repo_summary
 from src.aws.profiles import resolve_all
 from src.dashboard.costsense_theme import callout, confidence_pill, metric, money, section
 from src.dashboard.notifications_ui import NotificationDraft, render_notification_button
+from src.dashboard.state_cache import cached_state
 from src.pr_scanner.repos import gh_login, gh_orgs, repos_with_user_prs
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
@@ -190,7 +191,17 @@ with st.sidebar:
 _SCHEMA_VERSION = "v4-schema-guard"
 report_key = (f"anom::{_SCHEMA_VERSION}::{active.profile}::"
               f"{','.join(sorted(selected_repos))}")
-report = st.session_state.get(report_key)
+
+# Disk-backed cache — restores the last report the user ran across tab
+# switches, browser reloads, and server restarts. Identity is (schema,
+# profile, sorted repos) so any change to those forces a re-analyze.
+_anom_identity = (_SCHEMA_VERSION, active.profile,
+                   tuple(sorted(selected_repos)))
+report = cached_state.get("anom_report", _anom_identity)
+if report is not None:
+    # Mirror onto session_state so downstream code that still reads
+    # `st.session_state[report_key]` (e.g. PR-plan helpers) keeps working.
+    st.session_state[report_key] = report
 
 # Cross-tab hardening: if the cached report has ANY action missing the
 # `approaches` field, treat it as stale and discard it. This catches the
@@ -258,6 +269,9 @@ if run_btn:
             st.session_state[report_key] = report
             st.session_state[report_key + "::aws"] = aws_sum
             st.session_state[report_key + "::repo"] = repo_sum
+            # Also write to the disk-backed cache so a browser reload
+            # / tab switch restores the report instead of starting over.
+            cached_state.set("anom_report", _anom_identity, report)
         except Exception as e:  # noqa: BLE001
             callout(f"anomaly agent failed: {e}", tone="error")
             st.code(traceback.format_exc())
