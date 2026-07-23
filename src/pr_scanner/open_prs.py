@@ -168,49 +168,161 @@ def pr_diff(repo: str, number: int) -> str:
     return _run(["gh", "pr", "diff", str(number), "--repo", repo])
 
 
+def _split_resource_finding(f) -> dict:
+    """The deep agent returns Finding.resource as a single string like
+    'aws_lambda_function/bulkIngest'. The dashboard's table expects two
+    separate fields (resource_type + resource_name). Best-effort split
+    on the first '/' — anything left is `type=resource, name=''`."""
+    resource = getattr(f, "resource", "") or ""
+    if "/" in resource:
+        rtype, _, rname = resource.partition("/")
+        rtype, rname = rtype.strip(), rname.strip()
+    else:
+        rtype, rname = resource, ""
+    return {
+        "resource_type": rtype,
+        "resource_name": rname,
+        "action": getattr(f, "action", "") or "",
+        "est_daily_delta_usd": float(getattr(f, "est_daily_delta_usd", 0.0) or 0.0),
+        "rationale": getattr(f, "rationale", "") or "",
+    }
+
+
+def _rank_open_prs_for_analysis(open_prs: list[OpenPr]) -> list[OpenPr]:
+    """Rank open PRs by 'likely to matter for the near-term forecast'.
+
+    The deep agent takes ~15–60s per PR, so on repos with 20+ open PRs
+    the Dashboard forecast would take 10+ minutes. Instead of analyzing
+    every open PR, we pre-rank by cheap metadata (already fetched by
+    `gh pr list`) and only pass the top N to the LLM.
+
+    Scoring — higher = analyze first:
+      +2.0 if approved & mergeable
+      +1.0 if not draft
+      +0.5 if CI is passing (or hasn't reported failure)
+      +0.5 if updated in the last 3 days ("active" work)
+      -1.0 if draft
+      -1.0 if stalled >30 days
+      -0.5 if CI is failing
+    """
+    def score(pr: OpenPr) -> float:
+        s = 0.0
+        if pr.is_draft:
+            s -= 1.0
+        else:
+            s += 1.0
+        if pr.review_state == "APPROVED":
+            s += 2.0
+        elif pr.review_state == "CHANGES_REQUESTED":
+            s -= 0.5
+        if pr.checks_state == "SUCCESS":
+            s += 0.5
+        elif pr.checks_state == "FAILURE":
+            s -= 0.5
+        if pr.mergeable == "CONFLICTING":
+            s -= 0.5
+        if pr.days_open > 30:
+            s -= 1.0
+        elif pr.days_open <= 3:
+            s += 0.5
+        return s
+
+    return sorted(open_prs, key=lambda pr: (-score(pr), pr.days_open))
+
+
 def analyze_open_prs(
     open_prs: list[OpenPr],
     profile: str | None = None,
     llm_model: str = "us.anthropic.claude-sonnet-4-6",
+    max_prs: int = 8,
 ) -> list[PricedOpenPr]:
-    """Run each open PR through the deep LLM analyzer used for merged PRs.
+    """Run the top ``max_prs`` open PRs through the SAME deep agent the
+    PR Predictor uses (``analyze_pr`` from ``src.ai_agent.agent``).
+
+    The agent gets the full toolkit (Cost Explorer, CloudWatch, CloudTrail,
+    rightsizing, resource inventory, plus the ``precedent_lookup`` tool for
+    scope-expansion PRs). Same grounding rules, same verdict schema, same
+    neutral-verdict tool-call floor as the PR Predictor page.
+
+    Why the cap: each analysis takes ~15–60s. Analyzing 40 open PRs would
+    take 10+ minutes; the top 8 by "likely to merge soon" gives near-full
+    coverage of what actually matters for the near-term forecast in
+    minutes, not hours. See ``_rank_open_prs_for_analysis`` for the
+    ranking heuristic.
 
     Returns priced PRs with merge probability + expected delta. Sorted so
     high-impact PRs land first.
     """
-    from src.pr_scanner.llm_analyzer import analyze_pr_diff
+    from src.ai_agent.agent import analyze_pr
 
-    priced: list[PricedOpenPr] = []
-    for opr in open_prs:
+    to_analyze = _rank_open_prs_for_analysis(open_prs)[:max_prs]
+
+    def _analyze_one(opr: OpenPr) -> PricedOpenPr | None:
+        """Deep-analyze one open PR. Runs in a worker thread — the
+        precedent context inside analyze_pr uses threading.local() so
+        parallel calls don't clobber each other."""
+        import sys as _sys
+        print(f"[open-pr] START {opr.repo}#{opr.number} '{opr.title[:60]}'",
+              file=_sys.stderr, flush=True)
         try:
-            diff = pr_diff(opr.repo, opr.number)
-        except Exception:  # noqa: BLE001
-            continue
-        verdict = analyze_pr_diff(
-            diff, pr_title=opr.title, profile=profile, model_id=llm_model,
+            verdict = analyze_pr(
+                opr.url, profile=profile, model_id=llm_model,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[open-pr] FAIL  {opr.repo}#{opr.number}: {e}",
+                  file=_sys.stderr, flush=True)
+            return None
+
+        # If the agent bailed with an error, skip this PR — better to have
+        # no signal than a fabricated one.
+        if getattr(verdict, "error", None):
+            print(f"[open-pr] SKIP  {opr.repo}#{opr.number}: {verdict.error}",
+                  file=_sys.stderr, flush=True)
+            return None
+
+        est = float(verdict.est_daily_delta_usd or 0.0)
+        print(f"[open-pr] DONE  {opr.repo}#{opr.number} "
+              f"delta={est:+.2f} tool_calls={verdict.tool_calls}",
+              file=_sys.stderr, flush=True)
+        direction = str(
+            verdict.direction
+            if verdict.direction in ("increase", "decrease", "neutral")
+            else ("increase" if est > 0.01 else
+                  "decrease" if est < -0.01 else "neutral")
         )
-        est = float(verdict.total_daily_delta_usd or 0.0)
-        direction = ("increase" if est > 0.01 else
-                     "decrease" if est < -0.01 else "neutral")
         prob = estimate_merge_probability(opr)
         merge_day = expected_merge_date(opr, prob)
-        priced.append(PricedOpenPr(
+        return PricedOpenPr(
             open_pr=opr,
             est_daily_delta_usd=round(est, 4),
             direction=direction,
-            llm_summary=verdict.summary,
+            llm_summary=(verdict.verdict or verdict.detail or "")[:400],
             merge_probability=round(prob, 3),
             expected_merge_day=merge_day.isoformat(),
             expected_daily_delta_usd=round(est * prob, 4),
             findings=[
-                {"resource_type": c.resource_type,
-                 "resource_name": c.resource_name,
-                 "action": c.action,
-                 "est_daily_delta_usd": c.est_daily_delta_usd,
-                 "rationale": c.rationale}
-                for c in verdict.changes
+                _split_resource_finding(f)
+                for f in (verdict.findings or [])
             ],
-        ))
+        )
+
+    # Fan out across threads: Bedrock InvokeModel is I/O bound, and each
+    # analyze_pr is an independent tool-use loop. Cap concurrency at 4 so
+    # we don't hammer Bedrock's rate limits — with the top-8 cap above,
+    # 4 workers × ~30s per PR = ~60s wall-clock instead of ~4 min serial.
+    workers = min(4, len(to_analyze) or 1)
+    priced: list[PricedOpenPr] = []
+    if workers <= 1:
+        for opr in to_analyze:
+            p = _analyze_one(opr)
+            if p is not None:
+                priced.append(p)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for p in pool.map(_analyze_one, to_analyze):
+                if p is not None:
+                    priced.append(p)
+
     priced.sort(key=lambda p: -abs(p.expected_daily_delta_usd))
     return priced
 

@@ -12,6 +12,7 @@ Each function has:
 from __future__ import annotations
 
 import json
+import threading
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any
@@ -456,18 +457,22 @@ def tool_specs() -> list[dict]:
 # `precedent_lookup` needs (repo, diff), which are per-invocation context
 # that the LLM shouldn't have to (and can't reliably) pass in args. The
 # agent loop stashes them here right before invoking the model.
-_precedent_ctx: dict = {"repo": None, "diff": None}
+#
+# threading.local() is REQUIRED here — analyze_pr is called from multiple
+# threads at once by the Dashboard's open-PR fan-out. A shared dict would
+# race, and PR B's precedent context could clobber PR A's mid-invocation.
+_precedent_ctx = threading.local()
 
 
 def set_precedent_context(repo: str | None, diff: str | None) -> None:
-    _precedent_ctx["repo"] = repo
-    _precedent_ctx["diff"] = diff
+    _precedent_ctx.repo = repo
+    _precedent_ctx.diff = diff
 
 
 def _precedent_lookup_impl() -> dict:
     from src.ai_agent.precedent import find_precedents
-    repo = _precedent_ctx.get("repo")
-    diff = _precedent_ctx.get("diff")
+    repo = getattr(_precedent_ctx, "repo", None)
+    diff = getattr(_precedent_ctx, "diff", None)
     if not repo or not diff:
         return {
             "error": (

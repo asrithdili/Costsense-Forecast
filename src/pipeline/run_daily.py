@@ -54,6 +54,7 @@ def run(
     service: str | None = None,
     model: str = "lightgbm",
     include_open_prs: bool = True,
+    max_open_prs: int = 8,
 ) -> Path:
     cutoff = cutoff or date.today()
     start = cutoff - timedelta(days=history_days)
@@ -93,6 +94,7 @@ def run(
                 open_pr_priced = analyze_open_prs(
                     open_prs, profile=profile,
                     llm_model=(llm_model or "us.anthropic.claude-sonnet-4-6"),
+                    max_prs=max_open_prs,
                 )
                 open_pr_daily = to_step_series(
                     open_pr_priced, cutoff=cutoff, horizon_days=14,

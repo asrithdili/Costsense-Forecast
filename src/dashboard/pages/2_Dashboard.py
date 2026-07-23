@@ -499,9 +499,23 @@ with st.spinner(f"Fetching cost history for `{active_profile}`… "
 
 
 # On-demand forecast run
+#
+# Cap open-PR deep-analysis at the top 3 most merge-ready PRs. Each PR
+# takes ~30-90s in the Bedrock agent (10-20 tool calls per PR). At 3
+# PRs with 4-worker concurrency, the whole open-PR pass fits in one
+# parallel batch and finishes in ~60-90s. Larger caps (8+) push
+# wall-clock past 5 minutes on a busy repo, which the demo needs to
+# stay under.
+_MAX_OPEN_PRS_DEEP_ANALYSIS = 3
+
 if do_forecast:
     _run_msg = (
-        f"Fetching Cost Explorer, scanning PRs, fitting {model_choice}…"
+        # Open PRs are analyzed by the SAME deep agent the PR Predictor
+        # page uses (precedent lookup + Cost Explorer + CloudWatch tools).
+        # We cap it at the top-N most merge-ready PRs and run them
+        # in parallel so wall-clock stays ~1-2 minutes on a busy repo.
+        f"Deep-analyzing merged PRs + top {_MAX_OPEN_PRS_DEEP_ANALYSIS} "
+        f"most merge-ready open PRs, then fitting {model_choice}…"
         if include_pr else
         (f"Calling GetCostForecast for next 7 days…"
          if model_choice == "aws" else
@@ -520,6 +534,7 @@ if do_forecast:
                 service=selected_service,
                 model=model_choice,
                 include_open_prs=include_pr,
+                max_open_prs=_MAX_OPEN_PRS_DEEP_ANALYSIS,
             )
             callout(f"Wrote {Path(out).name}", tone="success")
             st.cache_data.clear()
@@ -529,6 +544,74 @@ if do_forecast:
 
 
 latest = _load_latest_forecast(account_id, service=selected_service)
+
+# ---- PR layer status banner ---------------------------------------------
+# Makes it obvious whether the "Include PR impact" toggle actually did
+# anything on the last run: how many merged PRs were priced, how many open
+# PRs the LLM code-reviewed, and the total expected $/day pressure they
+# add to the future forecast. When the toggle was off (or no PRs found),
+# the banner explains that instead of leaving the reader guessing.
+if latest:
+    _pr_scan = latest.get("pr_scan") or {}
+    _open_scan = latest.get("open_pr_scan") or {}
+    _merged_impacts = _pr_scan.get("impacts") or []
+    _merged_count = sum(1 for i in _merged_impacts
+                        if i.get("est_daily_delta_usd"))
+    _open_count = int(_open_scan.get("count", 0))
+    _open_delta = float(
+        _open_scan.get("total_expected_daily_delta_usd", 0.0)
+    )
+    _merged_delta = float(latest.get("pr_delta_daily_usd_at_cutoff", 0.0))
+    _repos_scanned = _pr_scan.get("repos") or []
+    _pr_layer_ran = bool(_repos_scanned or _merged_impacts or _open_count)
+
+    with st.container(border=True):
+        if _pr_layer_ran:
+            section(
+                "PR layer status",
+                (f"Scanned {len(_repos_scanned)} repo(s). Open PRs are "
+                 "ranked by merge readiness (approved + passing CI + "
+                 "recent activity) and the top 3 go through the same "
+                 "deep agent the PR Predictor uses — precedent lookup + "
+                 "full AWS tool loop. Merged PRs shape the past baseline; "
+                 "open PRs bump the future forecast weighted by merge "
+                 "probability."),
+                kicker="Included",
+            )
+            pcols = st.columns(3, gap="medium")
+            with pcols[0]:
+                metric(
+                    "Merged PRs priced",
+                    _merged_count,
+                    delta=(f"${_merged_delta:+,.2f}/day at cutoff"
+                           if _merged_delta else None),
+                    good=(True if _merged_delta < 0
+                          else False if _merged_delta > 0 else None),
+                )
+            with pcols[1]:
+                metric(
+                    "Open PRs code-reviewed",
+                    _open_count,
+                    delta=("scanned by Bedrock" if _open_count else
+                           "none found" if _repos_scanned else None),
+                )
+            with pcols[2]:
+                metric(
+                    "Expected Δ from open PRs",
+                    f"${_open_delta:+,.2f}/day",
+                    delta=("weighted by merge probability"
+                           if _open_count else None),
+                    good=(True if _open_delta < 0
+                          else False if _open_delta > 0 else None),
+                )
+        else:
+            section(
+                "PR layer status",
+                "Last run was billing-only. Enable **Include PR impact** "
+                "in Controls and pick at least one repo to layer merged + "
+                "open PR deltas on top of the forecast.",
+                kicker="Not included",
+            )
 
 # opportunistically score any old forecasts whose targets have landed
 try:
