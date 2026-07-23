@@ -500,7 +500,11 @@ with st.spinner(f"Fetching cost history for `{active_profile}`… "
 # On-demand forecast run
 if do_forecast:
     _run_msg = (
-        f"Fetching Cost Explorer, scanning PRs, fitting {model_choice}…"
+        # Open PRs are analyzed by the SAME deep agent the PR Predictor
+        # page uses (precedent lookup + Cost Explorer + CloudWatch tools),
+        # so this call can take several minutes on repos with many open PRs.
+        f"Deep-analyzing merged + open PRs (this can take a few minutes), "
+        f"then fitting {model_choice}…"
         if include_pr else
         (f"Calling GetCostForecast for next 7 days…"
          if model_choice == "aws" else
@@ -553,9 +557,11 @@ if latest:
         if _pr_layer_ran:
             section(
                 "PR layer status",
-                (f"Scanned {len(_repos_scanned)} repo(s). "
-                 "Merged PRs shape the past baseline; open PRs bump the "
-                 "future forecast weighted by merge probability."),
+                (f"Scanned {len(_repos_scanned)} repo(s). Open PRs went "
+                 "through the same deep agent the PR Predictor uses "
+                 "(precedent lookup + full AWS tool loop). Merged PRs "
+                 "shape the past baseline; open PRs bump the future "
+                 "forecast weighted by merge probability."),
                 kicker="Included",
             )
             pcols = st.columns(3, gap="medium")
