@@ -498,16 +498,23 @@ with st.spinner(f"Fetching cost history for `{active_profile}`… "
 
 
 # On-demand forecast run
-_MAX_OPEN_PRS_DEEP_ANALYSIS = 8
+#
+# Cap open-PR deep-analysis at the top 3 most merge-ready PRs. Each PR
+# takes ~30-90s in the Bedrock agent (10-20 tool calls per PR). At 3
+# PRs with 4-worker concurrency, the whole open-PR pass fits in one
+# parallel batch and finishes in ~60-90s. Larger caps (8+) push
+# wall-clock past 5 minutes on a busy repo, which the demo needs to
+# stay under.
+_MAX_OPEN_PRS_DEEP_ANALYSIS = 3
 
 if do_forecast:
     _run_msg = (
         # Open PRs are analyzed by the SAME deep agent the PR Predictor
         # page uses (precedent lookup + Cost Explorer + CloudWatch tools).
-        # We cap it at the top-N most likely to merge soon and run them
-        # 4-at-a-time to keep wall-clock around a minute or two.
+        # We cap it at the top-N most merge-ready PRs and run them
+        # in parallel so wall-clock stays ~1-2 minutes on a busy repo.
         f"Deep-analyzing merged PRs + top {_MAX_OPEN_PRS_DEEP_ANALYSIS} "
-        f"open PRs in parallel, then fitting {model_choice}…"
+        f"most merge-ready open PRs, then fitting {model_choice}…"
         if include_pr else
         (f"Calling GetCostForecast for next 7 days…"
          if model_choice == "aws" else
@@ -563,7 +570,7 @@ if latest:
                 "PR layer status",
                 (f"Scanned {len(_repos_scanned)} repo(s). Open PRs are "
                  "ranked by merge readiness (approved + passing CI + "
-                 "recent activity) and the top few go through the same "
+                 "recent activity) and the top 3 go through the same "
                  "deep agent the PR Predictor uses — precedent lookup + "
                  "full AWS tool loop. Merged PRs shape the past baseline; "
                  "open PRs bump the future forecast weighted by merge "
