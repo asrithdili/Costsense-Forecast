@@ -29,6 +29,15 @@ from datetime import date, timedelta
 from typing import Callable, Dict, List, Optional, Protocol
 
 
+# Bump this whenever the OrgSpend or AccountSpend dataclass gains or
+# renames a field. Streamlit's @st.cache_data pickles the return value,
+# so pre-existing cache entries keep the OLD dataclass shape and crash
+# any page that reads a new attribute. Mixing this into every provider's
+# cache_key forces a miss when the schema drifts, which is safer than
+# telling users to click Refresh every time we push a change.
+_ORG_SPEND_SCHEMA = "v2"  # ownership_source field added
+
+
 # ============================================================================
 # CONTRACTS
 # ============================================================================
@@ -288,7 +297,8 @@ class DemoOrgSpendProvider:
     def cache_key(self) -> str:
         """Identity for the UI's cache. Two providers that would return
         different data must not share a key."""
-        return (f"{','.join(sorted(self.account_ids))}"
+        return (f"{_ORG_SPEND_SCHEMA}|"
+                f"{','.join(sorted(self.account_ids))}"
                 f"|{self.budget_monthly}|{self.seed}|{self.as_of}")
 
     def fetch(self, profile: str = "demo", window_days: int = 30) -> OrgSpend:
@@ -391,7 +401,8 @@ class CostExplorerProvider:
 
     @property
     def cache_key(self) -> str:
-        return (f"{len(self.owners)}|{self.budget_monthly}|"
+        return (f"{_ORG_SPEND_SCHEMA}|"
+                f"{len(self.owners)}|{self.budget_monthly}|"
                 f"{self.include_service_mix}|{self.fetch_org_tags}")
 
     # Common tag-key aliases seen in the wild. First match wins per role.

@@ -290,11 +290,17 @@ st.divider()
 def _render_ownership(org: OrgSpend) -> None:
     st.markdown("##### Where the money sits")
 
+    # `getattr` guards against a stale cached OrgSpend built before the
+    # ownership_source field was added. When schema drifts, the cache_key
+    # in provider bumps invalidate stale entries — but the getattr keeps
+    # older entries readable if that bump was ever missed.
+    ownership_source = getattr(org, "ownership_source", "static")
+
     # Explain up front WHY the ownership charts might be sparse. Without
     # this banner, a payer profile that lacks Organizations permissions
     # shows a giant "Unallocated" bar and there's no way to tell whether
     # that's a real tagging-hygiene issue or an auth problem on our end.
-    if org.ownership_source == "unavailable":
+    if ownership_source == "unavailable":
         callout(
             "This profile can't read AWS Organizations (`ListAccounts` "
             "denied), so we don't have team/OU/environment info for these "
@@ -304,7 +310,7 @@ def _render_ownership(org: OrgSpend) -> None:
             "`organizations:ListTagsForResource` on this role.",
             tone="warning",
         )
-    elif org.ownership_source == "names":
+    elif ownership_source == "names":
         st.caption(
             "Team and Environment inferred from account NAMES because "
             "`organizations:ListTagsForResource` isn't granted on this "
@@ -315,7 +321,7 @@ def _render_ownership(org: OrgSpend) -> None:
     # Default the Group by selector based on how much ownership signal we
     # got. When Organizations is fully denied, Account is the only
     # dimension that carries useful information.
-    default_dim = ("Account" if org.ownership_source == "unavailable"
+    default_dim = ("Account" if ownership_source == "unavailable"
                    else "Team")
     dim_options = list(GROUP_DIMENSIONS.keys())
     if "orgv2_group_by" not in st.session_state:
