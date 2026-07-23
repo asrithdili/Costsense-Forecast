@@ -37,6 +37,7 @@ from src.ai_agent.repo_sweep import sweep_to_summary as repo_summary
 from src.aws.profiles import resolve_all
 from src.dashboard.costsense_theme import callout, confidence_pill, metric, money, section
 from src.dashboard.notifications_ui import NotificationDraft, render_notification_button
+from src.dashboard.state_cache import cached_state
 from src.pr_scanner.repos import gh_login, gh_orgs, repos_with_user_prs
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
@@ -257,17 +258,34 @@ st.session_state["anom_scan_in_progress"] = False
 _SCHEMA_VERSION = "v4-schema-guard"
 report_key = (f"anom::{_SCHEMA_VERSION}::{active.profile}::"
               f"{','.join(sorted(selected_repos))}")
+
+# Disk-backed cache — restores the last report the user ran across tab
+# switches, browser reloads, and server restarts. Identity is (schema,
+# profile, sorted repos) so any change to those forces a re-analyze.
+_anom_identity = (_SCHEMA_VERSION, active.profile,
+                   tuple(sorted(selected_repos)))
 config_key = (
     f"{active.profile}::{model_id}::{','.join(sorted(selected_repos))}"
 )
 report = st.session_state.get(report_key)
 if report is None:
-    last_key = st.session_state.get("anom_last_report_key")
-    if (
-        last_key
-        and st.session_state.get("anom_last_config_key") == config_key
-    ):
-        report = st.session_state.get(last_key)
+    # Try the disk-backed cache first, THEN fall back to the last-run
+    # config match. Disk wins because it survives things session_state
+    # can't (browser restart, server restart, tab crash).
+    report = cached_state.get("anom_report", _anom_identity)
+    if report is None:
+        last_key = st.session_state.get("anom_last_report_key")
+        if (
+            last_key
+            and st.session_state.get("anom_last_config_key") == config_key
+        ):
+            report = st.session_state.get(last_key)
+if report is not None:
+    # Mirror onto session_state so downstream code that still reads
+    # `st.session_state[report_key]` (PR-plan helpers etc) keeps working
+    # even when we hydrated `report` from the disk cache above.
+    st.session_state[report_key] = report
+
 freq_label = st.session_state.get("anom_continuous_freq", "15 min")
 if freq_label not in CONTINUOUS_FREQ_OPTIONS:
     freq_label = "15 min"
@@ -351,6 +369,9 @@ def _run_anomaly_scan(*, clear_caches: bool = False) -> object | None:
                 st.session_state["anom_repos_persist"] = [
                     r.split("/", 1)[-1] for r in selected_repos
                 ]
+                # Also persist to disk so browser reload / server restart
+                # restores the report instead of forcing a re-scan.
+                cached_state.set("anom_report", _anom_identity, scanned)
                 return scanned
             except Exception as e:  # noqa: BLE001
                 callout(f"anomaly agent failed: {e}", tone="error")
@@ -380,6 +401,13 @@ if _is_stale(report):
               if isinstance(k, str) and k.startswith("anom::")]:
         del st.session_state[k]
     report = None
+
+# Deep-link auto-run: another page (Org-Level Impact) can drop the user
+# here with `anom_autorun=True` in session state after setting the
+# account context via `anom_profile`. We treat that as a synthetic click
+# on Analyze, then clear the flag so subsequent reruns don't loop.
+if st.session_state.pop("anom_autorun", False):
+    run_btn = True
 
 # Don't re-run immediately when continuous is turned on and results already
 # exist, or when resuming a session that already has a cached report.

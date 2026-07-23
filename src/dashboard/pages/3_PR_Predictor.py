@@ -23,6 +23,7 @@ from src.dashboard.costsense_theme import (
     callout, meta_row, metric, pill, section,
 )
 from src.dashboard.notifications_ui import NotificationDraft, render_notification_button
+from src.dashboard.state_cache import cached_state
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
 )
@@ -137,6 +138,15 @@ section(
     kicker="Input",
 )
 
+# Restore the last-predicted URL for this profile from disk BEFORE the
+# text_input widget renders. Streamlit's session_state resets on new
+# browser tabs / F5 reloads / server restarts; without this seeding
+# step the URL field renders blank and the (profile, url) cache lookup
+# below misses even though the verdict pickle IS on disk.
+_last_url_for_profile = cached_state.get("prp_last_url", (active.profile,))
+if _last_url_for_profile and "prp_last_url" not in st.session_state:
+    st.session_state["prp_last_url"] = _last_url_for_profile
+
 # Persist the last predicted URL + verdict across tab switches so users
 # don't have to re-predict when they come back. Keyed on (profile, url).
 url_col, btn_col = st.columns([4, 1], gap="medium", vertical_alignment="bottom")
@@ -154,13 +164,15 @@ with btn_col:
         use_container_width=True,
     )
 
-verdict_key = f"prp_verdict::{active.profile}::{pr_url.strip()}"
-verdict = st.session_state.get(verdict_key)
-
-narrative_key = f"prp_narrative::{active.profile}::{pr_url.strip()}"
-current_daily_key = f"prp_current_daily::{active.profile}"
-narrative = st.session_state.get(narrative_key)
-current_daily = st.session_state.get(current_daily_key)
+# Disk-backed cache. Restores the verdict / narrative / current_daily
+# from the previous session so tab switches, browser reloads, or a
+# Streamlit server restart don't wipe what the user just spent 30
+# seconds computing. `cached_state` writes to both session_state (fast
+# hot cache) AND a pickle under data/ui_state/ (survives everything).
+_pr_url_key = pr_url.strip()
+verdict = cached_state.get("prp_verdict", (active.profile, _pr_url_key))
+narrative = cached_state.get("prp_narrative", (active.profile, _pr_url_key))
+current_daily = cached_state.get("prp_current_daily", (active.profile,))
 
 if run and pr_url.strip():
     with st.spinner("Fetching diff + querying AWS…"):
@@ -172,7 +184,10 @@ if run and pr_url.strip():
             callout(f"agent failed: {e}", tone="error")
             st.code(traceback.format_exc())
             st.stop()
-    st.session_state[verdict_key] = verdict
+    cached_state.set("prp_verdict", (active.profile, _pr_url_key), verdict)
+    # Remember which URL this profile last predicted, so the next
+    # session can re-seed the text box + re-lookup the verdict.
+    cached_state.set("prp_last_url", (active.profile,), _pr_url_key)
 
     # Pull current account $/day (avg last 7 days from Cost Explorer)
     with st.spinner("Fetching current account spend…"):
@@ -186,7 +201,7 @@ if run and pr_url.strip():
         except Exception as e:  # noqa: BLE001
             st.warning(f"Couldn't fetch current daily cost: {e}")
             current_daily = 0.0
-    st.session_state[current_daily_key] = current_daily
+    cached_state.set("prp_current_daily", (active.profile,), current_daily)
 
     with st.spinner("Writing plain-English summary…"):
         try:
@@ -198,7 +213,7 @@ if run and pr_url.strip():
             )
         except Exception as e:  # noqa: BLE001
             narrative = f"(narrative unavailable: {e})"
-    st.session_state[narrative_key] = narrative
+    cached_state.set("prp_narrative", (active.profile, _pr_url_key), narrative)
 
 if verdict is not None:
     if verdict.error:
