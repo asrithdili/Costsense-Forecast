@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import calendar
 import random
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Callable, Dict, List, Optional, Protocol
@@ -411,23 +412,44 @@ class CostExplorerProvider:
                 break
 
         dates = [start + timedelta(days=i) for i in range(window_days)]
+
+        # Build the account list without service mix first (no extra CE
+        # calls). This is instant — everything below is just Python.
         accounts: List[AccountSpend] = []
         for acct_id, by_day in daily_by_account.items():
             owner = resolve_owner(acct_id, self.owners)
             daily = [by_day.get(d.isoformat(), 0.0) for d in dates]
-            services: Dict[str, float] = {}
-            if self.include_service_mix:
-                try:
-                    services = self._services_for(ce, acct_id, start, end)
-                except Exception:  # noqa: BLE001
-                    services = {}  # skip mix rather than crash the whole page
             accounts.append(AccountSpend(
                 account_id=acct_id, name=owner["name"], team=owner["team"],
                 ou=owner["ou"], environment=owner["environment"],
                 total=sum(daily), last7=sum(daily[-7:]),
                 prior7=sum(daily[-14:-7]),
-                services=services, daily=daily,
+                services={}, daily=daily,
             ))
+
+        # Service mix requires one Cost Explorer call per account. On a
+        # payer with 20+ linked accounts this dominates wall-clock, so
+        # fan them out in parallel. The boto3 CE client is documented as
+        # thread-safe for concurrent operation calls on the same instance.
+        # Concurrency capped at 8 to stay under CE's per-account rate
+        # limits with headroom.
+        if self.include_service_mix and accounts:
+            def _fetch_mix(acct_id: str) -> tuple[str, Dict[str, float]]:
+                try:
+                    return acct_id, self._services_for(
+                        ce, acct_id, start, end,
+                    )
+                except Exception:  # noqa: BLE001
+                    # Skip mix rather than crash the whole page.
+                    return acct_id, {}
+
+            workers = min(8, len(accounts))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                mix_by_account = dict(
+                    pool.map(_fetch_mix, [a.account_id for a in accounts])
+                )
+            for acct in accounts:
+                acct.services = mix_by_account.get(acct.account_id, {})
 
         linked = len(accounts)
         try:
