@@ -261,41 +261,47 @@ def _pretty_series_label(raw: str) -> str:
 
 def _render_trend(org: OrgSpend) -> None:
     st.markdown("##### Daily spend")
-    # Top-10 (was top-5). Wider slice means the grey "Other" band shrinks
-    # from ~70% of the chart to ~30% on a typical Diligent-scale org, so
-    # the shape of the named accounts is visible rather than buried.
+    # Top-10 named accounts stacked with an "Other" tail. On a typical
+    # Diligent-scale org this covers ~30-40% of spend with named colour,
+    # keeping the grey Other band a supporting layer rather than the
+    # dominant one.
     series = org.daily_series(top_n=10)
     if not series or not org.dates:
         callout("No daily series available for this window.", tone="info")
         return
 
     other_values = series.pop("Other", None)
-    # Sort named series by total spend so the legend + stack read big-to-small.
+    # Sort named series by total spend so the legend + stack read
+    # biggest-first — the reader's eye lands on rank #1 immediately.
     named_items = sorted(
         series.items(), key=lambda kv: sum(kv[1]), reverse=True,
     )
 
-    # Named accounts get the brand palette. Grey is RESERVED for "Other"
-    # so the visual convention stays: colored = accountable, grey = tail.
+    # Named accounts get the brand palette. Grey is reserved for Other
+    # so the reader can read the chart at a glance: colour = accountable
+    # account, grey = long tail.
     palette = [
         C.BRAND, C.INFO, C.SEV["Medium"], C.SEV["High"], C.BRAND_DARK,
         C.SEV["Low"], C.SEV["Critical"], "#7A5AF8", "#00B8D4", "#FF7043",
     ]
 
-    total_by_day = [0.0] * len(org.dates)
     fig = go.Figure()
     for i, (label, values) in enumerate(named_items):
         color = palette[i % len(palette)]
+        # Rank-prefix the legend label ("#1 …6223") so scanning the
+        # legend and finding a band in the stack is trivial. Order in
+        # the legend matches order in the stack, top-to-bottom.
+        legend_name = f"#{i + 1}  {_pretty_series_label(label)}"
         fig.add_trace(go.Scatter(
-            x=org.dates, y=values, name=_pretty_series_label(label),
+            x=org.dates, y=values, name=legend_name,
             mode="lines", stackgroup="spend",
             line=dict(width=0.5, color=color),
             fillcolor=color,
+            # Per-series hover only — no `x unified` so we don't stack
+            # 11 lines into a black overflow box on the right edge.
             hovertemplate="<b>%{fullData.name}</b><br>"
                           "%{x|%d %b}<br>$%{y:,.0f}<extra></extra>",
         ))
-        for i_day, v in enumerate(values):
-            total_by_day[i_day] += v
 
     if other_values:
         fig.add_trace(go.Scatter(
@@ -306,19 +312,26 @@ def _render_trend(org: OrgSpend) -> None:
             hovertemplate="<b>Other</b><br>"
                           "%{x|%d %b}<br>$%{y:,.0f}<extra></extra>",
         ))
-        for i_day, v in enumerate(other_values):
-            total_by_day[i_day] += v
 
-    lay = plotly_layout(height=300)
+    lay = plotly_layout(height=340)
     lay["yaxis_title"] = "Daily spend (USD)"
-    lay["hovermode"] = "x unified"
+    # Legend on the RIGHT, vertical single column. On top the legend
+    # wrapped to a second row and shoved the chart down; on the right
+    # it fits cleanly next to the plot and reads top-to-bottom.
+    lay["legend"] = dict(
+        orientation="v", yanchor="top", y=1.0,
+        xanchor="left", x=1.02,
+        font=dict(size=11),
+        bgcolor="rgba(0,0,0,0)",  # transparent
+        itemsizing="constant",
+    )
+    lay["margin"] = dict(l=16, r=200, t=8, b=16)  # room on right for legend
     fig.update_layout(**lay)
     fig.update_traces(opacity=0.92)
     st.plotly_chart(fig, use_container_width=True)
 
-    # One-line caption calibrated to what's on screen — top-10 share of
-    # total tells the reader whether the stack IS the story or whether
-    # the grey Other band still dominates.
+    # One-line caption below. Tells the reader whether the coloured
+    # stack IS the story or the grey tail dominates.
     named_total = sum(sum(v) for _, v in named_items)
     other_total = sum(other_values) if other_values else 0.0
     grand = named_total + other_total
@@ -327,8 +340,7 @@ def _render_trend(org: OrgSpend) -> None:
         st.caption(
             f"Top {len(named_items)} accounts = "
             f"**{named_share:.0f}%** of org spend over this window. "
-            "Named accounts are coloured; grey \"Other\" is the tail. "
-            "A trend without a shape can't be explained to a reviewer."
+            "Coloured bands are named accounts; grey is the long tail."
         )
 
 
