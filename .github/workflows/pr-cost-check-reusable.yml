@@ -50,6 +50,14 @@ on:
       AWS_ROLE_TO_ASSUME:
         description: IAM role ARN for OIDC (Bedrock + read-only AWS APIs)
         required: true
+      COSTSENSE_TOKEN:
+        description: >-
+          GitHub token (PAT or fine-grained) with `contents: read` on the
+          CostSense repository. Required when costsense_repository points to a
+          private repo in a different organisation or when the default
+          GITHUB_TOKEN lacks cross-repo read access. Leave unset when calling
+          from inside the same repo.
+        required: false
 
 permissions:
   contents: read
@@ -66,6 +74,8 @@ jobs:
         with:
           repository: >-
             ${{ inputs.costsense_repository != '' && inputs.costsense_repository || github.repository }}
+          token: >-
+            ${{ secrets.COSTSENSE_TOKEN != '' && secrets.COSTSENSE_TOKEN || github.token }}
           path: costsense
 
       - uses: actions/setup-python@v5
