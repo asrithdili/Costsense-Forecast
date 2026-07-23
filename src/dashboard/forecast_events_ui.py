@@ -1,6 +1,7 @@
 """Streamlit UI for the event-based future forecast panel."""
 from __future__ import annotations
 
+import html
 import traceback
 from datetime import date, timedelta
 from typing import List, Optional, Sequence
@@ -66,7 +67,7 @@ _CATEGORY_COLOR = {
 
 
 def _save_import_result(
-    account_id: str,
+    profile: str,
     *,
     added: int,
     incoming_count: int,
@@ -97,7 +98,7 @@ def _save_import_result(
             "a different repo/lookback."
         )
         tone = "warning"
-    set_import_flash(account_id, msg, tone)
+    set_import_flash(profile, msg, tone)
 
 
 def render_controls(
@@ -535,16 +536,16 @@ def render_pr_import_section(
                         max_prs=_MAX_OPEN_PRS_DEEP_ANALYSIS,
                     )
                     incoming = events_from_priced_open_prs(priced)
-                    existing = get_stored_events(account_id)
+                    existing = get_stored_events(active_profile)
                     before_ids = {e.external_id for e in existing if e.external_id}
                     merged, added = merge_events(existing, incoming)
-                    store_events(account_id, merged)
+                    store_events(active_profile, merged)
                     added_names = [
                         ev.name for ev in incoming
                         if not ev.external_id or ev.external_id not in before_ids
                     ]
                     _save_import_result(
-                        account_id,
+                        active_profile,
                         added=added,
                         incoming_count=len(incoming),
                         scanned=len(open_prs),
@@ -569,16 +570,16 @@ def render_pr_import_section(
                         llm_model=llm_model if analyzer != "regex" else None,
                     )
                     incoming = events_from_pr_impacts(impacts)
-                    existing = get_stored_events(account_id)
+                    existing = get_stored_events(active_profile)
                     before_ids = {e.external_id for e in existing if e.external_id}
                     merged, added = merge_events(existing, incoming)
-                    store_events(account_id, merged)
+                    store_events(active_profile, merged)
                     added_names = [
                         ev.name for ev in incoming
                         if not ev.external_id or ev.external_id not in before_ids
                     ]
                     _save_import_result(
-                        account_id,
+                        active_profile,
                         added=added,
                         incoming_count=len(incoming),
                         scanned=len(impacts),
@@ -596,13 +597,10 @@ def render_pr_import_section(
 
 def render_anomaly_import_section(
     *,
-    account_id: str,
     active_profile: str,
 ) -> None:
-    """Import savings events from a cached Anomalies scan for this account."""
+    """Import savings events from a cached Anomalies scan for this profile."""
     reports = find_anomaly_reports_for_profile(active_profile)
-    if not reports:
-        return
 
     st.markdown("##### Import from Anomalies")
     st.caption(
@@ -610,9 +608,15 @@ def render_anomaly_import_section(
         "Imports are deduplicated in the ledger below."
     )
 
-    report_options = {
-        key: report for key, report in reports
-    }
+    if not reports:
+        st.info(
+            "No Anomalies scan found for this account. Open **Anomalies**, "
+            "pick the same AWS profile, run **Analyze**, then return here. "
+            "You can also use **Add to future forecast** on each recommendation "
+            "on the Anomalies page."
+        )
+        return
+
     labels = []
     for key, report in reports:
         repos_part = key.split("::", 3)[-1] if key.count("::") >= 3 else ""
@@ -627,14 +631,14 @@ def render_anomaly_import_section(
             "Cached scan",
             range(len(labels)),
             format_func=lambda i: labels[i],
-            key=f"fc_anom_pick::{account_id}",
+            key=f"fc_anom_pick::{active_profile}",
         )
         report_key, report = reports[pick_idx]
 
         apply_date = st.date_input(
             "Expected apply date",
             value=date.today() + timedelta(days=14),
-            key=f"fc_anom_apply::{account_id}::{pick_idx}",
+            key=f"fc_anom_apply::{active_profile}::{pick_idx}",
         )
 
         action_labels = [
@@ -649,31 +653,31 @@ def render_anomaly_import_section(
             options=list(range(len(report.actions))),
             default=list(range(len(report.actions))),
             format_func=lambda i: action_labels[i],
-            key=f"fc_anom_actions::{account_id}::{pick_idx}",
+            key=f"fc_anom_actions::{active_profile}::{pick_idx}",
         )
 
         if st.button(
             "Import selected recommendations",
-            key=f"fc_anom_import::{account_id}::{pick_idx}",
+            key=f"fc_anom_import::{active_profile}::{pick_idx}",
             disabled=not picked,
         ):
             incoming = events_from_anomaly_actions(
                 report.actions,
-                account_id=account_id,
+                profile=active_profile,
                 report_key=report_key,
                 action_indices=picked,
                 expected_apply=apply_date,
             )
-            existing = get_stored_events(account_id)
+            existing = get_stored_events(active_profile)
             before_ids = {e.external_id for e in existing if e.external_id}
             merged, added = merge_events(existing, incoming)
-            store_events(account_id, merged)
+            store_events(active_profile, merged)
             added_names = [
                 ev.name for ev in incoming
                 if not ev.external_id or ev.external_id not in before_ids
             ]
             _save_import_result(
-                account_id,
+                active_profile,
                 added=added,
                 incoming_count=len(incoming),
                 scanned=len(report.actions),
@@ -688,10 +692,10 @@ def render_anomaly_import_section(
 
 def render_ledger(
     proj: Projection,
-    account_id: str,
+    profile: str,
     start_day: date,
 ) -> None:
-    events = get_stored_events(account_id)
+    events = get_stored_events(profile)
     st.markdown("##### Event ledger")
     st.caption(
         "Every assumption behind the forecast, named and dated. Uncheck one "
@@ -707,25 +711,27 @@ def render_ledger(
     contrib_by_name = {ev.name: amt for ev, amt in proj.contributions()}
 
     for i, ev in enumerate(events):
-        _event_row(ev, i, contrib_by_name.get(ev.name), account_id)
+        _event_row(ev, i, contrib_by_name.get(ev.name), profile)
 
     with st.expander("Add an event"):
-        _add_event_form(start_day, account_id)
+        _add_event_form(start_day, profile)
 
 
 def _event_row(
     ev: CostEvent,
     idx: int,
     contribution: Optional[float],
-    account_id: str,
+    profile: str,
 ) -> None:
     colour = _CATEGORY_COLOR.get(ev.category, C.MUTED)
     with st.container(border=True):
         head, amt, tog = st.columns([5, 1.3, 0.9])
         with head:
+            safe_name = html.escape(ev.name)
             st.markdown(
-                f"<span style='font-weight:650;"
-                f"{'' if ev.enabled else f'color:{C.FAINT};'}'>{ev.name}</span>",
+                f"<span style='font-weight:650;word-break:break-word;"
+                f"display:block;line-height:1.35;"
+                f"{'' if ev.enabled else f'color:{C.FAINT};'}'>{safe_name}</span>",
                 unsafe_allow_html=True,
             )
             chips = [
@@ -745,7 +751,9 @@ def _event_row(
             st.markdown(" ".join(chips), unsafe_allow_html=True)
             if ev.note:
                 st.markdown(
-                    f"<span style='color:{C.MUTED};font-size:.83rem;'>{ev.note}</span>",
+                    f"<span style='color:{C.MUTED};font-size:.83rem;"
+                    f"word-break:break-word;display:block;line-height:1.35;'>"
+                    f"{html.escape(ev.note)}</span>",
                     unsafe_allow_html=True,
                 )
         with amt:
@@ -763,17 +771,17 @@ def _event_row(
             )
         with tog:
             new_state = st.checkbox(
-                "On", value=ev.enabled, key=f"fc_en_{account_id}_{idx}",
+                "On", value=ev.enabled, key=f"fc_en_{profile}_{idx}",
                 label_visibility="collapsed",
             )
             if new_state != ev.enabled:
-                events = get_stored_events(account_id)
+                events = get_stored_events(profile)
                 events[idx].enabled = new_state
-                store_events(account_id, events)
+                store_events(profile, events)
                 st.rerun()
 
 
-def _add_event_form(start_day: date, account_id: str) -> None:
+def _add_event_form(start_day: date, profile: str) -> None:
     name = st.text_input(
         "Name",
         key="fc_new_name",
@@ -836,7 +844,7 @@ def _add_event_form(start_day: date, account_id: str) -> None:
         if not name.strip():
             st.warning("Give the event a name.")
             return
-        events = get_stored_events(account_id)
+        events = get_stored_events(profile)
         events.append(CostEvent(
             name=name.strip(),
             start_date=start,
@@ -849,5 +857,5 @@ def _add_event_form(start_day: date, account_id: str) -> None:
             confidence=float(confidence),
             source="manual",
         ))
-        store_events(account_id, events)
+        store_events(profile, events)
         st.rerun()

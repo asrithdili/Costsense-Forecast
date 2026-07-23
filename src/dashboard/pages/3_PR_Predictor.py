@@ -362,7 +362,7 @@ if verdict is not None:
             if ev is None:
                 st.warning("No material cost delta to add to the forecast.")
             else:
-                queue_pending_event(active.account_id, ev)
+                queue_pending_event(active.profile, ev)
                 callout(
                     "Queued for Future Forecast — open that page to review "
                     "and toggle the event.",
