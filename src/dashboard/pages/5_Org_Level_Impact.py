@@ -250,34 +250,86 @@ st.divider()
 # ============================================================================
 # DAILY SPEND TREND
 # ============================================================================
+def _pretty_series_label(raw: str) -> str:
+    """Shorten a raw 12-digit AWS account ID to `…2902310` so the legend
+    doesn't hog horizontal space. Human names pass through unchanged."""
+    s = raw.strip()
+    if len(s) == 12 and s.isdigit():
+        return f"…{s[-7:]}"
+    return s
+
+
 def _render_trend(org: OrgSpend) -> None:
     st.markdown("##### Daily spend")
-    st.caption(
-        "Top accounts stacked, remainder rolled into Other. A trend number "
-        "without a shape can't be explained to a reviewer."
-    )
-    series = org.daily_series(top_n=5)
+    # Top-10 (was top-5). Wider slice means the grey "Other" band shrinks
+    # from ~70% of the chart to ~30% on a typical Diligent-scale org, so
+    # the shape of the named accounts is visible rather than buried.
+    series = org.daily_series(top_n=10)
     if not series or not org.dates:
         callout("No daily series available for this window.", tone="info")
         return
 
-    palette = [C.BRAND, C.INFO, C.SEV["Medium"], C.SEV["High"],
-               C.BRAND_DARK, C.FAINT]
+    other_values = series.pop("Other", None)
+    # Sort named series by total spend so the legend + stack read big-to-small.
+    named_items = sorted(
+        series.items(), key=lambda kv: sum(kv[1]), reverse=True,
+    )
+
+    # Named accounts get the brand palette. Grey is RESERVED for "Other"
+    # so the visual convention stays: colored = accountable, grey = tail.
+    palette = [
+        C.BRAND, C.INFO, C.SEV["Medium"], C.SEV["High"], C.BRAND_DARK,
+        C.SEV["Low"], C.SEV["Critical"], "#7A5AF8", "#00B8D4", "#FF7043",
+    ]
+
+    total_by_day = [0.0] * len(org.dates)
     fig = go.Figure()
-    for i, (label, values) in enumerate(series.items()):
+    for i, (label, values) in enumerate(named_items):
+        color = palette[i % len(palette)]
         fig.add_trace(go.Scatter(
-            x=org.dates, y=values, name=label, mode="lines",
-            stackgroup="spend",
-            line=dict(width=0.5, color=palette[i % len(palette)]),
-            fillcolor=palette[i % len(palette)],
+            x=org.dates, y=values, name=_pretty_series_label(label),
+            mode="lines", stackgroup="spend",
+            line=dict(width=0.5, color=color),
+            fillcolor=color,
             hovertemplate="<b>%{fullData.name}</b><br>"
                           "%{x|%d %b}<br>$%{y:,.0f}<extra></extra>",
         ))
-    lay = plotly_layout(height=280)
+        for i_day, v in enumerate(values):
+            total_by_day[i_day] += v
+
+    if other_values:
+        fig.add_trace(go.Scatter(
+            x=org.dates, y=other_values, name="Other",
+            mode="lines", stackgroup="spend",
+            line=dict(width=0.5, color=C.FAINT),
+            fillcolor=C.FAINT,
+            hovertemplate="<b>Other</b><br>"
+                          "%{x|%d %b}<br>$%{y:,.0f}<extra></extra>",
+        ))
+        for i_day, v in enumerate(other_values):
+            total_by_day[i_day] += v
+
+    lay = plotly_layout(height=300)
     lay["yaxis_title"] = "Daily spend (USD)"
+    lay["hovermode"] = "x unified"
     fig.update_layout(**lay)
-    fig.update_traces(opacity=0.9)
+    fig.update_traces(opacity=0.92)
     st.plotly_chart(fig, use_container_width=True)
+
+    # One-line caption calibrated to what's on screen — top-10 share of
+    # total tells the reader whether the stack IS the story or whether
+    # the grey Other band still dominates.
+    named_total = sum(sum(v) for _, v in named_items)
+    other_total = sum(other_values) if other_values else 0.0
+    grand = named_total + other_total
+    if grand > 0:
+        named_share = named_total / grand * 100
+        st.caption(
+            f"Top {len(named_items)} accounts = "
+            f"**{named_share:.0f}%** of org spend over this window. "
+            "Named accounts are coloured; grey \"Other\" is the tail. "
+            "A trend without a shape can't be explained to a reviewer."
+        )
 
 
 _render_trend(org)
