@@ -250,33 +250,125 @@ st.divider()
 # ============================================================================
 # DAILY SPEND TREND
 # ============================================================================
+def _pretty_series_label(raw: str) -> str:
+    """Shorten a raw 12-digit AWS account ID to `…2902310` so the legend
+    doesn't hog horizontal space. Human names pass through unchanged."""
+    s = raw.strip()
+    if len(s) == 12 and s.isdigit():
+        return f"…{s[-7:]}"
+    return s
+
+
 def _render_trend(org: OrgSpend) -> None:
-    st.markdown("##### Daily spend")
-    st.caption(
-        "Top accounts stacked, remainder rolled into Other. A trend number "
-        "without a shape can't be explained to a reviewer."
+    """Daily-spend chart in the style of professional cost dashboards
+    (Datadog Cost Management, AWS Cost Explorer, Vantage). Structure:
+      - Section title + one-line subtitle
+      - KPI tile row (Total / 7d avg / peak day)
+      - Line chart: bold org total + top-3 accounts overlaid
+    No stacked bands, no giant tooltip overflow, no math-italic prose."""
+    section(
+        "Daily spend",
+        f"Trend across the last {org.window_days} days. "
+        "Top 3 accounts overlaid on the org total.",
+        kicker="Trend",
     )
-    series = org.daily_series(top_n=5)
-    if not series or not org.dates:
-        callout("No daily series available for this window.", tone="info")
+
+    ranked = [a for a in
+              sorted(org.accounts, key=lambda a: a.total, reverse=True)
+              if a.total > 0]
+    if not ranked or not org.dates:
+        callout("No daily spend data for this window.", tone="info")
         return
 
-    palette = [C.BRAND, C.INFO, C.SEV["Medium"], C.SEV["High"],
-               C.BRAND_DARK, C.FAINT]
+    # Compute org-total daily series (sum across every account).
+    n = len(org.dates)
+    total_series: list[float] = [0.0] * n
+    for a in ranked:
+        for i, v in enumerate((a.daily or [])[:n]):
+            total_series[i] += v
+
+    # ---- KPI tiles (numbers first, chart second — real dashboards
+    # always lead with totals). Uses the shared metric() helper so it
+    # matches the answer band above.
+    window_total = sum(total_series)
+    last7 = total_series[-7:] if len(total_series) >= 7 else total_series
+    avg_last7 = sum(last7) / len(last7) if last7 else 0.0
+    peak_day_idx = max(range(len(total_series)),
+                        key=lambda i: total_series[i]) if total_series else 0
+    peak_amt = total_series[peak_day_idx] if total_series else 0.0
+    peak_date = org.dates[peak_day_idx] if org.dates else None
+
+    k1, k2, k3 = st.columns(3, gap="medium")
+    with k1:
+        metric(f"Total spend · {org.window_days}d", money(window_total))
+    with k2:
+        metric("Trailing 7-day avg", f"{money(avg_last7)}/day")
+    with k3:
+        metric(
+            "Peak day",
+            money(peak_amt),
+            delta=peak_date.strftime("%d %b") if peak_date else None,
+        )
+
+    # ---- Line chart
     fig = go.Figure()
-    for i, (label, values) in enumerate(series.items()):
+
+    # Org total: bold brand line with soft brand tint filled below.
+    # This is the "primary story" line.
+    fig.add_trace(go.Scatter(
+        x=org.dates, y=total_series,
+        name="Org total",
+        mode="lines",
+        line=dict(width=3, color=C.BRAND, shape="spline", smoothing=0.6),
+        fill="tozeroy",
+        fillcolor=C.BRAND_SOFT,
+        hovertemplate="<b>Org total</b><br>%{x|%d %b}<br>"
+                      "<b>$%{y:,.0f}</b><extra></extra>",
+    ))
+
+    # Top-3 named accounts as thinner supporting lines. Not filled —
+    # keeps them visually secondary to the org-total.
+    line_palette = [C.INFO, C.SEV["Medium"], C.SEV["High"]]
+    for i, acct in enumerate(ranked[:3]):
+        color = line_palette[i]
+        label = _pretty_series_label(acct.name or acct.account_id)
         fig.add_trace(go.Scatter(
-            x=org.dates, y=values, name=label, mode="lines",
-            stackgroup="spend",
-            line=dict(width=0.5, color=palette[i % len(palette)]),
-            fillcolor=palette[i % len(palette)],
-            hovertemplate="<b>%{fullData.name}</b><br>"
-                          "%{x|%d %b}<br>$%{y:,.0f}<extra></extra>",
+            x=org.dates, y=(acct.daily or [])[:n],
+            name=f"#{i + 1}  {label}",
+            mode="lines",
+            line=dict(width=2, color=color, shape="spline", smoothing=0.6),
+            hovertemplate=f"<b>#{i + 1} {label}</b>"
+                          "<br>%{x|%d %b}<br>"
+                          "$%{y:,.0f}<extra></extra>",
         ))
-    lay = plotly_layout(height=280)
-    lay["yaxis_title"] = "Daily spend (USD)"
+
+    lay = plotly_layout(height=300)
+    lay["yaxis"] = dict(
+        title=dict(text="Daily spend (USD)",
+                   font=dict(size=11, color=C.MUTED)),
+        gridcolor=C.HAIRLINE, zerolinecolor=C.HAIRLINE,
+        tickformat="$,.0f",
+        rangemode="tozero",
+    )
+    lay["xaxis"] = dict(
+        gridcolor=C.HAIRLINE, zerolinecolor=C.HAIRLINE,
+        tickformat="%d %b",
+        showspikes=True, spikemode="across", spikesnap="cursor",
+        spikedash="dot", spikecolor=C.FAINT, spikethickness=1,
+    )
+    lay["legend"] = dict(
+        orientation="h",
+        yanchor="bottom", y=1.02,
+        xanchor="left", x=0.0,
+        font=dict(size=11),
+        bgcolor="rgba(0,0,0,0)",
+    )
+    lay["margin"] = dict(l=16, r=24, t=44, b=32)
+    # Per-series hover (NOT x-unified) — with 4 series a unified
+    # tooltip renders a big black box on the right edge. Individual
+    # hovers keep the chart clean.
+    lay["hovermode"] = "closest"
     fig.update_layout(**lay)
-    fig.update_traces(opacity=0.9)
     st.plotly_chart(fig, use_container_width=True)
 
 

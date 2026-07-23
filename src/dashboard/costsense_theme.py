@@ -103,7 +103,17 @@ def plotly_layout(height: int = 400) -> dict:
             x=1,
             font=dict(color=C.MUTED),
         ),
-        hoverlabel=dict(bgcolor=C.INK, font=dict(color="white")),
+        # Soft card-white tooltip with a hairline border. The old
+        # bgcolor=INK / white-text combo looked like a black overlay
+        # slap on pale charts; this reads as a floating card that
+        # belongs to the same visual system as everything else.
+        hoverlabel=dict(
+            bgcolor=C.CARD,
+            bordercolor=C.HAIRLINE,
+            font=dict(color=C.INK, size=12,
+                      family="Inter, -apple-system, Segoe UI, Roboto, sans-serif"),
+            align="left",
+        ),
     )
 
 
