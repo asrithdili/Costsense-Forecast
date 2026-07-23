@@ -137,6 +137,15 @@ section(
     kicker="Input",
 )
 
+# Restore the last-predicted URL for this profile from disk BEFORE the
+# text_input widget renders. Streamlit's session_state resets on new
+# browser tabs / F5 reloads / server restarts; without this seeding
+# step the URL field renders blank and the (profile, url) cache lookup
+# below misses even though the verdict pickle IS on disk.
+_last_url_for_profile = cached_state.get("prp_last_url", (active.profile,))
+if _last_url_for_profile and "prp_last_url" not in st.session_state:
+    st.session_state["prp_last_url"] = _last_url_for_profile
+
 # Persist the last predicted URL + verdict across tab switches so users
 # don't have to re-predict when they come back. Keyed on (profile, url).
 url_col, btn_col = st.columns([4, 1], gap="medium", vertical_alignment="bottom")
@@ -175,6 +184,9 @@ if run and pr_url.strip():
             st.code(traceback.format_exc())
             st.stop()
     cached_state.set("prp_verdict", (active.profile, _pr_url_key), verdict)
+    # Remember which URL this profile last predicted, so the next
+    # session can re-seed the text box + re-lookup the verdict.
+    cached_state.set("prp_last_url", (active.profile,), _pr_url_key)
 
     # Pull current account $/day (avg last 7 days from Cost Explorer)
     with st.spinner("Fetching current account spend…"):
