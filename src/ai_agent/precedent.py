@@ -23,6 +23,7 @@ import json
 import re
 import statistics
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -187,23 +188,63 @@ def _sibling_profiles_for_repo(repo: str):
     return matches
 
 
+# Cache: (repo, sorted files tuple) -> PrecedentAggregate.
+#
+# Why this exists: the Dashboard's open-PR fan-out calls find_precedents
+# once per open PR (whenever the LLM invokes precedent_lookup). On a single
+# repo the 8 open PRs typically touch overlapping files, and every call
+# would otherwise re-hit `gh pr list` + `gh pr diff` on the same historical
+# PRs and re-hit Cost Explorer on the same sibling accounts. GitHub search
+# rate-limits at ~30 req/min — the fan-out was queueing behind that.
+#
+# One find_precedents per (repo, files) fixes it: 8 PRs on the same repo
+# with the same 2-file diff → 1 real precedent scan + 7 cache hits.
+_precedent_cache: dict[tuple, "PrecedentAggregate"] = {}
+_precedent_cache_lock = threading.Lock()
+
+
 def find_precedents(
     repo: str,
     current_diff: str,
     max_precedents: int = 5,
     window_days: int = 14,
 ) -> PrecedentAggregate:
-    """Full pipeline. Returns aggregated $/tenant/day rate + samples."""
-    from src.ai_agent.diff_resources import (
-        _count_added_scope_ids, extract_resources,
-    )
-
+    """Cached wrapper — memoizes per (repo, files-touched, window_days)
+    so parallel open-PR analyses on the same repo don't each re-scan the
+    same historical PRs + sibling AWS accounts. See `_precedent_cache`
+    docstring above for the rationale."""
     agg = PrecedentAggregate()
     files = _files_touched_in_diff(current_diff)
     if not files:
         agg.note = "No files identified in the PR diff."
         return agg
 
+    cache_key = (repo, tuple(sorted(files)), window_days)
+    with _precedent_cache_lock:
+        cached = _precedent_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    result = _find_precedents_uncached(
+        repo, files, max_precedents=max_precedents, window_days=window_days,
+    )
+    with _precedent_cache_lock:
+        _precedent_cache[cache_key] = result
+    return result
+
+
+def _find_precedents_uncached(
+    repo: str,
+    files: list[str],
+    max_precedents: int = 5,
+    window_days: int = 14,
+) -> PrecedentAggregate:
+    """The actual pipeline. Cache-agnostic; called through find_precedents."""
+    from src.ai_agent.diff_resources import (
+        _count_added_scope_ids, extract_resources,
+    )
+
+    agg = PrecedentAggregate()
     prior = _list_prior_prs_touching_files(repo, files, limit=25)
     if not prior:
         agg.note = "No prior merged PRs found touching these files."

@@ -261,19 +261,29 @@ def analyze_open_prs(
         """Deep-analyze one open PR. Runs in a worker thread — the
         precedent context inside analyze_pr uses threading.local() so
         parallel calls don't clobber each other."""
+        import sys as _sys
+        print(f"[open-pr] START {opr.repo}#{opr.number} '{opr.title[:60]}'",
+              file=_sys.stderr, flush=True)
         try:
             verdict = analyze_pr(
                 opr.url, profile=profile, model_id=llm_model,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            print(f"[open-pr] FAIL  {opr.repo}#{opr.number}: {e}",
+                  file=_sys.stderr, flush=True)
             return None
 
         # If the agent bailed with an error, skip this PR — better to have
         # no signal than a fabricated one.
         if getattr(verdict, "error", None):
+            print(f"[open-pr] SKIP  {opr.repo}#{opr.number}: {verdict.error}",
+                  file=_sys.stderr, flush=True)
             return None
 
         est = float(verdict.est_daily_delta_usd or 0.0)
+        print(f"[open-pr] DONE  {opr.repo}#{opr.number} "
+              f"delta={est:+.2f} tool_calls={verdict.tool_calls}",
+              file=_sys.stderr, flush=True)
         direction = str(
             verdict.direction
             if verdict.direction in ("increase", "decrease", "neutral")
