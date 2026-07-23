@@ -14,7 +14,7 @@ from __future__ import annotations
 import sys
 import time
 import traceback
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -40,6 +40,11 @@ from src.dashboard.notifications_ui import NotificationDraft, render_notificatio
 from src.pr_scanner.repos import gh_login, gh_orgs, repos_with_user_prs
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
+)
+from src.forecast.adapters import (
+    event_from_anomaly_action,
+    events_from_anomaly_actions,
+    queue_pending_event,
 )
 
 
@@ -617,6 +622,40 @@ if report.actions:
         kicker="Actions",
     )
 
+    bulk_fc1, bulk_fc2 = st.columns([2, 1], gap="medium", vertical_alignment="bottom")
+    with bulk_fc1:
+        bulk_apply_date = st.date_input(
+            "Expected apply date (all shown actions)",
+            value=date.today() + timedelta(days=14),
+            key=f"anom_fc_bulk_date::{report_key}",
+            help="When savings from these recommendations are expected to land.",
+        )
+    with bulk_fc2:
+        if st.button(
+            f"Add all {len(filtered)} shown to future forecast",
+            key=f"anom_fc_bulk_add::{report_key}",
+            use_container_width=True,
+            disabled=not filtered,
+        ):
+            indices = [report.actions.index(a) for a in filtered]
+            incoming = events_from_anomaly_actions(
+                report.actions,
+                account_id=active.account_id,
+                report_key=report_key,
+                action_indices=indices,
+                expected_apply=bulk_apply_date,
+            )
+            if not incoming:
+                callout("No material savings in the shown actions.", tone="warning")
+            else:
+                for ev in incoming:
+                    queue_pending_event(active.account_id, ev)
+                callout(
+                    f"Queued {len(incoming)} event(s) for Future Forecast — open "
+                    "that page to review them in the event ledger.",
+                    tone="success",
+                )
+
     for display_i, a in enumerate(filtered, start=1):
         action_idx = report.actions.index(a)
         cat_label = CATEGORY_LABEL.get(
@@ -644,6 +683,37 @@ if report.actions:
                 f"- **Reason:** {_plain(a.reason) or '_—_'}\n"
                 f"- **Recommendation:** {_plain(a.recommendation) or '_—_'}"
             )
+
+            fc1, fc2 = st.columns([2, 1], gap="medium", vertical_alignment="bottom")
+            with fc1:
+                apply_date = st.date_input(
+                    "Expected apply date",
+                    value=date.today() + timedelta(days=14),
+                    key=f"anom_fc_date::{report_key}::{action_idx}",
+                    help="When this savings is expected to show up in spend.",
+                )
+            with fc2:
+                if st.button(
+                    "Add to future forecast",
+                    key=f"anom_fc_add::{report_key}::{action_idx}",
+                    use_container_width=True,
+                ):
+                    ev = event_from_anomaly_action(
+                        a,
+                        account_id=active.account_id,
+                        report_key=report_key,
+                        action_idx=action_idx,
+                        expected_apply=apply_date,
+                    )
+                    if ev is None:
+                        callout("No material savings to add to the forecast.", tone="warning")
+                    else:
+                        queue_pending_event(active.account_id, ev)
+                        callout(
+                            "Queued for Future Forecast — open that page to "
+                            "review and toggle the event in the ledger.",
+                            tone="success",
+                        )
 
             # Single-approach mode: pick the first LLM approach that has a
             # distinct title (not just repeating the recommendation). If none
@@ -680,6 +750,10 @@ if report.actions:
 
                 # --- Draft PR flow (gated: IaC code + scanned repos) ---
                 if _approach_pr_eligible(best) and selected_repos:
+                    st.caption(
+                        f"Draft PRs are limited to the {len(selected_repos)} "
+                        f"repo(s) selected for this scan on `{active.profile}`."
+                    )
                     gh_ready, gh_msg = github_write_auth_status()
                     plan_key = _pr_plan_key(report_key, action_idx)
                     result_key = _pr_result_key(report_key, action_idx)
@@ -725,52 +799,68 @@ if report.actions:
                                     tone="warning",
                                 )
                             elif plan.repo and plan.files:
-                                st.markdown("**PR preview**")
-                                st.markdown(
-                                    f"- **Repo:** `{plan.repo}`\n"
-                                    f"- **Branch:** `{plan.branch}`\n"
-                                    f"- **Title:** {_plain(plan.title)}"
-                                )
-                                try:
-                                    diff_text = build_diff_preview(
-                                        plan.repo,
-                                        [{"path": f.path, "content": f.content}
-                                         for f in plan.files],
+                                if plan.repo not in selected_repos:
+                                    callout(
+                                        f"PR targets `{plan.repo}` which is not in "
+                                        "the repos selected for this scan.",
+                                        tone="error",
                                     )
-                                except Exception as e:  # noqa: BLE001
-                                    diff_text = f"(diff preview failed: {e})"
-                                st.code(diff_text or "(no changes)", language="diff")
+                                else:
+                                    st.markdown("**PR preview**")
+                                    st.markdown(
+                                        f"- **Repo:** `{plan.repo}`\n"
+                                        f"- **Branch:** `{plan.branch}`\n"
+                                        f"- **Title:** {_plain(plan.title)}"
+                                    )
+                                    try:
+                                        diff_text = build_diff_preview(
+                                            plan.repo,
+                                            [{"path": f.path, "content": f.content}
+                                             for f in plan.files],
+                                        )
+                                    except Exception as e:  # noqa: BLE001
+                                        diff_text = f"(diff preview failed: {e})"
+                                    st.code(diff_text or "(no changes)", language="diff")
 
-                                btn_l, btn_r = st.columns(2)
-                                with btn_l:
-                                    if st.button(
-                                        "Open draft PR",
-                                        key=confirm_key,
-                                        type="primary",
-                                    ):
-                                        with st.spinner("Pushing branch and opening draft PR…"):
-                                            try:
-                                                url = apply_pr_plan(
-                                                    repo=plan.repo,
-                                                    branch=plan.branch,
-                                                    title=plan.title,
-                                                    body=plan.body,
-                                                    files=[
-                                                        {"path": f.path,
-                                                         "content": f.content}
-                                                        for f in plan.files
-                                                    ],
-                                                )
-                                                st.session_state[result_key] = url
-                                                del st.session_state[plan_key]
-                                                st.rerun()
-                                            except Exception as e:  # noqa: BLE001
+                                    btn_l, btn_r = st.columns(2)
+                                    with btn_l:
+                                        if st.button(
+                                            "Open draft PR",
+                                            key=confirm_key,
+                                            type="primary",
+                                        ):
+                                            if plan.repo not in selected_repos:
                                                 callout(
-                                                    f"Failed to open draft PR: {e}",
+                                                    f"PR targets `{plan.repo}` which is "
+                                                    "not in the repos selected for this scan.",
                                                     tone="error",
                                                 )
-                                                st.code(traceback.format_exc())
-                                with btn_r:
-                                    if st.button("Discard preview", key=cancel_key):
-                                        del st.session_state[plan_key]
-                                        st.rerun()
+                                            else:
+                                                with st.spinner(
+                                                    "Pushing branch and opening draft PR…"
+                                                ):
+                                                    try:
+                                                        url = apply_pr_plan(
+                                                            repo=plan.repo,
+                                                            branch=plan.branch,
+                                                            title=plan.title,
+                                                            body=plan.body,
+                                                            files=[
+                                                                {"path": f.path,
+                                                                 "content": f.content}
+                                                                for f in plan.files
+                                                            ],
+                                                        )
+                                                        st.session_state[result_key] = url
+                                                        del st.session_state[plan_key]
+                                                        st.rerun()
+                                                    except Exception as e:  # noqa: BLE001
+                                                        callout(
+                                                            f"Failed to open draft PR: {e}",
+                                                            tone="error",
+                                                        )
+                                                        st.code(traceback.format_exc())
+                                    with btn_r:
+                                        if st.button("Discard preview", key=cancel_key):
+                                            del st.session_state[plan_key]
+                                            st.rerun()
