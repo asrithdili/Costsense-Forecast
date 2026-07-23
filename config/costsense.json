@@ -1,0 +1,12 @@
+{
+  "aws": {
+    "region": "us-west-2",
+    "runtime_profile": "ecs-task-role"
+  },
+  "bedrock": {
+    "region": "us-west-2"
+  },
+  "github": {
+    "token": ""
+  }
+}

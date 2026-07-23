@@ -1,0 +1,444 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CostSense Streamlit on ECS Fargate behind an internet-facing Application Load
+  Balancer. Creates ECR, cluster, service, task definition, IAM roles, and an
+  optional GitHub OIDC deploy role for .github/workflows/deploy-ecs.yml.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the ALB and ECS tasks run.
+
+  AlbSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets (at least two AZs) for the internet-facing ALB.
+
+  EcsSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for Fargate tasks (public subnets if AssignPublicIp=true).
+
+  AssignPublicIp:
+    Type: String
+    AllowedValues: ["ENABLED", "DISABLED"]
+    Default: ENABLED
+    Description: >-
+      ENABLED uses public subnets so tasks can reach ECR without NAT. Use
+      DISABLED with private subnets plus NAT for production.
+
+  AllowedIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to reach the ALB on HTTP (restrict in production).
+
+  ContainerPort:
+    Type: Number
+    Default: 8501
+    Description: Streamlit listen port inside the container.
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    Description: >-
+      Number of running tasks. Set to 0 until the first image is pushed to ECR,
+      then update the stack or service to 1.
+
+  TaskCpu:
+    Type: String
+    Default: "1024"
+    AllowedValues: ["256", "512", "1024", "2048", "4096"]
+
+  TaskMemory:
+    Type: String
+    Default: "2048"
+    AllowedValues: ["512", "1024", "2048", "3072", "4096", "5120", "6144", "7168", "8192"]
+
+  EcrRepositoryName:
+    Type: String
+    Default: costsense
+
+  ClusterName:
+    Type: String
+    Default: costsense-cluster
+
+  ServiceName:
+    Type: String
+    Default: costsense-service
+
+  TaskDefinitionFamily:
+    Type: String
+    Default: costsense
+
+  ContainerName:
+    Type: String
+    Default: costsense
+
+  LogGroupName:
+    Type: String
+    Default: /ecs/costsense
+
+  GitHubOrg:
+    Type: String
+    Description: GitHub organization or user that owns the repository.
+
+  GitHubRepo:
+    Type: String
+    Default: Costsense-Forecast
+    Description: Repository name (without org).
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch allowed to assume the GitHub deploy role.
+
+  CreateGitHubDeployRole:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: >-
+      Create github-ecs-deploy IAM role for GitHub Actions OIDC. Requires the
+      account OIDC provider token.actions.githubusercontent.com to exist.
+
+Conditions:
+  CreateGitHubDeployRole: !Equals [!Ref CreateGitHubDeployRole, "true"]
+  AssignPublicIpEnabled: !Equals [!Ref AssignPublicIp, "ENABLED"]
+
+Resources:
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref EcrRepositoryName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EmptyOnDelete: false
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref LogGroupName
+      RetentionInDays: 30
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP to CostSense ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedIngressCidr
+      Tags:
+        - Key: Name
+          Value: costsense-alb-sg
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow ALB traffic to CostSense ECS tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: costsense-ecs-sg
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: costsense-alb
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets: !Ref AlbSubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "3600"
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: costsense-tg
+      VpcId: !Ref VpcId
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: /_stcore/health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: "true"
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: costsense-ecs-execution-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: costsense-ecs-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt LogGroup.Arn
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: costsense-task-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: costsense-readonly-aws
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadOnlyCostAndUsage
+                Effect: Allow
+                Action:
+                  - ce:*
+                  - cur:DescribeReportDefinitions
+                  - budgets:ViewBudget
+                  - budgets:Describe*
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - cloudtrail:LookupEvents
+                  - compute-optimizer:Get*
+                  - compute-optimizer:Describe*
+                  - servicequotas:List*
+                  - servicequotas:Get*
+                  - pricing:GetProducts
+                  - organizations:List*
+                  - organizations:Describe*
+                  - sts:GetCallerIdentity
+                Resource: "*"
+              - Sid: ReadOnlyInventory
+                Effect: Allow
+                Action:
+                  - ec2:Describe*
+                  - rds:Describe*
+                  - lambda:List*
+                  - lambda:Get*
+                  - s3:List*
+                  - s3:GetBucket*
+                  - s3:GetObject
+                  - s3:GetLifecycleConfiguration
+                  - dynamodb:List*
+                  - dynamodb:Describe*
+                Resource: "*"
+              - Sid: BedrockInvoke
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: "*"
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref TaskDefinitionFamily
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Ref ContainerName
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepositoryName}:latest"
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub "curl -f http://localhost:${ContainerPort}/_stcore/health || exit 1"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties:
+      ServiceName: !Ref ServiceName
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 120
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !Ref AssignPublicIp
+          Subnets: !Ref EcsSubnetIds
+          SecurityGroups:
+            - !Ref EcsSecurityGroup
+      LoadBalancers:
+        - ContainerName: !Ref ContainerName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Condition: CreateGitHubDeployRole
+    Properties:
+      RoleName: github-ecs-deploy
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/${GitHubBranch}"
+      Policies:
+        - PolicyName: github-ecs-deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EcrPushPull
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeRepositories
+                  - ecr:DescribeImages
+                Resource: "*"
+              - Sid: EcsDeploy
+                Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTaskDefinition
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:RegisterTaskDefinition
+                  - ecs:UpdateService
+                Resource: "*"
+              - Sid: PassRolesToEcs
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt TaskExecutionRole.Arn
+                  - !GetAtt TaskRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+Outputs:
+  LoadBalancerUrl:
+    Description: Public HTTP URL for the CostSense app
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
+
+  LoadBalancerDnsName:
+    Description: ALB DNS name (use for Route53 alias or ACM cert)
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  EcrRepositoryUri:
+    Description: Push container images here before the service can start
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepositoryName}"
+
+  ClusterName:
+    Value: !Ref EcsCluster
+
+  ServiceName:
+    Value: !GetAtt EcsService.Name
+
+  TaskDefinitionFamily:
+    Value: !Ref TaskDefinitionFamily
+
+  ContainerName:
+    Value: !Ref ContainerName
+
+  TaskRoleArn:
+    Value: !GetAtt TaskRole.Arn
+
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+
+  GitHubDeployRoleArn:
+    Condition: CreateGitHubDeployRole
+    Description: Set as GitHub secret AWS_DEPLOY_ROLE_TO_ASSUME
+    Value: !GetAtt GitHubDeployRole.Arn
+
+  GitHubOidcSetupCommand:
+    Description: Run once per account if the GitHub OIDC provider does not exist
+    Value: >-
+      aws iam create-open-id-connect-provider --url
+      https://token.actions.githubusercontent.com --client-id-list
+      sts.amazonaws.com --thumbprint-list 6938fd4d98bab03fa88697dae08f0dc81b3a3b0a

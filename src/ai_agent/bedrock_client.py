@@ -11,9 +11,11 @@ from functools import lru_cache
 from botocore.config import Config
 
 from src.aws.session import make_session
+from src.config import get_str
 
 
-DEFAULT_REGION = "us-west-2"
+def default_bedrock_region() -> str:
+    return get_str("bedrock.region", "us-west-2") or "us-west-2"
 
 _BEDROCK_CONFIG = Config(
     read_timeout=300,      # 5 min — Sonnet + long tool loops can be slow
@@ -23,7 +25,8 @@ _BEDROCK_CONFIG = Config(
 
 
 @lru_cache(maxsize=8)
-def make_client(profile: str | None, region: str = DEFAULT_REGION):
+def make_client(profile: str | None, region: str | None = None):
+    region = region or default_bedrock_region()
     session = make_session(profile)
     return session.client("bedrock-runtime", region_name=region,
                           config=_BEDROCK_CONFIG)
