@@ -16,11 +16,22 @@ import os
 
 import boto3
 
+from src.config import get_str
+
 
 def vault_profile() -> str | None:
     """Profile name when running under ``aws-vault exec``."""
     value = os.environ.get("AWS_VAULT")
     return value if value else None
+
+
+def runtime_profile_name() -> str:
+    """Logical profile label for ECS task roles and other default-credential runtimes."""
+    return get_str("aws.runtime_profile", "ecs-task-role") or "ecs-task-role"
+
+
+def aws_region() -> str | None:
+    return get_str("aws.region")
 
 
 def _env_credentials_available() -> bool:
@@ -38,7 +49,11 @@ def _session_from_environment() -> boto3.Session:
     profile_keys = ("AWS_PROFILE", "AWS_DEFAULT_PROFILE")
     saved = {k: os.environ.pop(k) for k in profile_keys if k in os.environ}
     try:
-        region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION")
+        region = (
+            os.environ.get("AWS_DEFAULT_REGION")
+            or os.environ.get("AWS_REGION")
+            or aws_region()
+        )
         return boto3.Session(
             aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
             aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
@@ -67,10 +82,16 @@ def _should_use_env_credentials(profile: str | None) -> bool:
 
 def make_session(profile: str | None = None) -> boto3.Session:
     """Return a boto3 Session for *profile*, honoring aws-vault env creds."""
+    if profile == runtime_profile_name():
+        profile = None
+
     if _should_use_env_credentials(profile):
         return _session_from_environment()
 
     if not profile:
+        region = aws_region()
+        if region:
+            return boto3.Session(region_name=region)
         return boto3.Session()
 
     return boto3.Session(profile_name=profile)

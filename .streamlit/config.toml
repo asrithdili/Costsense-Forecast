@@ -24,3 +24,9 @@ showSidebarNavigation = false
 # Silently rerun on every file save instead of showing the
 # "File change. Rerun / Always rerun" toast at the top-right.
 runOnSave = false
+headless = true
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false

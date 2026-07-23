@@ -1,0 +1,12 @@
+{
+  "aws": {
+    "region": "us-west-2",
+    "runtime_profile": "your-aws-profile"
+  },
+  "bedrock": {
+    "region": "us-west-2"
+  },
+  "github": {
+    "token": "ghp_your_token_here"
+  }
+}

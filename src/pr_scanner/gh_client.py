@@ -10,6 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from src.config import get_str
 from src.env import load_env
 
 load_env()
@@ -47,6 +48,9 @@ def gh_available() -> bool:
 
 
 def _github_token() -> str | None:
+    token = get_str("github.token")
+    if token:
+        return token
     return os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
 
 

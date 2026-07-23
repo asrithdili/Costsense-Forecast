@@ -1,0 +1,117 @@
+name: Deploy to ECS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      aws_account_id:
+        description: >-
+          Override target AWS account ID (12 digits). Defaults to repository
+          variable AWS_ACCOUNT_ID when empty.
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-west-2' }}
+  AWS_ACCOUNT_ID: ${{ github.event.inputs.aws_account_id || vars.AWS_ACCOUNT_ID }}
+  AWS_DEPLOY_ROLE_NAME: ${{ vars.AWS_DEPLOY_ROLE_NAME || 'github-ecs-deploy' }}
+  ECR_REPOSITORY: costsense
+  ECS_CLUSTER: costsense-cluster
+  ECS_SERVICE: costsense-service
+  ECS_TASK_DEFINITION: costsense
+  CONTAINER_NAME: costsense
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve deploy role ARN
+        id: role
+        env:
+          DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_TO_ASSUME }}
+        run: |
+          if [ -n "$DEPLOY_ROLE_ARN" ]; then
+            echo "arn=$DEPLOY_ROLE_ARN" >> "$GITHUB_OUTPUT"
+            echo "Using AWS_DEPLOY_ROLE_TO_ASSUME secret"
+          elif [ -n "$AWS_ACCOUNT_ID" ]; then
+            echo "arn=arn:aws:iam::${AWS_ACCOUNT_ID}:role/${AWS_DEPLOY_ROLE_NAME}" >> "$GITHUB_OUTPUT"
+            echo "Using role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${AWS_DEPLOY_ROLE_NAME}"
+          else
+            echo "Set repository variable AWS_ACCOUNT_ID or secret AWS_DEPLOY_ROLE_TO_ASSUME"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.role.outputs.arn }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify target AWS account
+        run: |
+          ACTUAL=$(aws sts get-caller-identity --query Account --output text)
+          echo "Authenticated to AWS account ${ACTUAL}"
+          if [ -n "$AWS_ACCOUNT_ID" ] && [ "$ACTUAL" != "$AWS_ACCOUNT_ID" ]; then
+            echo "Expected AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID but assumed role resolved to $ACTUAL"
+            exit 1
+          fi
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Prepare runtime config
+        env:
+          COSTSENSE_GITHUB_TOKEN: ${{ secrets.COSTSENSE_GITHUB_TOKEN }}
+        run: python scripts/prepare_deploy_config.py
+
+      - name: Build, tag, and push image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_TASK_DEFINITION" \
+            --query taskDefinition > task-definition.json
+
+      - name: Render new task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Deployment summary
+        run: |
+          {
+            echo "### CostSense ECS deploy"
+            echo "- **Account:** $(aws sts get-caller-identity --query Account --output text)"
+            echo "- **Region:** $AWS_REGION"
+            echo "- **Image:** ${{ steps.build-image.outputs.image }}"
+            echo "- **Cluster:** $ECS_CLUSTER"
+            echo "- **Service:** $ECS_SERVICE"
+          } >> "$GITHUB_STEP_SUMMARY"
