@@ -56,7 +56,8 @@ GROUP_DIMENSIONS = {
     "Environment": "environment",
     "Service": "service",
 }
-WINDOWS = {"30 days": 30, "60 days": 60, "90 days": 90}
+WINDOWS = {"14 days": 14, "30 days": 30, "60 days": 60, "90 days": 90}
+DEFAULT_WINDOW = "14 days"
 SMALL_N = 3  # below this, movers analysis is not meaningful
 
 
@@ -94,7 +95,9 @@ labels = [p.label for p in profiles]
 picked_label = st.session_state.get("orgv2_profile", labels[default_idx])
 if picked_label not in labels:
     picked_label = labels[default_idx]
-picked_window = st.session_state.get("orgv2_window", "30 days")
+picked_window = st.session_state.get("orgv2_window", DEFAULT_WINDOW)
+if picked_window not in WINDOWS:
+    picked_window = DEFAULT_WINDOW
 picked_floor = int(st.session_state.get("orgv2_floor", 250))
 
 header = (f"Controls  ·  Profile: {picked_label}  ·  "
@@ -116,6 +119,13 @@ with top_bar(header):
             "Window", list(WINDOWS.keys()),
             index=list(WINDOWS.keys()).index(picked_window),
             key="orgv2_window",
+            help=(
+                "How far back to pull daily spend from Cost Explorer. "
+                "The trend chart, ownership totals, and month-to-date "
+                "use the full window. The 'biggest movers' table always "
+                "compares the last 7 days to the 7 days before that, "
+                "regardless of window."
+            ),
         )
     with c3:
         picked_floor = st.number_input(
