@@ -12,7 +12,9 @@ Flow:
 from __future__ import annotations
 
 import sys
+import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -77,6 +79,26 @@ MODEL_OPTIONS = [
 ]
 model_ids = [mid for mid, _ in MODEL_OPTIONS]
 model_labels = [name for _, name in MODEL_OPTIONS]
+
+CONTINUOUS_FREQ_OPTIONS: dict[str, int] = {
+    "3 min": 3 * 60,
+    "15 min": 15 * 60,
+    "30 min": 30 * 60,
+    "1 hr": 60 * 60,
+    "6 hr": 6 * 60 * 60,
+    "12 hr": 12 * 60 * 60,
+    "24 hr": 24 * 60 * 60,
+}
+
+# Restore page settings that must survive navigation away and back.
+if "anom_continuous_enabled" not in st.session_state:
+    st.session_state["anom_continuous_enabled"] = bool(
+        st.session_state.get("anom_continuous_persist", False)
+    )
+if "anom_continuous_freq" not in st.session_state:
+    st.session_state["anom_continuous_freq"] = st.session_state.get(
+        "anom_continuous_freq_persist", "15 min"
+    )
 
 picked_label = st.session_state.get("anom_profile", labels[0])
 if picked_label not in labels:
@@ -158,20 +180,56 @@ with top_bar(header):
             suggested_full = []
         short_names = [r.split("/", 1)[-1] for r in suggested_full]
         default_selection = _match(active_preview.profile, short_names) or short_names
+        _persisted_short = st.session_state.get("anom_repos_persist", [])
+        short_names_merged = list(dict.fromkeys(
+            short_names + [r for r in _persisted_short if r not in short_names]
+        ))
+        _repos_widget_key = f"anom_repos_v{_widget_ver}"
+        if _repos_widget_key not in st.session_state and _persisted_short:
+            restored = [r for r in _persisted_short if r in short_names_merged]
+            if restored:
+                st.session_state[_repos_widget_key] = restored
         # Key salted by widget-version counter — bumped on account
         # change so `default=` takes effect for the new profile.
         picked_short = st.multiselect(
-            "Repos to scan", options=short_names,
+            "Repos to scan", options=short_names_merged,
             default=default_selection,
-            key=f"anom_repos_v{_widget_ver}",
+            key=_repos_widget_key,
+        )
+        st.session_state["anom_repos_persist"] = list(picked_short)
+
+    c_cont1, c_cont2 = st.columns([3, 3], gap="medium", vertical_alignment="bottom")
+    with c_cont1:
+        continuous_on = st.toggle(
+            "Continuous analysis",
+            key="anom_continuous_enabled",
+            help="Re-run analysis on the chosen schedule while this page is open.",
+        )
+    with c_cont2:
+        st.selectbox(
+            "Frequency",
+            options=list(CONTINUOUS_FREQ_OPTIONS),
+            key="anom_continuous_freq",
+            disabled=not continuous_on,
         )
 
     run_btn = st.button("Analyze", type="primary",
                         use_container_width=True)
 
+st.session_state["anom_continuous_persist"] = bool(
+    st.session_state.get("anom_continuous_enabled", False)
+)
+st.session_state["anom_continuous_freq_persist"] = st.session_state.get(
+    "anom_continuous_freq", "15 min"
+)
+continuous_on = bool(st.session_state.get("anom_continuous_enabled", False))
+
 active = profiles[labels.index(picked_label)]
 model_id = model_ids[picked_model_idx]
 selected_repos = [f"{gh_org}/{n}" for n in picked_short] if gh_org else []
+if not selected_repos:
+    selected_repos = list(st.session_state.get("anom_selected_repos_persist", []))
+st.session_state["anom_selected_repos_persist"] = list(selected_repos)
 
 with st.sidebar:
     render_sidebar_footer(
@@ -186,6 +244,10 @@ with st.sidebar:
 
 # ---------- session cache ----------
 
+# A fresh page run never has an active scan yet. Clear stale flags left when
+# a prior run was interrupted (e.g. user navigated away mid-scan).
+st.session_state["anom_scan_in_progress"] = False
+
 # Bump this whenever the Action / AnomalyReport schema changes so we don't
 # render stale cached objects that are missing new fields (e.g. `approaches`).
 _SCHEMA_VERSION = "v4-schema-guard"
@@ -197,11 +259,122 @@ report_key = (f"anom::{_SCHEMA_VERSION}::{active.profile}::"
 # profile, sorted repos) so any change to those forces a re-analyze.
 _anom_identity = (_SCHEMA_VERSION, active.profile,
                    tuple(sorted(selected_repos)))
-report = cached_state.get("anom_report", _anom_identity)
+config_key = (
+    f"{active.profile}::{model_id}::{','.join(sorted(selected_repos))}"
+)
+report = st.session_state.get(report_key)
+if report is None:
+    # Try the disk-backed cache first, THEN fall back to the last-run
+    # config match. Disk wins because it survives things session_state
+    # can't (browser restart, server restart, tab crash).
+    report = cached_state.get("anom_report", _anom_identity)
+    if report is None:
+        last_key = st.session_state.get("anom_last_report_key")
+        if (
+            last_key
+            and st.session_state.get("anom_last_config_key") == config_key
+        ):
+            report = st.session_state.get(last_key)
 if report is not None:
     # Mirror onto session_state so downstream code that still reads
-    # `st.session_state[report_key]` (e.g. PR-plan helpers) keeps working.
+    # `st.session_state[report_key]` (PR-plan helpers etc) keeps working
+    # even when we hydrated `report` from the disk cache above.
     st.session_state[report_key] = report
+
+freq_label = st.session_state.get("anom_continuous_freq", "15 min")
+if freq_label not in CONTINUOUS_FREQ_OPTIONS:
+    freq_label = "15 min"
+interval_sec = CONTINUOUS_FREQ_OPTIONS[freq_label]
+
+
+def _format_countdown(seconds: int) -> str:
+    """Live countdown: under 1h → ``2m59s``; 1h+ → ``1:14:59``."""
+    seconds = max(0, int(seconds))
+    if seconds < 3600:
+        mins, secs = divmod(seconds, 60)
+        if mins:
+            return f"{mins}m{secs:02d}s"
+        return f"{secs}s"
+    hours, rem = divmod(seconds, 3600)
+    mins, secs = divmod(rem, 60)
+    return f"{hours}:{mins:02d}:{secs:02d}"
+
+
+def _continuous_config_changed() -> bool:
+    stored = st.session_state.get("anom_continuous_config_key")
+    return stored is not None and stored != config_key
+
+
+def _continuous_interval_elapsed() -> bool:
+    last_run = st.session_state.get("anom_continuous_last_run")
+    if last_run is None:
+        return False
+    return (time.time() - last_run) >= interval_sec
+
+
+def _clear_anomaly_caches() -> None:
+    stale = [k for k in list(st.session_state.keys())
+             if isinstance(k, str) and (
+                 k.startswith("anom::")
+                 or "::pr_plan::" in k
+                 or "::pr_result::" in k
+             )]
+    for k in stale:
+        del st.session_state[k]
+
+
+def _run_anomaly_scan(*, clear_caches: bool = False) -> object | None:
+    if clear_caches:
+        _clear_anomaly_caches()
+
+    st.session_state["anom_scan_in_progress"] = True
+    st.session_state["anom_scan_started_at"] = time.time()
+    try:
+        with st.spinner("Sweeping AWS (~30s) — Cost Explorer, Compute Optimizer, "
+                        "resource inventory…"):
+            try:
+                aws_raw = sweep_account(active.profile)
+                aws_sum = aws_summary(aws_raw)
+            except Exception as e:  # noqa: BLE001
+                callout(f"AWS sweep failed: {e}", tone="error")
+                st.code(traceback.format_exc())
+                return None
+        with st.spinner(f"Sweeping {len(selected_repos)} repo(s) via GitHub…"):
+            try:
+                repo_raw = sweep_repos(selected_repos) if selected_repos else []
+                repo_sum = repo_summary(repo_raw)
+            except Exception as e:  # noqa: BLE001
+                callout(f"Repo sweep failed: {e}", tone="error")
+                st.code(traceback.format_exc())
+                return None
+        with st.spinner("Analyzing with Claude…"):
+            try:
+                scanned = analyze_anomalies(
+                    aws_summary=aws_sum, repo_summary=repo_sum,
+                    profile=active.profile, model_id=model_id,
+                )
+                st.session_state[report_key] = scanned
+                st.session_state[report_key + "::aws"] = aws_sum
+                st.session_state[report_key + "::repo"] = repo_sum
+                st.session_state["anom_continuous_last_run"] = time.time()
+                st.session_state["anom_continuous_config_key"] = config_key
+                st.session_state["anom_last_report_key"] = report_key
+                st.session_state["anom_last_config_key"] = config_key
+                st.session_state["anom_selected_repos_persist"] = list(selected_repos)
+                st.session_state["anom_repos_persist"] = [
+                    r.split("/", 1)[-1] for r in selected_repos
+                ]
+                # Also persist to disk so browser reload / server restart
+                # restores the report instead of forcing a re-scan.
+                cached_state.set("anom_report", _anom_identity, scanned)
+                return scanned
+            except Exception as e:  # noqa: BLE001
+                callout(f"anomaly agent failed: {e}", tone="error")
+                st.code(traceback.format_exc())
+                return None
+    finally:
+        st.session_state["anom_scan_in_progress"] = False
+
 
 # Cross-tab hardening: if the cached report has ANY action missing the
 # `approaches` field, treat it as stale and discard it. This catches the
@@ -231,60 +404,100 @@ if _is_stale(report):
 if st.session_state.pop("anom_autorun", False):
     run_btn = True
 
+# Don't re-run immediately when continuous is turned on and results already
+# exist, or when resuming a session that already has a cached report.
+_was_continuous = st.session_state.get("_anom_continuous_prev", False)
+if continuous_on and not _was_continuous and report is not None:
+    st.session_state["anom_continuous_last_run"] = time.time()
+    st.session_state["anom_continuous_config_key"] = config_key
+elif (
+    continuous_on
+    and report is not None
+    and st.session_state.get("anom_continuous_last_run") is None
+):
+    st.session_state["anom_continuous_last_run"] = time.time()
+    st.session_state["anom_continuous_config_key"] = config_key
+st.session_state["_anom_continuous_prev"] = continuous_on
+
+should_auto_run = (
+    continuous_on
+    and not run_btn
+    and not st.session_state.get("anom_scan_in_progress")
+    and (
+        _continuous_config_changed()
+        or (report is None and st.session_state.get("anom_continuous_last_run") is None)
+        or _continuous_interval_elapsed()
+    )
+)
+
 # Every Analyze click nukes prior anomaly caches — prevents "half-populated
 # from an earlier schema" artifacts. Also clears any siblings (aws/repo).
 if run_btn:
-    stale = [k for k in list(st.session_state.keys())
-             if isinstance(k, str) and (
-                 k.startswith("anom::")
-                 or "::pr_plan::" in k
-                 or "::pr_result::" in k
-             )]
-    for k in stale:
-        del st.session_state[k]
-    report = None
-    with st.spinner("Sweeping AWS (~30s) — Cost Explorer, Compute Optimizer, "
-                    "resource inventory…"):
-        try:
-            aws_raw = sweep_account(active.profile)
-            aws_sum = aws_summary(aws_raw)
-        except Exception as e:  # noqa: BLE001
-            callout(f"AWS sweep failed: {e}", tone="error")
-            st.code(traceback.format_exc())
-            st.stop()
-    with st.spinner(f"Sweeping {len(selected_repos)} repo(s) via GitHub…"):
-        try:
-            repo_raw = sweep_repos(selected_repos) if selected_repos else []
-            repo_sum = repo_summary(repo_raw)
-        except Exception as e:  # noqa: BLE001
-            callout(f"Repo sweep failed: {e}", tone="error")
-            st.code(traceback.format_exc())
-            st.stop()
-    with st.spinner("Analyzing with Claude…"):
-        try:
-            report = analyze_anomalies(
-                aws_summary=aws_sum, repo_summary=repo_sum,
-                profile=active.profile, model_id=model_id,
+    if st.session_state.get("anom_scan_in_progress"):
+        callout("A scan is already running. Please wait for it to finish.", tone="info")
+    else:
+        _clear_anomaly_caches()
+        report = _run_anomaly_scan()
+elif should_auto_run:
+    new_report = _run_anomaly_scan()
+    if new_report is not None:
+        report = new_report
+    elif report is None:
+        report = st.session_state.get(report_key)
+
+if continuous_on:
+
+    @st.fragment(run_every=1)
+    def _continuous_status_tick() -> None:
+        if not st.session_state.get("anom_continuous_enabled"):
+            return
+        if st.session_state.get("anom_scan_in_progress"):
+            st.caption("Continuous analysis · scan in progress…")
+            return
+
+        last_run = st.session_state.get("anom_continuous_last_run")
+        if last_run is None:
+            st.caption("Continuous analysis enabled · preparing first scan…")
+            return
+
+        tick_freq = st.session_state.get("anom_continuous_freq", "15 min")
+        tick_interval = CONTINUOUS_FREQ_OPTIONS.get(tick_freq, 15 * 60)
+        last_txt = datetime.fromtimestamp(last_run).strftime("%H:%M:%S")
+        remaining = int((last_run + tick_interval) - time.time())
+
+        if remaining > 0:
+            st.caption(
+                f"Continuous analysis · last run {last_txt} · "
+                f"next run in {_format_countdown(remaining)}"
             )
-            st.session_state[report_key] = report
-            st.session_state[report_key + "::aws"] = aws_sum
-            st.session_state[report_key + "::repo"] = repo_sum
-            # Also write to the disk-backed cache so a browser reload
-            # / tab switch restores the report instead of starting over.
-            cached_state.set("anom_report", _anom_identity, report)
-        except Exception as e:  # noqa: BLE001
-            callout(f"anomaly agent failed: {e}", tone="error")
-            st.code(traceback.format_exc())
+            return
+
+        st.caption(
+            f"Continuous analysis · last run {last_txt} · "
+            "starting next scan…"
+        )
+        st.rerun()
+
+    _continuous_status_tick()
 
 
 # ---------- render ----------
 
 if report is None:
-    callout(
-        "Pick an AWS profile and repos in the sidebar, then click "
-        "**Analyze**.",
-        tone="info",
-    )
+    if st.session_state.get("anom_scan_in_progress"):
+        callout("Analysis in progress. Results will appear when the scan finishes.", tone="info")
+    elif continuous_on:
+        callout(
+            "Continuous analysis is enabled. The first scan will start "
+            "automatically — or click **Analyze** to run now.",
+            tone="info",
+        )
+    else:
+        callout(
+            "Pick an AWS profile and repos in the sidebar, then click "
+            "**Analyze**.",
+            tone="info",
+        )
     st.stop()
 
 if report.error:
