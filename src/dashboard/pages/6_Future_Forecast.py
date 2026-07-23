@@ -196,8 +196,8 @@ chosen = reachable[labels.index(picked_label)]
 active_profile = chosen.profile
 account_id = chosen.account_id
 
-events, _pending_added = drain_pending_events(account_id)
-flash = pop_import_flash(account_id)
+events, _pending_added = drain_pending_events(active_profile)
+flash = pop_import_flash(active_profile)
 if flash:
     callout(flash["message"], tone=flash.get("tone", "info"))
 elif _pending_added:
@@ -248,10 +248,9 @@ render_pr_import_section(
     widget_ver=_widget_ver,
 )
 render_anomaly_import_section(
-    account_id=account_id,
     active_profile=active_profile,
 )
-events = get_stored_events(account_id)
+events = get_stored_events(active_profile)
 
 trailing_avg = sum(hist_values[-7:]) / min(7, len(hist_values))
 default_cpu = round(trailing_avg / 750, 2) if trailing_avg else 4.53
@@ -286,7 +285,7 @@ render_chart(hist_dates, hist_values, proj, scenario, budget)
 st.divider()
 render_waterfall(proj)
 st.divider()
-render_ledger(proj, account_id, start_day)
+render_ledger(proj, active_profile, start_day)
 
 
 # Snapshot the current view back to disk. Runs at the END of the

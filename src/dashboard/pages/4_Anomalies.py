@@ -668,7 +668,7 @@ if report.actions:
             indices = [report.actions.index(a) for a in filtered]
             incoming = events_from_anomaly_actions(
                 report.actions,
-                account_id=active.account_id,
+                profile=active.profile,
                 report_key=report_key,
                 action_indices=indices,
                 expected_apply=bulk_apply_date,
@@ -677,7 +677,7 @@ if report.actions:
                 callout("No material savings in the shown actions.", tone="warning")
             else:
                 for ev in incoming:
-                    queue_pending_event(active.account_id, ev)
+                    queue_pending_event(active.profile, ev)
                 callout(
                     f"Queued {len(incoming)} event(s) for Future Forecast — open "
                     "that page to review them in the event ledger.",
@@ -728,7 +728,7 @@ if report.actions:
                 ):
                     ev = event_from_anomaly_action(
                         a,
-                        account_id=active.account_id,
+                        profile=active.profile,
                         report_key=report_key,
                         action_idx=action_idx,
                         expected_apply=apply_date,
@@ -736,7 +736,7 @@ if report.actions:
                     if ev is None:
                         callout("No material savings to add to the forecast.", tone="warning")
                     else:
-                        queue_pending_event(active.account_id, ev)
+                        queue_pending_event(active.profile, ev)
                         callout(
                             "Queued for Future Forecast — open that page to "
                             "review and toggle the event in the ledger.",

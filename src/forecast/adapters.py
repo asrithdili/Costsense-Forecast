@@ -132,7 +132,7 @@ def events_from_pr_impacts(impacts: Iterable[PrImpact]) -> list[CostEvent]:
 def event_from_anomaly_action(
     action: Action,
     *,
-    account_id: str,
+    profile: str,
     report_key: str,
     action_idx: int,
     expected_apply: date,
@@ -142,9 +142,9 @@ def event_from_anomaly_action(
     savings = action.est_daily_savings_usd
     if savings < 0.01:
         return None
-    label = (action.issue or action.recommendation or "Cost action").strip()
+    issue = (action.issue or action.recommendation or "Cost action").strip()
     return CostEvent(
-        name=f"Anomaly · {label[:48]}",
+        name=f"Anomaly · {issue}",
         start_date=expected_apply,
         effect=Effect.RAMP if ramp_days else Effect.STEP,
         category="optimization",
@@ -152,15 +152,15 @@ def event_from_anomaly_action(
         ramp_days=ramp_days,
         confidence=confidence_from_string(action.confidence),
         source="anomalies",
-        external_id=f"anomaly:{account_id}:{report_key}:{action_idx}",
-        note=(action.recommendation or action.reason or "")[:200],
+        external_id=f"anomaly:{profile}:{report_key}:{action_idx}",
+        note=(action.recommendation or action.reason or "").strip(),
     )
 
 
 def events_from_anomaly_actions(
     actions: Sequence[Action],
     *,
-    account_id: str,
+    profile: str,
     report_key: str,
     action_indices: Iterable[int],
     expected_apply: date,
@@ -173,7 +173,7 @@ def events_from_anomaly_actions(
             continue
         ev = event_from_anomaly_action(
             actions_list[idx],
-            account_id=account_id,
+            profile=profile,
             report_key=report_key,
             action_idx=idx,
             expected_apply=expected_apply,
@@ -185,11 +185,15 @@ def events_from_anomaly_actions(
 
 
 def find_anomaly_reports_for_profile(profile: str) -> list[tuple[str, AnomalyReport]]:
-    """Cached anomaly scans in session state for ``profile``."""
+    """Cached anomaly scans for ``profile`` (session + disk cache)."""
     import streamlit as st
 
+    from src.dashboard.state_cache import cached_state
+
+    _schema = "v4-schema-guard"
     needle = f"::{profile}::"
-    out: list[tuple[str, AnomalyReport]] = []
+    found: dict[str, AnomalyReport] = {}
+
     for key, value in st.session_state.items():
         if not isinstance(key, str) or not key.startswith("anom::"):
             continue
@@ -199,9 +203,42 @@ def find_anomaly_reports_for_profile(profile: str) -> list[tuple[str, AnomalyRep
             continue
         if value.error or not value.actions:
             continue
-        out.append((key, value))
-    out.sort(key=lambda pair: pair[0], reverse=True)
-    return out
+        found[key] = value
+
+    # Post–PR #18 Anomalies stores scans on disk; hydrate using the same
+    # identity + persisted repos as the Anomalies page.
+    persisted_repos = st.session_state.get("anom_selected_repos_persist", [])
+    if persisted_repos:
+        sorted_repos = sorted(persisted_repos)
+        report_key = f"anom::{_schema}::{profile}::{','.join(sorted_repos)}"
+        if report_key not in found:
+            report = st.session_state.get(report_key)
+            if report is None:
+                report = cached_state.get(
+                    "anom_report",
+                    (_schema, profile, tuple(sorted_repos)),
+                )
+            if (
+                isinstance(report, AnomalyReport)
+                and not report.error
+                and report.actions
+            ):
+                st.session_state[report_key] = report
+                found[report_key] = report
+
+    last_key = st.session_state.get("anom_last_report_key")
+    if (
+        isinstance(last_key, str)
+        and needle in last_key
+        and last_key not in found
+        and not last_key.endswith("::aws")
+        and not last_key.endswith("::repo")
+    ):
+        report = st.session_state.get(last_key)
+        if isinstance(report, AnomalyReport) and not report.error and report.actions:
+            found[last_key] = report
+
+    return sorted(found.items(), key=lambda pair: pair[0], reverse=True)
 
 
 def merge_events(
@@ -222,32 +259,32 @@ def merge_events(
     return merged, added
 
 
-def pending_import_key(account_id: str) -> str:
-    return f"fc_pending_import::{account_id}"
+def pending_import_key(profile: str) -> str:
+    return f"fc_pending_import::{profile}"
 
 
-def queue_pending_event(account_id: str, event: CostEvent) -> None:
+def queue_pending_event(profile: str, event: CostEvent) -> None:
     import streamlit as st
 
-    key = pending_import_key(account_id)
+    key = pending_import_key(profile)
     st.session_state.setdefault(key, []).append(event.to_dict())
 
 
-def drain_pending_events(account_id: str) -> tuple[list[CostEvent], int]:
-    """Merge queued cross-page events into the account event list."""
+def drain_pending_events(profile: str) -> tuple[list[CostEvent], int]:
+    """Merge queued cross-page events into the profile's event list."""
     import streamlit as st
 
     from src.forecast.event_store import get_stored_events, store_events
 
-    key = pending_import_key(account_id)
+    key = pending_import_key(profile)
     pending_raw = st.session_state.pop(key, [])
     if not pending_raw:
-        return get_stored_events(account_id), 0
+        return get_stored_events(profile), 0
     pending = [
         CostEvent.from_dict(p) if isinstance(p, dict) else p
         for p in pending_raw
     ]
-    events = get_stored_events(account_id)
+    events = get_stored_events(profile)
     merged, added = merge_events(events, pending)
-    store_events(account_id, merged)
+    store_events(profile, merged)
     return merged, added

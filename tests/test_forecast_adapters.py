@@ -83,7 +83,7 @@ def test_event_from_anomaly_action_negative_savings():
     )
     ev = event_from_anomaly_action(
         action,
-        account_id="123456789012",
+        profile="my-sandbox-profile",
         report_key="anom::v1::profile::repo",
         action_idx=0,
         expected_apply=date(2026, 8, 1),
@@ -93,7 +93,8 @@ def test_event_from_anomaly_action_negative_savings():
     assert ev.category == "optimization"
     assert ev.confidence == 90.0
     assert ev.source == "anomalies"
-    assert ev.external_id == "anomaly:123456789012:anom::v1::profile::repo:0"
+    assert "Idle EBS volume" in ev.name
+    assert ev.external_id == "anomaly:my-sandbox-profile:anom::v1::profile::repo:0"
 
 
 def test_event_from_pr_predictor_uses_range_midpoint():
