@@ -260,87 +260,115 @@ def _pretty_series_label(raw: str) -> str:
 
 
 def _render_trend(org: OrgSpend) -> None:
-    st.markdown("##### Daily spend")
-    # Top-10 named accounts stacked with an "Other" tail. On a typical
-    # Diligent-scale org this covers ~30-40% of spend with named colour,
-    # keeping the grey Other band a supporting layer rather than the
-    # dominant one.
-    series = org.daily_series(top_n=10)
-    if not series or not org.dates:
-        callout("No daily series available for this window.", tone="info")
+    st.markdown("##### Spend by account")
+    st.caption(
+        f"Total over the last {org.window_days} days, ranked. "
+        "Δ7d compares the trailing 7 days to the 7 before that."
+    )
+
+    # Rank all accounts with spend, take top-10, roll the rest into Other.
+    ranked = [a for a in
+              sorted(org.accounts, key=lambda a: a.total, reverse=True)
+              if a.total > 0]
+    top_accts = ranked[:10]
+    other_accts = ranked[10:]
+    other_total = sum(a.total for a in other_accts)
+    other_delta = sum(a.delta_abs for a in other_accts)
+
+    if not top_accts:
+        callout("No account spend in this window.", tone="info")
         return
 
-    other_values = series.pop("Other", None)
-    # Sort named series by total spend so the legend + stack read
-    # biggest-first — the reader's eye lands on rank #1 immediately.
-    named_items = sorted(
-        series.items(), key=lambda kv: sum(kv[1]), reverse=True,
-    )
+    # Build parallel arrays for the bar chart. Order: biggest at top,
+    # Other at the bottom of the chart (which is the visual bottom
+    # of the ranking, since Plotly's y-axis grows upward).
+    labels: list[str] = []
+    totals: list[float] = []
+    deltas: list[float] = []
+    colors: list[str] = []
+    for a in top_accts:
+        labels.append(_pretty_series_label(a.name or a.account_id))
+        totals.append(a.total)
+        deltas.append(a.delta_abs)
+        colors.append(C.BRAND)
+    if other_accts:
+        labels.append(f"Other ({len(other_accts)} accts)")
+        totals.append(other_total)
+        deltas.append(other_delta)
+        colors.append(C.FAINT)
 
-    # Named accounts get the brand palette. Grey is reserved for Other
-    # so the reader can read the chart at a glance: colour = accountable
-    # account, grey = long tail.
-    palette = [
-        C.BRAND, C.INFO, C.SEV["Medium"], C.SEV["High"], C.BRAND_DARK,
-        C.SEV["Low"], C.SEV["Critical"], "#7A5AF8", "#00B8D4", "#FF7043",
-    ]
+    # Reverse arrays: Plotly's horizontal bar treats first item as
+    # BOTTOM. We want biggest at top, so reverse the built lists.
+    labels = labels[::-1]
+    totals = totals[::-1]
+    deltas = deltas[::-1]
+    colors = colors[::-1]
 
-    fig = go.Figure()
-    for i, (label, values) in enumerate(named_items):
-        color = palette[i % len(palette)]
-        # Rank-prefix the legend label ("#1 …6223") so scanning the
-        # legend and finding a band in the stack is trivial. Order in
-        # the legend matches order in the stack, top-to-bottom.
-        legend_name = f"#{i + 1}  {_pretty_series_label(label)}"
-        fig.add_trace(go.Scatter(
-            x=org.dates, y=values, name=legend_name,
-            mode="lines", stackgroup="spend",
-            line=dict(width=0.5, color=color),
-            fillcolor=color,
-            # Per-series hover only — no `x unified` so we don't stack
-            # 11 lines into a black overflow box on the right edge.
-            hovertemplate="<b>%{fullData.name}</b><br>"
-                          "%{x|%d %b}<br>$%{y:,.0f}<extra></extra>",
+    # Bar text = just the dollar total. Delta arrows go in a separate
+    # annotation so we can colour them green/red per bar.
+    bar_text = [money(t) for t in totals]
+
+    fig = go.Figure(go.Bar(
+        y=labels, x=totals, orientation="h",
+        marker=dict(color=colors, line=dict(width=0)),
+        text=bar_text, textposition="outside",
+        textfont=dict(size=12, color=C.INK),
+        hovertemplate="<b>%{y}</b><br>Total: $%{x:,.0f}<extra></extra>",
+        cliponaxis=False,
+    ))
+
+    # Right-aligned coloured delta annotation for each bar.
+    # (Cost ↑ = red = bad; cost ↓ = green = good — same convention as
+    # the metric tiles elsewhere.)
+    max_total = max(totals) if totals else 1
+    annotations = []
+    for label, total, d in zip(labels, totals, deltas):
+        if abs(d) < 1:
+            continue
+        colour = C.BAD if d > 0 else C.GOOD
+        arrow = "▲" if d > 0 else "▼"
+        # Offset the annotation past the bar's end + past the total text.
+        # ~11 chars of dollar text at ~7px each = ~77px, so 0.08 of
+        # max_total is roughly the space that reads well at most sizes.
+        annotations.append(dict(
+            x=total + max_total * 0.08,
+            y=label,
+            text=f"<b>{arrow} {money(abs(d))}</b>",
+            showarrow=False,
+            xanchor="left",
+            font=dict(size=11, color=colour),
         ))
 
-    if other_values:
-        fig.add_trace(go.Scatter(
-            x=org.dates, y=other_values, name="Other",
-            mode="lines", stackgroup="spend",
-            line=dict(width=0.5, color=C.FAINT),
-            fillcolor=C.FAINT,
-            hovertemplate="<b>Other</b><br>"
-                          "%{x|%d %b}<br>$%{y:,.0f}<extra></extra>",
-        ))
-
-    lay = plotly_layout(height=340)
-    lay["yaxis_title"] = "Daily spend (USD)"
-    # Legend on the RIGHT, vertical single column. On top the legend
-    # wrapped to a second row and shoved the chart down; on the right
-    # it fits cleanly next to the plot and reads top-to-bottom.
-    lay["legend"] = dict(
-        orientation="v", yanchor="top", y=1.0,
-        xanchor="left", x=1.02,
-        font=dict(size=11),
-        bgcolor="rgba(0,0,0,0)",  # transparent
-        itemsizing="constant",
+    # Row height scales with N so bars have breathing room.
+    row_height = 34
+    height = 60 + row_height * len(labels)
+    lay = plotly_layout(height=height)
+    lay["margin"] = dict(l=16, r=180, t=8, b=32)
+    lay["showlegend"] = False
+    lay["xaxis"] = dict(
+        title=f"Spend over {org.window_days} days (USD)",
+        gridcolor=C.HAIRLINE,
+        zerolinecolor=C.HAIRLINE,
+        tickformat="$,.0f",
     )
-    lay["margin"] = dict(l=16, r=200, t=8, b=16)  # room on right for legend
+    lay["yaxis"] = dict(
+        automargin=True,
+        ticksuffix="   ",  # small right-pad so bar starts don't hug labels
+    )
+    lay["annotations"] = annotations
     fig.update_layout(**lay)
-    fig.update_traces(opacity=0.92)
+    fig.update_traces(opacity=0.95)
     st.plotly_chart(fig, use_container_width=True)
 
-    # One-line caption below. Tells the reader whether the coloured
-    # stack IS the story or the grey tail dominates.
-    named_total = sum(sum(v) for _, v in named_items)
-    other_total = sum(other_values) if other_values else 0.0
+    # One-line summary caption calibrated to what's on screen.
+    named_total = sum(a.total for a in top_accts)
     grand = named_total + other_total
     if grand > 0:
-        named_share = named_total / grand * 100
+        share = named_total / grand * 100
         st.caption(
-            f"Top {len(named_items)} accounts = "
-            f"**{named_share:.0f}%** of org spend over this window. "
-            "Coloured bands are named accounts; grey is the long tail."
+            f"Top {len(top_accts)} of {len(ranked)} accounts with spend "
+            f"= **{share:.0f}%** of the total. "
+            "Green/red arrows show week-over-week change."
         )
 
 
