@@ -188,26 +188,77 @@ def _split_resource_finding(f) -> dict:
     }
 
 
+def _rank_open_prs_for_analysis(open_prs: list[OpenPr]) -> list[OpenPr]:
+    """Rank open PRs by 'likely to matter for the near-term forecast'.
+
+    The deep agent takes ~15–60s per PR, so on repos with 20+ open PRs
+    the Dashboard forecast would take 10+ minutes. Instead of analyzing
+    every open PR, we pre-rank by cheap metadata (already fetched by
+    `gh pr list`) and only pass the top N to the LLM.
+
+    Scoring — higher = analyze first:
+      +2.0 if approved & mergeable
+      +1.0 if not draft
+      +0.5 if CI is passing (or hasn't reported failure)
+      +0.5 if updated in the last 3 days ("active" work)
+      -1.0 if draft
+      -1.0 if stalled >30 days
+      -0.5 if CI is failing
+    """
+    def score(pr: OpenPr) -> float:
+        s = 0.0
+        if pr.is_draft:
+            s -= 1.0
+        else:
+            s += 1.0
+        if pr.review_state == "APPROVED":
+            s += 2.0
+        elif pr.review_state == "CHANGES_REQUESTED":
+            s -= 0.5
+        if pr.checks_state == "SUCCESS":
+            s += 0.5
+        elif pr.checks_state == "FAILURE":
+            s -= 0.5
+        if pr.mergeable == "CONFLICTING":
+            s -= 0.5
+        if pr.days_open > 30:
+            s -= 1.0
+        elif pr.days_open <= 3:
+            s += 0.5
+        return s
+
+    return sorted(open_prs, key=lambda pr: (-score(pr), pr.days_open))
+
+
 def analyze_open_prs(
     open_prs: list[OpenPr],
     profile: str | None = None,
     llm_model: str = "us.anthropic.claude-sonnet-4-6",
+    max_prs: int = 8,
 ) -> list[PricedOpenPr]:
-    """Run each open PR through the SAME deep agent the PR Predictor uses.
+    """Run the top ``max_prs`` open PRs through the SAME deep agent the
+    PR Predictor uses (``analyze_pr`` from ``src.ai_agent.agent``).
 
-    This is the ``analyze_pr`` agent from ``src.ai_agent.agent`` — it gets
-    the full toolkit (Cost Explorer, CloudWatch, CloudTrail, rightsizing,
-    resource inventory, plus the ``precedent_lookup`` tool for scope-
-    expansion PRs). Same grounding rules, same verdict schema, same
+    The agent gets the full toolkit (Cost Explorer, CloudWatch, CloudTrail,
+    rightsizing, resource inventory, plus the ``precedent_lookup`` tool for
+    scope-expansion PRs). Same grounding rules, same verdict schema, same
     neutral-verdict tool-call floor as the PR Predictor page.
+
+    Why the cap: each analysis takes ~15–60s. Analyzing 40 open PRs would
+    take 10+ minutes; the top 8 by "likely to merge soon" gives near-full
+    coverage of what actually matters for the near-term forecast in
+    minutes, not hours. See ``_rank_open_prs_for_analysis`` for the
+    ranking heuristic.
 
     Returns priced PRs with merge probability + expected delta. Sorted so
     high-impact PRs land first.
     """
     from src.ai_agent.agent import analyze_pr
 
+    to_analyze = _rank_open_prs_for_analysis(open_prs)[:max_prs]
+
     priced: list[PricedOpenPr] = []
-    for opr in open_prs:
+    for opr in to_analyze:
         try:
             verdict = analyze_pr(
                 opr.url, profile=profile, model_id=llm_model,

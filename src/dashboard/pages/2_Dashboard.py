@@ -498,13 +498,16 @@ with st.spinner(f"Fetching cost history for `{active_profile}`… "
 
 
 # On-demand forecast run
+_MAX_OPEN_PRS_DEEP_ANALYSIS = 8
+
 if do_forecast:
     _run_msg = (
         # Open PRs are analyzed by the SAME deep agent the PR Predictor
-        # page uses (precedent lookup + Cost Explorer + CloudWatch tools),
-        # so this call can take several minutes on repos with many open PRs.
-        f"Deep-analyzing merged + open PRs (this can take a few minutes), "
-        f"then fitting {model_choice}…"
+        # page uses (precedent lookup + Cost Explorer + CloudWatch tools).
+        # We cap it at the top-N most likely to merge soon so we don't
+        # spend 15+ minutes on 40 stale drafts.
+        f"Deep-analyzing merged PRs + top {_MAX_OPEN_PRS_DEEP_ANALYSIS} "
+        f"open PRs, then fitting {model_choice}…"
         if include_pr else
         (f"Calling GetCostForecast for next 7 days…"
          if model_choice == "aws" else
@@ -523,6 +526,7 @@ if do_forecast:
                 service=selected_service,
                 model=model_choice,
                 include_open_prs=include_pr,
+                max_open_prs=_MAX_OPEN_PRS_DEEP_ANALYSIS,
             )
             callout(f"Wrote {Path(out).name}", tone="success")
             st.cache_data.clear()
@@ -557,11 +561,13 @@ if latest:
         if _pr_layer_ran:
             section(
                 "PR layer status",
-                (f"Scanned {len(_repos_scanned)} repo(s). Open PRs went "
-                 "through the same deep agent the PR Predictor uses "
-                 "(precedent lookup + full AWS tool loop). Merged PRs "
-                 "shape the past baseline; open PRs bump the future "
-                 "forecast weighted by merge probability."),
+                (f"Scanned {len(_repos_scanned)} repo(s). Open PRs are "
+                 "ranked by merge readiness (approved + passing CI + "
+                 "recent activity) and the top few go through the same "
+                 "deep agent the PR Predictor uses — precedent lookup + "
+                 "full AWS tool loop. Merged PRs shape the past baseline; "
+                 "open PRs bump the future forecast weighted by merge "
+                 "probability."),
                 kicker="Included",
             )
             pcols = st.columns(3, gap="medium")
