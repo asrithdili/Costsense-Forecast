@@ -35,6 +35,7 @@ Keys are (namespace, *identity) tuples. The disk file lives at
 """
 from __future__ import annotations
 
+import atexit
 import hashlib
 import pickle
 import threading
@@ -46,7 +47,38 @@ import streamlit as st
 
 _ROOT = Path(__file__).resolve().parents[2]
 _UI_STATE_DIR = _ROOT / "data" / "ui_state"
+
+
+def _wipe_ui_state_dir() -> None:
+    """Delete every persisted state file. Called on module import (fresh
+    Streamlit run) and on process exit (graceful shutdown).
+
+    User expectation: stopping Streamlit with Ctrl+C should reset the
+    app's caches so the next run doesn't restore stale values. This
+    trades cross-restart durability for a cleaner start each session —
+    the deliberate trade-off requested for this app."""
+    if not _UI_STATE_DIR.exists():
+        return
+    for path in _UI_STATE_DIR.glob("*.pkl"):
+        try:
+            path.unlink()
+        except OSError:
+            # Nothing we can meaningfully do if a file is locked — the
+            # next startup will retry.
+            pass
+
+
+# Wipe on import — every `streamlit run` starts clean. This catches
+# any shutdown mode (Ctrl+C, kill, crash, power loss) because it
+# runs at the next start rather than depending on a shutdown hook
+# firing.
 _UI_STATE_DIR.mkdir(parents=True, exist_ok=True)
+_wipe_ui_state_dir()
+
+# Also wipe on graceful exit as belt-and-suspenders. atexit fires on
+# Ctrl+C's SIGINT handling; won't fire on SIGKILL / power loss (which
+# is why the startup wipe is the real safety net).
+atexit.register(_wipe_ui_state_dir)
 
 _FILE_LOCK = threading.Lock()
 

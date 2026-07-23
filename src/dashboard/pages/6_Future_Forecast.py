@@ -20,6 +20,7 @@ import streamlit as st
 from src.aws.cost_explorer import fetch_daily_totals
 from src.aws.profiles import ProfileInfo, resolve_all
 from src.dashboard.costsense_theme import callout, section
+from src.dashboard.state_cache import cached_state
 from src.dashboard.forecast_events_ui import (
     render_answer_band,
     render_anomaly_import_section,
@@ -95,6 +96,23 @@ if not reachable:
         tone="error",
     )
     st.stop()
+
+# Disk-backed cache — restores what the user was looking at last time
+# (profile, window, method, scenario, budget, units…) so tab switches,
+# browser reloads, and Streamlit server restarts don't wipe their
+# view. Mirrors the pattern used on PR Predictor + Anomalies pages:
+# seed session_state from disk BEFORE widgets render, save the whole
+# view back at the end.
+_FC_CACHE_KEYS = (
+    "fc_profile", "fc_cutoff", "fc_history_days", "fc_service",
+    "fc_horizon", "fc_method", "fc_scenario", "fc_budget",
+    "fc_units_start", "fc_units_end", "fc_units_ramp",
+)
+_fc_snapshot = cached_state.get("fc_view", ("_",))
+if isinstance(_fc_snapshot, dict):
+    for _k, _v in _fc_snapshot.items():
+        if _k in _FC_CACHE_KEYS and _k not in st.session_state:
+            st.session_state[_k] = _v
 
 labels = [p.label for p in reachable]
 picked_label = st.session_state.get("fc_profile", labels[0])
@@ -269,3 +287,17 @@ st.divider()
 render_waterfall(proj)
 st.divider()
 render_ledger(proj, account_id, start_day)
+
+
+# Snapshot the current view back to disk. Runs at the END of the
+# render so we capture whatever the user just settled on (widget
+# changes trigger a rerun; on that rerun the values are in
+# session_state, and we save them). Non-serializable values (date
+# objects etc.) are converted to ISO strings by pickle transparently.
+_fc_view_snapshot = {
+    k: st.session_state[k]
+    for k in _FC_CACHE_KEYS
+    if k in st.session_state
+}
+if _fc_view_snapshot:
+    cached_state.set("fc_view", ("_",), _fc_view_snapshot)
