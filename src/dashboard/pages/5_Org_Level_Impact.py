@@ -260,10 +260,17 @@ def _pretty_series_label(raw: str) -> str:
 
 
 def _render_trend(org: OrgSpend) -> None:
-    st.markdown("##### Daily spend")
-    st.caption(
-        f"Org total across the last {org.window_days} days, with the "
-        "top 3 accounts broken out. Hover any point for exact values."
+    """Daily-spend chart in the style of professional cost dashboards
+    (Datadog Cost Management, AWS Cost Explorer, Vantage). Structure:
+      - Section title + one-line subtitle
+      - KPI tile row (Total / 7d avg / peak day)
+      - Line chart: bold org total + top-3 accounts overlaid
+    No stacked bands, no giant tooltip overflow, no math-italic prose."""
+    section(
+        "Daily spend",
+        f"Trend across the last {org.window_days} days. "
+        "Top 3 accounts overlaid on the org total.",
+        kicker="Trend",
     )
 
     ranked = [a for a in
@@ -273,18 +280,41 @@ def _render_trend(org: OrgSpend) -> None:
         callout("No daily spend data for this window.", tone="info")
         return
 
-    # Compute the org-total daily series (sum across every account).
+    # Compute org-total daily series (sum across every account).
     n = len(org.dates)
     total_series: list[float] = [0.0] * n
     for a in ranked:
         for i, v in enumerate((a.daily or [])[:n]):
             total_series[i] += v
 
+    # ---- KPI tiles (numbers first, chart second — real dashboards
+    # always lead with totals). Uses the shared metric() helper so it
+    # matches the answer band above.
+    window_total = sum(total_series)
+    last7 = total_series[-7:] if len(total_series) >= 7 else total_series
+    avg_last7 = sum(last7) / len(last7) if last7 else 0.0
+    peak_day_idx = max(range(len(total_series)),
+                        key=lambda i: total_series[i]) if total_series else 0
+    peak_amt = total_series[peak_day_idx] if total_series else 0.0
+    peak_date = org.dates[peak_day_idx] if org.dates else None
+
+    k1, k2, k3 = st.columns(3, gap="medium")
+    with k1:
+        metric(f"Total spend · {org.window_days}d", money(window_total))
+    with k2:
+        metric("Trailing 7-day avg", f"{money(avg_last7)}/day")
+    with k3:
+        metric(
+            "Peak day",
+            money(peak_amt),
+            delta=peak_date.strftime("%d %b") if peak_date else None,
+        )
+
+    # ---- Line chart
     fig = go.Figure()
 
-    # 1. Bold org-total line on top. This is the primary "how much are
-    #    we spending" line — 3px, filled area beneath in soft brand
-    #    tint to give it visual weight without stealing focus.
+    # Org total: bold brand line with soft brand tint filled below.
+    # This is the "primary story" line.
     fig.add_trace(go.Scatter(
         x=org.dates, y=total_series,
         name="Org total",
@@ -296,8 +326,8 @@ def _render_trend(org: OrgSpend) -> None:
                       "<b>$%{y:,.0f}</b><extra></extra>",
     ))
 
-    # 2. Top-3 accounts as thinner colored lines. Explicit named
-    #    accounts so the reader can see WHICH accounts drive the total.
+    # Top-3 named accounts as thinner supporting lines. Not filled —
+    # keeps them visually secondary to the org-total.
     line_palette = [C.INFO, C.SEV["Medium"], C.SEV["High"]]
     for i, acct in enumerate(ranked[:3]):
         color = line_palette[i]
@@ -312,16 +342,19 @@ def _render_trend(org: OrgSpend) -> None:
                           "$%{y:,.0f}<extra></extra>",
         ))
 
-    lay = plotly_layout(height=340)
-    lay["yaxis_title"] = "Daily spend (USD)"
+    lay = plotly_layout(height=300)
     lay["yaxis"] = dict(
-        title=dict(text="Daily spend (USD)", font=dict(size=11, color=C.MUTED)),
+        title=dict(text="Daily spend (USD)",
+                   font=dict(size=11, color=C.MUTED)),
         gridcolor=C.HAIRLINE, zerolinecolor=C.HAIRLINE,
         tickformat="$,.0f",
+        rangemode="tozero",
     )
     lay["xaxis"] = dict(
         gridcolor=C.HAIRLINE, zerolinecolor=C.HAIRLINE,
         tickformat="%d %b",
+        showspikes=True, spikemode="across", spikesnap="cursor",
+        spikedash="dot", spikecolor=C.FAINT, spikethickness=1,
     )
     lay["legend"] = dict(
         orientation="h",
@@ -330,25 +363,13 @@ def _render_trend(org: OrgSpend) -> None:
         font=dict(size=11),
         bgcolor="rgba(0,0,0,0)",
     )
-    lay["margin"] = dict(l=16, r=24, t=52, b=32)
-    lay["hovermode"] = "x unified"
+    lay["margin"] = dict(l=16, r=24, t=44, b=32)
+    # Per-series hover (NOT x-unified) — with 4 series a unified
+    # tooltip renders a big black box on the right edge. Individual
+    # hovers keep the chart clean.
+    lay["hovermode"] = "closest"
     fig.update_layout(**lay)
     st.plotly_chart(fig, use_container_width=True)
-
-    # Small numeric summary line beneath the chart so the reader has
-    # a concrete anchor: current run rate + biggest single-day spike.
-    if total_series:
-        last7 = total_series[-7:] if len(total_series) >= 7 else total_series
-        avg_last7 = sum(last7) / len(last7) if last7 else 0.0
-        peak_day_idx = max(range(len(total_series)),
-                            key=lambda i: total_series[i])
-        peak_amt = total_series[peak_day_idx]
-        peak_date = org.dates[peak_day_idx]
-        st.caption(
-            f"Trailing 7-day average: **{money(avg_last7)}/day**  ·  "
-            f"peak day in window: **{money(peak_amt)}** on "
-            f"{peak_date:%d %b}"
-        )
 
 
 _render_trend(org)
