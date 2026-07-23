@@ -390,24 +390,135 @@ class CostExplorerProvider:
         "name": ("Name", "AccountName", "name", "DisplayName"),
     }
 
-    def _tags_to_owner(self, tags: Dict[str, str],
-                        account_id: str) -> Dict[str, str]:
-        """Map an account's raw tag dict onto our owner shape. Missing
-        fields fall through to the static owners map, then to Unallocated."""
+    # Common environment tokens seen in AWS account names. Order matters:
+    # longer/more specific tokens first so 'preprod' doesn't collide with
+    # 'prod' when both would match.
+    _ENV_TOKENS = [
+        ("preprod", "preprod"), ("staging", "staging"), ("stage", "staging"),
+        ("nonprod", "nonprod"), ("dev", "dev"), ("test", "test"),
+        ("qa", "qa"), ("sandbox", "sandbox"), ("sbx", "sandbox"),
+        ("tools", "tools"), ("shared", "shared"),
+        ("prod", "prod"), ("prd", "prod"),
+    ]
+    # Team-name prefixes we know about. Extend this — or replace with a
+    # `Team=` tag — when we get real tagging in place.
+    _TEAM_PREFIX = {
+        "dp": "Data platform",
+        "dp-team-3pm": "Data platform",
+        "gov": "Governance",
+        "audit": "Audit",
+        "shared": "Shared services",
+        "control-tower": "Platform",
+        "connector-service": "Connector service",
+        "risk-manager": "Risk manager",
+        "data-platform": "Data platform",
+    }
+
+    def _parse_account_name(self, name: str) -> Dict[str, str]:
+        """Best-effort ownership inference from just an account name.
+
+        Handles Diligent-style names like 'dp-team-3pm-nonprod',
+        'diligent-audit-prod-eu', 'control-tower'. Returns only the fields
+        we could infer — never fabricates a team from thin air. Used as a
+        second-tier fallback after tags/static map.
+        """
+        if not name:
+            return {}
+        lower = name.lower()
+
+        picked: Dict[str, str] = {"name": name}
+
+        # Environment: match against known tokens, longest first.
+        for token, canonical in self._ENV_TOKENS:
+            if f"-{token}-" in f"-{lower}-":
+                picked["environment"] = canonical
+                break
+
+        # Team: longest prefix match. Try progressively shorter prefixes
+        # of the hyphenated name — 'dp-team-3pm-nonprod' checks
+        # 'dp-team-3pm-nonprod' → 'dp-team-3pm' → 'dp-team' → 'dp'.
+        parts = lower.split("-")
+        # Skip 'diligent' if it's the first segment — it's a global brand
+        # prefix that adds no ownership info.
+        if parts and parts[0] in ("diligent", "dil"):
+            parts = parts[1:]
+        for i in range(len(parts), 0, -1):
+            candidate = "-".join(parts[:i])
+            if candidate in self._TEAM_PREFIX:
+                picked["team"] = self._TEAM_PREFIX[candidate]
+                break
+
+        return picked
+
+    def _tags_to_owner(
+        self,
+        tags: Dict[str, str],
+        account_id: str,
+        account_meta: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
+        """Map an account's tags → owner shape. Ownership precedence:
+          1. Explicit tags (Team, OU, Environment, Name…)
+          2. Account NAME from Organizations, parsed for team+environment
+          3. Static DEFAULT_OWNERS map
+          4. Unallocated (still surfaced — a tagging-hygiene signal)
+        """
         static = resolve_owner(account_id, self.owners)
+        parsed = self._parse_account_name(
+            (account_meta or {}).get("name", "")
+        )
+
         picked: Dict[str, str] = {}
         for role, aliases in self._TAG_ALIASES.items():
             for key in aliases:
                 if key in tags and tags[key]:
                     picked[role] = tags[key]
                     break
+
         return {
-            "name": picked.get("name") or static.get("name", account_id),
-            "team": picked.get("team") or static.get("team", "Unallocated"),
+            "name": (
+                picked.get("name")
+                or parsed.get("name")
+                or static.get("name", account_id)
+            ),
+            "team": (
+                picked.get("team")
+                or parsed.get("team")
+                or static.get("team", "Unallocated")
+            ),
             "ou": picked.get("ou") or static.get("ou", "Unallocated"),
-            "environment": (picked.get("environment") or
-                             static.get("environment", "unknown")),
+            "environment": (
+                picked.get("environment")
+                or parsed.get("environment")
+                or static.get("environment", "unknown")
+            ),
         }
+
+    def _fetch_org_account_meta(
+        self, profile: str,
+    ) -> Dict[str, Dict[str, str]]:
+        """One paginated call to organizations:ListAccounts.
+
+        Returns {account_id: {"name": "...", "email": "...", "status": "..."}}
+        for every account in the org. This is nearly always granted on payer
+        roles (unlike ListTagsForResource which frequently isn't), and the
+        Name field is usually already meaningful — e.g. 'dp-team-3pm-nonprod'
+        or 'diligent-audit-prod-eu' — so we can use it as an ownership
+        fallback even when tags are empty.
+        """
+        try:
+            orgs = self._client(profile, "organizations")
+            paginator = orgs.get_paginator("list_accounts")
+            out: Dict[str, Dict[str, str]] = {}
+            for page in paginator.paginate():
+                for a in page.get("Accounts", []):
+                    out[a["Id"]] = {
+                        "name": a.get("Name", "") or "",
+                        "email": a.get("Email", "") or "",
+                        "status": a.get("Status", "") or "",
+                    }
+            return out
+        except Exception:  # noqa: BLE001
+            return {}
 
     def _fetch_org_tags_bulk(
         self, profile: str, account_ids: List[str],
@@ -476,25 +587,34 @@ class CostExplorerProvider:
 
         dates = [start + timedelta(days=i) for i in range(window_days)]
 
-        # Pull real ownership tags from AWS Organizations first. The
-        # static owners map (DEFAULT_OWNERS) is only used as a fallback
-        # for accounts that don't have the expected tag keys. This is
-        # what makes the Team / OU / Environment charts actually differ
-        # from each other — without real tags, everything was collapsing
-        # into a single Unallocated bar.
+        # Ownership signal has three tiers (best to worst):
+        #   1. Real AWS tags (organizations:ListTagsForResource per account,
+        #      in parallel). Requires the payer to have this permission —
+        #      NOT granted by default on many Diligent payer roles.
+        #   2. Account NAMES from organizations:ListAccounts (single
+        #      paginated call). ~always granted on payer roles, and
+        #      Diligent-style names like 'dp-team-3pm-nonprod' already
+        #      encode team + environment. This is what stops every
+        #      account from showing 'Unallocated' when tag reads are
+        #      denied.
+        #   3. Static DEFAULT_OWNERS map — hand-curated fallback for a
+        #      few known account IDs.
         account_ids = list(daily_by_account.keys())
+        account_meta = self._fetch_org_account_meta(profile)
         tags_by_account: Dict[str, Dict[str, str]] = (
             self._fetch_org_tags_bulk(profile, account_ids)
             if self.fetch_org_tags else {}
         )
 
         # Build the account list without service mix (fast — no extra
-        # Cost Explorer calls). Ownership comes from fetched tags with
-        # static-map fallback via _tags_to_owner().
+        # Cost Explorer calls). Ownership comes from tags → account name
+        # → static map, cascading via _tags_to_owner().
         accounts: List[AccountSpend] = []
         for acct_id, by_day in daily_by_account.items():
             owner = self._tags_to_owner(
-                tags_by_account.get(acct_id, {}), acct_id,
+                tags_by_account.get(acct_id, {}),
+                acct_id,
+                account_meta.get(acct_id),
             )
             daily = [by_day.get(d.isoformat(), 0.0) for d in dates]
             accounts.append(AccountSpend(
@@ -529,13 +649,11 @@ class CostExplorerProvider:
             for acct in accounts:
                 acct.services = mix_by_account.get(acct.account_id, {})
 
-        linked = len(accounts)
-        try:
-            orgs = self._client(profile, "organizations")
-            paginator = orgs.get_paginator("list_accounts")
-            linked = sum(len(p["Accounts"]) for p in paginator.paginate())
-        except Exception:
-            pass  # not a payer account, or no org permissions — degrade quietly
+        # Prefer the org's authoritative account count if we already have
+        # it from _fetch_org_account_meta (single call above). Falls back
+        # to counting accounts with spend when the payer profile can't
+        # reach Organizations.
+        linked = len(account_meta) or len(accounts)
 
         data_through = end - timedelta(days=1)
         mtd = sum(
