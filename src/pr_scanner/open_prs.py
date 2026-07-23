@@ -257,19 +257,21 @@ def analyze_open_prs(
 
     to_analyze = _rank_open_prs_for_analysis(open_prs)[:max_prs]
 
-    priced: list[PricedOpenPr] = []
-    for opr in to_analyze:
+    def _analyze_one(opr: OpenPr) -> PricedOpenPr | None:
+        """Deep-analyze one open PR. Runs in a worker thread — the
+        precedent context inside analyze_pr uses threading.local() so
+        parallel calls don't clobber each other."""
         try:
             verdict = analyze_pr(
                 opr.url, profile=profile, model_id=llm_model,
             )
         except Exception:  # noqa: BLE001
-            continue
+            return None
 
         # If the agent bailed with an error, skip this PR — better to have
         # no signal than a fabricated one.
         if getattr(verdict, "error", None):
-            continue
+            return None
 
         est = float(verdict.est_daily_delta_usd or 0.0)
         direction = str(
@@ -280,7 +282,7 @@ def analyze_open_prs(
         )
         prob = estimate_merge_probability(opr)
         merge_day = expected_merge_date(opr, prob)
-        priced.append(PricedOpenPr(
+        return PricedOpenPr(
             open_pr=opr,
             est_daily_delta_usd=round(est, 4),
             direction=direction,
@@ -292,7 +294,25 @@ def analyze_open_prs(
                 _split_resource_finding(f)
                 for f in (verdict.findings or [])
             ],
-        ))
+        )
+
+    # Fan out across threads: Bedrock InvokeModel is I/O bound, and each
+    # analyze_pr is an independent tool-use loop. Cap concurrency at 4 so
+    # we don't hammer Bedrock's rate limits — with the top-8 cap above,
+    # 4 workers × ~30s per PR = ~60s wall-clock instead of ~4 min serial.
+    workers = min(4, len(to_analyze) or 1)
+    priced: list[PricedOpenPr] = []
+    if workers <= 1:
+        for opr in to_analyze:
+            p = _analyze_one(opr)
+            if p is not None:
+                priced.append(p)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for p in pool.map(_analyze_one, to_analyze):
+                if p is not None:
+                    priced.append(p)
+
     priced.sort(key=lambda p: -abs(p.expected_daily_delta_usd))
     return priced
 

@@ -504,10 +504,10 @@ if do_forecast:
     _run_msg = (
         # Open PRs are analyzed by the SAME deep agent the PR Predictor
         # page uses (precedent lookup + Cost Explorer + CloudWatch tools).
-        # We cap it at the top-N most likely to merge soon so we don't
-        # spend 15+ minutes on 40 stale drafts.
+        # We cap it at the top-N most likely to merge soon and run them
+        # 4-at-a-time to keep wall-clock around a minute or two.
         f"Deep-analyzing merged PRs + top {_MAX_OPEN_PRS_DEEP_ANALYSIS} "
-        f"open PRs, then fitting {model_choice}…"
+        f"open PRs in parallel, then fitting {model_choice}…"
         if include_pr else
         (f"Calling GetCostForecast for next 7 days…"
          if model_choice == "aws" else
