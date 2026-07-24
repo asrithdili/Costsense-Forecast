@@ -73,7 +73,17 @@ No initial inline policies needed — `deploy-public-ecr.sh` attaches
 `costsense-readonly` via `iam:PutRolePolicy` (allowed by the SCP) on
 every run.
 
-## Deploying manually
+## Current live deployment
+
+| | |
+|---|---|
+| URL | https://pma8dqvi4m.us-west-2.awsapprunner.com |
+| Account | 609400232087 (hackfest) |
+| Region | us-west-2 |
+| Service ARN | `arn:aws:apprunner:us-west-2:609400232087:service/costsense/0b806d58770943eab615538073a624c2` |
+| Instance role | `golden-thread-hackathon-instance-role` |
+
+## Deploying manually (Linux / macOS)
 
 ```bash
 # Log in first (SSO)
@@ -91,6 +101,134 @@ Successful run ends with a `https://<hash>.us-west-2.awsapprunner.com`
 URL printed. Wait ~2 minutes after the script prints RUNNING for the
 first HTTP request to succeed — App Runner takes a moment past
 "Running" to be reachable externally.
+
+## Deploying manually from Windows with Rancher Desktop
+
+On Diligent-managed Windows machines the default `docker_engine` named
+pipe is held by Docker Desktop, whose daemon is blocked by an org SSO
+policy that we can't dismiss from a script. Rancher Desktop provides a
+working Docker-compatible daemon that lives inside a WSL2 distro. The
+deploy script can't run end-to-end as one shell command because
+`docker` (inside Rancher's WSL) and `aws` (on Windows, holding the
+SSO session) live in different environments — but the same 5 steps
+work if you drive them explicitly.
+
+### One-time setup
+
+1. **Install Rancher Desktop** and launch it. In **Preferences →
+   Container Engine** confirm the runtime is `dockerd (moby)`.
+2. **Quit Docker Desktop** if it's running (right-click whale icon in
+   the system tray → Quit Docker Desktop). This isn't strictly required
+   — Rancher works via WSL regardless — but leaving Docker Desktop
+   running only wastes memory.
+3. Verify Rancher's WSL distro is reachable:
+   ```bash
+   wsl -d rancher-desktop -- docker info --format 'os={{.OperatingSystem}}'
+   # expect: os=Rancher Desktop WSL Distribution   (or similar)
+   ```
+
+### Two Rancher WSL fixups that keep coming up
+
+Both are done inside Rancher's WSL distro, non-persistent — apply
+per-shell before running docker.
+
+**A. Credential helper isn't installed.** Rancher's default config
+sets `credsStore=secretservice` but that helper isn't shipped. Point
+to a per-invocation config with credsStore="none":
+
+```bash
+wsl -d rancher-desktop -- sh -c '
+  mkdir -p /tmp/dcfg
+  echo "{\"credsStore\":\"none\"}" > /tmp/dcfg/config.json
+'
+# then run every docker call with DOCKER_CONFIG=/tmp/dcfg
+```
+
+**B. Rancher's internal DNS proxy is often dead.** `/etc/resolv.conf`
+inside the distro points at `192.168.127.1` which frequently times
+out. Override to a public resolver:
+
+```bash
+wsl -d rancher-desktop -- sh -c '
+  echo "nameserver 8.8.8.8" > /etc/resolv.conf
+  echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+'
+```
+
+### The five steps (Windows + Rancher path)
+
+```bash
+# All aws commands run on Windows (SSO session lives there)
+export AWS_PROFILE=dil-team-hackfest
+export AWS_REGION=us-west-2
+IMAGE_TAG="$(date +%Y-%m-%d)-01"   # or any unique string
+
+# --- Step 0: verify instance role ---------------------------------
+ROLE_ARN=$(aws iam get-role --role-name golden-thread-hackathon-instance-role \
+  --query 'Role.Arn' --output text)
+
+# --- Step 1a: ensure public ECR repo in us-east-1 -----------------
+aws ecr-public describe-repositories --region us-east-1 --repository-names costsense \
+  >/dev/null 2>&1 \
+  || aws ecr-public create-repository --region us-east-1 --repository-name costsense >/dev/null
+REGISTRY_URI=$(aws ecr-public describe-registries --region us-east-1 \
+  --query 'registries[0].registryUri' --output text)
+IMAGE_URI="$REGISTRY_URI/costsense:$IMAGE_TAG"
+
+# --- Step 1b: attach IAM policy to the pre-existing instance role -
+aws iam put-role-policy --role-name golden-thread-hackathon-instance-role \
+  --policy-name costsense-readonly \
+  --policy-document file://infra/instance-role-policy.json
+
+# --- Step 2: docker build inside Rancher's WSL --------------------
+MSYS_NO_PATHCONV=1 wsl -d rancher-desktop -- sh -c "
+  mkdir -p /tmp/dcfg
+  echo '{\"credsStore\":\"none\"}' > /tmp/dcfg/config.json
+  echo 'nameserver 8.8.8.8' > /etc/resolv.conf
+  cd /mnt/c/Users/<you>/Documents/hackathon/costsense-forecast &&
+  DOCKER_CONFIG=/tmp/dcfg docker build --platform linux/amd64 --load \
+    -f Dockerfile -t $IMAGE_URI .
+"
+
+# --- Step 3: login + push (login password fetched on Windows,     -
+#              piped into wsl docker) -----------------------------
+aws ecr-public get-login-password --region us-east-1 \
+  | MSYS_NO_PATHCONV=1 wsl -d rancher-desktop -- sh -c '
+      DOCKER_CONFIG=/tmp/dcfg docker login --username AWS \
+        --password-stdin public.ecr.aws
+    '
+MSYS_NO_PATHCONV=1 wsl -d rancher-desktop -- sh -c "
+  DOCKER_CONFIG=/tmp/dcfg docker push $IMAGE_URI
+"
+
+# --- Step 4: create OR update App Runner service ------------------
+SERVICE_ARN=$(aws apprunner list-services --region us-west-2 \
+  --query \"ServiceSummaryList[?ServiceName=='costsense'].ServiceArn | [0]\" \
+  --output text)
+
+if [ -z "$SERVICE_ARN" ] || [ "$SERVICE_ARN" = "None" ]; then
+  # first-time create — see infra/deploy-public-ecr.sh step 4 for
+  # the full source/instance/health config JSON
+  ./infra/deploy-public-ecr.sh "$IMAGE_TAG"   # or run create-service inline
+else
+  # subsequent update
+  aws apprunner update-service --region us-west-2 --service-arn "$SERVICE_ARN" \
+    --source-configuration "{ ...ImageIdentifier=$IMAGE_URI... }"
+  aws apprunner start-deployment --region us-west-2 --service-arn "$SERVICE_ARN"
+fi
+
+# --- Step 5: wait for RUNNING -------------------------------------
+aws apprunner describe-service --region us-west-2 --service-arn "$SERVICE_ARN" \
+  --query 'Service.[Status,ServiceUrl]' --output text
+```
+
+In practice the script `infra/deploy-public-ecr.sh` handles all of
+this in one command on Linux/macOS. Windows-with-Rancher requires
+the explicit split above because `docker` and `aws` are on different
+sides. The GitHub Actions workflow in
+`.github/workflows/deploy-apprunner.yml` also runs the script as a
+single command — it uses ubuntu-latest where docker and aws are
+co-located.
 
 ## Two gotchas that will waste hours
 
@@ -129,12 +267,16 @@ the only region public ECR exists in, regardless of `AWS_REGION`.
 | 4 | Create or update the App Runner service in us-west-2 | Idempotent — same script for first deploy and updates |
 | 5 | Poll `describe-service` until RUNNING, print URL | Up to 15 min timeout |
 
-## Rollback
+## Rollback and teardown
+
+### Roll back to a previous image tag
 
 App Runner keeps the last several image tags in the service config
 history. To roll back, redeploy the previous tag:
 
 ```bash
+export AWS_PROFILE=dil-team-hackfest
+
 # Find previous tags
 aws ecr-public describe-images \
   --region us-east-1 \
@@ -148,6 +290,48 @@ AWS_REGION=us-west-2 ./infra/deploy-public-ecr.sh <old-tag>
 Because the script always ends with `start-deployment`, rolling forward
 to an existing tag DOES re-pull the image (even though App Runner
 normally wouldn't). That's belt-and-suspenders for exactly this case.
+
+### Full teardown (destructive — irreversible)
+
+Removes the App Runner service, the public ECR repo, and the inline
+IAM policy this deploy attached. Leaves the reused
+`golden-thread-hackathon-instance-role` intact along with its
+golden-thread policies (`bedrock-invoke`, `golden-thread-datalake-secret`,
+`golden-thread-selections-ddb`).
+
+```bash
+export AWS_PROFILE=dil-team-hackfest
+
+# 1. Delete the App Runner service (async, takes ~5 min)
+aws apprunner delete-service --region us-west-2 \
+  --service-arn arn:aws:apprunner:us-west-2:609400232087:service/costsense/0b806d58770943eab615538073a624c2
+
+# 2. Delete the public ECR repo and every image tag in it (irreversible)
+aws ecr-public delete-repository --region us-east-1 \
+  --repository-name costsense --force
+
+# 3. Detach the costsense inline policy from the reused instance role.
+#    IMPORTANT: this leaves golden-thread's own policies untouched.
+aws iam delete-role-policy \
+  --role-name golden-thread-hackathon-instance-role \
+  --policy-name costsense-readonly
+```
+
+Verify nothing costsense-shaped remains:
+
+```bash
+aws apprunner list-services --region us-west-2 \
+  --query "ServiceSummaryList[?ServiceName=='costsense']"
+# expect: []
+
+aws ecr-public describe-repositories --region us-east-1 --repository-names costsense
+# expect: RepositoryNotFoundException
+
+aws iam list-role-policies --role-name golden-thread-hackathon-instance-role \
+  --query 'PolicyNames'
+# expect: ["bedrock-invoke","golden-thread-datalake-secret","golden-thread-selections-ddb"]
+# (i.e. NO "costsense-readonly")
+```
 
 ## CI
 
