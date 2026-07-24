@@ -677,6 +677,66 @@ def _apply_hallucination_guard(
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _format_bedrock_error(
+    exc: Exception,
+    profile: str | None,
+    account_id: str | None,
+    model_id: str,
+) -> str:
+    """Translate a raw Bedrock InvokeModel failure into a user-facing
+    string that names the underlying cause plainly. The most common
+    surprise for users is that a role legitimately does not have
+    ``bedrock:InvokeModel`` — the raw stack trace reads like a crash,
+    but the honest answer is "this profile can't reach Bedrock, switch
+    profiles."
+
+    We keep the raw error inline (in a "Details" tail) so nothing is
+    hidden, but lead with the plain-language explanation."""
+    text = str(exc)
+    lowered = text.lower()
+    scope = (
+        f"profile `{profile}` (account {account_id})"
+        if account_id else f"profile `{profile or '(none)'}`"
+    )
+
+    if "bedrock:invokemodel" in lowered and (
+        "accessdenied" in lowered
+        or "not authorized to perform" in lowered
+    ):
+        return (
+            f"**Bedrock model access denied for this account.** "
+            f"{scope} does not have permission to call "
+            f"`bedrock:InvokeModel` on `{model_id}`. This is an IAM "
+            f"policy on the AWS side, not a bug in the app.\n\n"
+            f"To use the chatbot, switch to a profile whose account "
+            f"has Bedrock enabled (a data-platform or AI-enabled "
+            f"account in your org — ask an admin if you're unsure). "
+            f"AWS tabs like Dashboard, Anomalies, and Close the Loop "
+            f"still work on this profile — they don't call Bedrock "
+            f"directly.\n\n"
+            f"AWS error detail: {text}"
+        )
+
+    if "expiredtoken" in lowered or "unrecognizedclientexception" in lowered:
+        return (
+            f"**AWS session for {scope} has expired.** "
+            f"Run `aws sso login --profile {profile}` and try again.\n\n"
+            f"AWS error detail: {text}"
+        )
+
+    if "modelnotreadyexception" in lowered or "throttling" in lowered:
+        return (
+            f"**Bedrock is throttling or the model isn't ready.** "
+            f"Try again in a few seconds — this is a transient AWS "
+            f"issue, not a permission problem.\n\n"
+            f"AWS error detail: {text}"
+        )
+
+    # Fallback: keep the original message so we don't lose signal on
+    # unfamiliar failure modes.
+    return f"bedrock invoke failed: {text}"
+
+
 def _detect_github_read_available() -> bool:
     """True when the chat page can plausibly reach GitHub — either a
     GITHUB_TOKEN/GH_TOKEN is set OR the `gh` CLI is on PATH. This mirrors
@@ -760,7 +820,9 @@ def chat_step(
             )
             payload = json.loads(resp["body"].read())
         except Exception as e:  # noqa: BLE001
-            return ChatTurn(reply="", error=f"bedrock invoke failed: {e}",
+            return ChatTurn(reply="", error=_format_bedrock_error(
+                                e, profile, account_id, model_id,
+                            ),
                             model_id=model_id,
                             updated_history=history + [
                                 {"role": "user", "content": user_msg}])
