@@ -124,7 +124,15 @@ def _values_grounded(chart: dict, tool_numbers: set[float]) -> tuple[bool, list[
     every series shows up in ``tool_numbers`` at 4dp. offending_values
     lists the first few values that failed — used for the warning banner
     so the user (and we during debugging) can see exactly what mismatched.
+
+    Prediction charts (with ``prediction_basis``) are skipped here — their
+    "Change" and "Projected" bars are DERIVED from historical values,
+    so they naturally don't appear in tool_results. Those charts are
+    ground-checked instead via ``_prediction_grounded`` on their
+    ``prediction_basis`` inputs (which DO need to come from tool_results).
     """
+    if "prediction_basis" in chart:
+        return True, []
     offending: list[float] = []
     for series in chart.get("series", []):
         for y in series.get("y", []):
@@ -166,7 +174,101 @@ def _schema_ok(chart: dict) -> tuple[bool, str]:
                 f"series[{i}] x/y length mismatch: "
                 f"{len(s['x'])} vs {len(s['y'])}"
             )
+
+    # If the chart claims to be a prediction (has `prediction_basis`), it
+    # must be a 3-bar Current/Change/Projected shape. The three x-labels
+    # are how the arithmetic guard finds the values it should reconcile.
+    basis = chart.get("prediction_basis")
+    if basis is not None:
+        if not isinstance(basis, dict):
+            return False, "prediction_basis must be an object"
+        if ctype != "bar":
+            return False, "prediction charts must be type=bar"
+        if len(series) != 1:
+            return False, (
+                f"prediction charts must have exactly one series; "
+                f"got {len(series)}"
+            )
+        xs = [str(x).strip().lower() for x in series[0]["x"]]
+        if xs != ["current", "change", "projected"]:
+            return False, (
+                f"prediction chart x-labels must be exactly "
+                f"['Current', 'Change', 'Projected']; got {series[0]['x']}"
+            )
+        for field in ("current_grounding", "rate_grounding"):
+            if not isinstance(basis.get(field), list):
+                return False, f"prediction_basis.{field} must be a list"
+        if not isinstance(basis.get("note"), str) or not basis["note"].strip():
+            return False, "prediction_basis.note must be a non-empty string"
     return True, ""
+
+
+def _prediction_arithmetic_ok(
+    chart: dict,
+) -> tuple[bool, str]:
+    """When `prediction_basis` is present, verify the third bar equals the
+    first + second (within $0.50 or 1%). LLMs get this wrong more often
+    than you'd expect — the point of the check is to catch cases where
+    the "Projected" number was computed by a different path than the
+    displayed "Change".
+    """
+    if "prediction_basis" not in chart:
+        return True, ""
+    series = chart["series"][0]
+    y = series["y"]
+    if len(y) != 3:
+        return False, f"prediction chart must have 3 bars, got {len(y)}"
+    try:
+        current = float(y[0])
+        change = float(y[1])
+        projected = float(y[2])
+    except (TypeError, ValueError):
+        return False, "prediction chart bars must be numeric"
+    expected = current + change
+    tolerance = max(0.50, abs(expected) * 0.01)
+    if abs(projected - expected) > tolerance:
+        return False, (
+            f"arithmetic mismatch: Current ({current:.2f}) + Change "
+            f"({change:+.2f}) = {expected:.2f}, but Projected shown as "
+            f"{projected:.2f} (diff {projected - expected:+.2f} exceeds "
+            f"tolerance ${tolerance:.2f})"
+        )
+    return True, ""
+
+
+def _prediction_grounded(
+    chart: dict, tool_numbers: set[float],
+) -> tuple[bool, list[float]]:
+    """When `prediction_basis` is present, verify that every value in
+    both `current_grounding` and `rate_grounding` appears in the tool
+    outputs from this turn.
+
+    We don't check the bars' own y-values here because the "Change" and
+    "Projected" bars are derived and will not naturally appear in a raw
+    tool_result. Instead we check the inputs the model claims to have
+    used — that's what could be fabricated.
+    """
+    if "prediction_basis" not in chart:
+        return True, []
+    basis = chart["prediction_basis"]
+    offending: list[float] = []
+    for field in ("current_grounding", "rate_grounding"):
+        for v in basis.get(field, []):
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                offending.append(v)
+                continue
+            rounded = round(float(v), 4)
+            if rounded in tool_numbers:
+                continue
+            tolerated = any(
+                abs(rounded - t) <= max(0.01, abs(t) * 0.01)
+                for t in tool_numbers
+            )
+            if not tolerated:
+                offending.append(v)
+                if len(offending) >= 5:
+                    return False, offending
+    return len(offending) == 0, offending
 
 
 def _build_figure(chart: dict) -> go.Figure:
@@ -229,6 +331,33 @@ def render_charts_inline(
             )
             continue
 
+        # For prediction charts, verify the derived arithmetic AND that
+        # the model's `prediction_basis` inputs came from tool_results.
+        # For regular charts, verify every y value came from a tool_result.
+        # Order matters: schema first (cheapest), then arithmetic (pure
+        # math on the chart), then grounding (walks tool_results).
+        arith_ok, arith_err = _prediction_arithmetic_ok(chart)
+        if not arith_ok:
+            st.warning(
+                f"**Chart {i} suppressed — arithmetic error.** {arith_err}. "
+                f"Prediction charts must satisfy Projected = Current + "
+                f"Change. The bot's numbers don't add up, so the chart "
+                f"is not rendered."
+            )
+            continue
+
+        pred_ok, pred_offending = _prediction_grounded(chart, tool_numbers)
+        if not pred_ok:
+            preview = ", ".join(str(v) for v in pred_offending[:5])
+            st.warning(
+                f"**Chart {i} suppressed by prediction guard.** The bot "
+                f"claimed to use these historical values, but they don't "
+                f"appear in any tool call this turn: `{preview}`. "
+                f"Prediction charts must trace their inputs back to real "
+                f"AWS data — this one didn't."
+            )
+            continue
+
         grounded, offending = _values_grounded(chart, tool_numbers)
         if not grounded:
             preview = ", ".join(str(v) for v in offending[:5])
@@ -245,9 +374,15 @@ def render_charts_inline(
         st.plotly_chart(fig, use_container_width=True,
                         key=f"chat_chart::{id(chart)}::{i}")
 
+        # For prediction charts, show the model's basis note underneath —
+        # named dates + dollar values so the user can audit the reasoning.
+        basis = chart.get("prediction_basis")
+        if isinstance(basis, dict) and basis.get("note"):
+            st.caption(f"**Prediction basis:** {basis['note']}")
+
         source_tool = chart.get("source_tool")
         if source_tool:
             st.caption(
-                f"Source tool: `{source_tool}` · every y-value verified "
+                f"Source tool: `{source_tool}` · every value verified "
                 f"against tool output from this turn."
             )
