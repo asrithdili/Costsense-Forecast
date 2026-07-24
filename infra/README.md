@@ -1,9 +1,74 @@
 # CostSense — App Runner deploy
 
-This directory contains the ONLY deploy path for CostSense. If you're
-looking at `deploy/cloudformation/` — that's the old ECS/CloudFormation
-path, which is blocked by an org SCP in the hackfest account and is
-scheduled for removal. Use this instead.
+This directory contains the App Runner + public-ECR deploy path for
+CostSense. It's the only remotely-hosted deploy path we have (the old
+ECS/CloudFormation path was blocked by an org SCP — see below).
+
+## Known limitation — App Runner cannot serve Streamlit's WebSocket
+
+**⚠ Read this before assuming the deployed URL is usable for real demos.**
+
+Streamlit's UI populates over a persistent WebSocket at
+`/_stcore/stream`. App Runner's Envoy front-proxy returns
+`HTTP/1.1 403 Forbidden` (empty body, `server: envoy`) on the
+WebSocket upgrade — the request never reaches the container. The
+Streamlit HTML/JS loads (health check + `/` return 200), but the app
+gets stuck on the skeleton loader forever because it can't establish
+the WebSocket.
+
+Diagnosis this project ran and confirmed:
+
+```bash
+curl -v -H "Upgrade: websocket" -H "Connection: Upgrade" \
+     -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+     https://pma8dqvi4m.us-west-2.awsapprunner.com/_stcore/stream
+# → HTTP/1.1 403 Forbidden
+# → server: envoy
+# → content-length: 0
+```
+
+This is App Runner's Envoy, not Streamlit — the container's own logs
+show clean startup with no WebSocket-related errors on the app side.
+AWS docs claim App Runner "supports HTTP/1 and HTTP/2 including
+WebSocket," but in practice Streamlit's WS upgrade is rejected. This
+is a known compatibility gap (many `streamlit-on-apprunner` issues
+online report the same behaviour). Not a bug in our config.
+
+We already ruled out:
+
+- `server.enableCORS=false` + `server.enableXsrfProtection=false` in
+  the container CMD → applied, container logs no longer show the CORS
+  warning, but the 403 persists at the proxy.
+- `MinSize=1` autoscaling config → applied (keeps a warm instance so
+  there's no cold-start race). Doesn't help because the WS upgrade is
+  rejected regardless of instance state.
+
+**What the App Runner URL is good for:** demonstrating that we have a
+deployment artifact, health check working, image pipeline live. It is
+NOT usable for actual product demos.
+
+**Consider tearing down the App Runner service** once the hackathon
+demo is done — it costs ~$8/month idle even when unused because we
+set `MinSize=1` to keep a warm instance (which turned out not to help
+anyway). See "Full teardown" below for the exact commands.
+
+**What to use for demos:** run Streamlit locally with an SSO'd AWS
+profile:
+
+```bash
+git clone https://github.com/asrithdili/Costsense-Forecast.git
+cd Costsense-Forecast
+python -m venv .venv && source .venv/bin/activate   # or .venv\Scripts\activate on Windows
+pip install -r requirements.txt
+aws sso login --profile dil-team-hackfest
+export AWS_PROFILE=dil-team-hackfest
+streamlit run src/dashboard/app.py
+```
+
+That's what every screenshot in the project used and where every
+anti-hallucination guard was validated live.
+
+## The story: why we use public ECR
 
 ## The story: why we use public ECR
 
@@ -78,10 +143,12 @@ every run.
 | | |
 |---|---|
 | URL | https://pma8dqvi4m.us-west-2.awsapprunner.com |
+| Status | Container RUNNING, HTML serves, **but** Streamlit WebSocket rejected by App Runner Envoy — see "Known limitation" above |
 | Account | 609400232087 (hackfest) |
 | Region | us-west-2 |
 | Service ARN | `arn:aws:apprunner:us-west-2:609400232087:service/costsense/0b806d58770943eab615538073a624c2` |
 | Instance role | `golden-thread-hackathon-instance-role` |
+| Autoscaling | `costsense-min1` (MinSize=1, MaxSize=3) |
 
 ## Deploying manually (Linux / macOS)
 
@@ -302,15 +369,21 @@ golden-thread policies (`bedrock-invoke`, `golden-thread-datalake-secret`,
 ```bash
 export AWS_PROFILE=dil-team-hackfest
 
-# 1. Delete the App Runner service (async, takes ~5 min)
+# 1. Delete the App Runner service (async, takes ~5 min).
+#    This automatically detaches the autoscaling config from the service.
 aws apprunner delete-service --region us-west-2 \
   --service-arn arn:aws:apprunner:us-west-2:609400232087:service/costsense/0b806d58770943eab615538073a624c2
 
-# 2. Delete the public ECR repo and every image tag in it (irreversible)
+# 2. Once step 1 finishes, delete the autoscaling config we created.
+#    (You can only delete a config after no service is using it.)
+aws apprunner delete-auto-scaling-configuration --region us-west-2 \
+  --auto-scaling-configuration-arn arn:aws:apprunner:us-west-2:609400232087:autoscalingconfiguration/costsense-min1/1/ee8347fa605f4ef2ab276724649e81cf
+
+# 3. Delete the public ECR repo and every image tag in it (irreversible)
 aws ecr-public delete-repository --region us-east-1 \
   --repository-name costsense --force
 
-# 3. Detach the costsense inline policy from the reused instance role.
+# 4. Detach the costsense inline policy from the reused instance role.
 #    IMPORTANT: this leaves golden-thread's own policies untouched.
 aws iam delete-role-policy \
   --role-name golden-thread-hackathon-instance-role \
