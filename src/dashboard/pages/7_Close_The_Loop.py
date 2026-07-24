@@ -608,10 +608,3 @@ if scan_button:
                 st.rerun()
             except Exception as e:  # noqa: BLE001
                 callout(f"Open PR analysis failed: {e}", tone="error")
-
-st.caption(
-    "Aggregation logic (mirrors PR Predictor): "
-    "projected $/day = current $/day + Σ (cached recommendation $/day). "
-    "No forecasting, no horizon multiplication, no confidence-weighted "
-    "curves. If a source has nothing cached, its tile shows an em dash."
-)
