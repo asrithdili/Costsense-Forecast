@@ -712,7 +712,31 @@ def chat_step(
     answer (e.g. a UI that renders a "GitHub connected" indicator) can
     pass it in directly to avoid re-probing.
     """
-    from src.ai_agent.bedrock_client import make_client
+    from src.ai_agent.bedrock_client import make_client, verify_profile_account
+
+    # Sanity check: confirm the profile actually resolves to the account
+    # the sidebar shows. If env credentials or a stale profile ambush the
+    # request, the resolved account will differ from `account_id` — we
+    # refuse the Bedrock call rather than silently invoke against the
+    # wrong role.
+    account_ok, _resolved, verify_err = verify_profile_account(
+        profile, account_id,
+    )
+    if not account_ok and verify_err:
+        return ChatTurn(
+            reply="",
+            error=(
+                "Account verification failed. " + verify_err + " Try "
+                "`aws sso login --profile " + (profile or "") + "` or "
+                "restart Streamlit so leaked env credentials don't "
+                "override the profile."
+            ),
+            model_id=model_id,
+            updated_history=history + [
+                {"role": "user", "content": user_msg},
+            ],
+        )
+
     client = make_client(profile, region=BEDROCK_REGION)
 
     if github_read_available is None:

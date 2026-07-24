@@ -65,8 +65,39 @@ def _session_from_environment() -> boto3.Session:
             os.environ[key] = value
 
 
+def _named_profile_exists(profile: str) -> bool:
+    """True when *profile* is present in the local AWS config. Used to
+    decide whether an explicit profile argument should win over env creds."""
+    try:
+        return profile in boto3.Session().available_profiles
+    except Exception:  # noqa: BLE001
+        # If botocore can't even enumerate profiles, fall back to letting
+        # the caller's request through — Session(profile_name=…) will
+        # raise a clear error at construction if the profile is missing.
+        return False
+
+
 def _should_use_env_credentials(profile: str | None) -> bool:
     if not _env_credentials_available():
+        return False
+    # PRIORITY FIX: when the caller explicitly asked for a named profile
+    # that EXISTS in the local AWS config, always honor it. Env credentials
+    # are a fallback for anonymous callers (no profile), not an override.
+    #
+    # Prior behaviour: any env creds + no AWS_PROFILE set → env creds win
+    # for every call. That routed Bedrock calls for "dil-data-platform-dev"
+    # to whatever role had last exported creds into the env (typically the
+    # billing role from a prior aws-vault export or SSO leak), which then
+    # denied bedrock:InvokeModel because that role doesn't have it — the
+    # exact "why is Bedrock denying when I selected a valid account" bug.
+    if profile and _named_profile_exists(profile):
+        vault = vault_profile()
+        # aws-vault exec injects env creds INTO the same profile the user
+        # asked for — that's the one case where using env creds is still
+        # correct (they ARE the profile's creds). Everything else: named
+        # profile wins.
+        if vault == profile:
+            return True
         return False
     active = os.environ.get("AWS_PROFILE")
     # OIDC / exported creds with no profile env (e.g. GitHub Actions).
