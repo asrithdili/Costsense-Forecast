@@ -544,24 +544,20 @@ for it in items:
 st.divider()
 section(
     "Add open PR analysis",
-    "Optional: run the deep AWS agent against this account's matching open "
-    "PRs to price them before they merge. Same analyser the Dashboard uses. "
-    "Results are cached — subsequent visits find them without re-analysing.",
+    "Run the deep AWS agent against this account's matching open PRs to "
+    "price them before they merge. Results are cached.",
     kicker="Live analysis",
 )
 
 # Open-PR scan cap. Default 12 (mid of the user-requested 10-15 range).
 # The underlying `analyze_open_prs` defaults to 8; we override explicitly so
-# behaviour is deterministic regardless of upstream defaults. A slider lets
-# the user tune within 10-15 to trade coverage for wall-clock time (each
-# PR is ~10-15s of deep-agent work).
+# behaviour is deterministic regardless of upstream defaults.
 _DEFAULT_OPEN_PR_SCAN_CAP = 12
 
-scan_cols = st.columns([1, 2, 3], gap="medium", vertical_alignment="bottom")
+scan_cols = st.columns([1, 2], gap="medium", vertical_alignment="bottom")
 with scan_cols[0]:
     scan_button = st.button(
         "Analyze open PRs now",
-        help="~2-3 min for the default 12 PRs. Uses the deep agent.",
         use_container_width=True,
     )
 with scan_cols[1]:
@@ -569,16 +565,6 @@ with scan_cols[1]:
         "Max PRs to analyse",
         min_value=10, max_value=15, value=_DEFAULT_OPEN_PR_SCAN_CAP,
         step=1, key="loop_open_pr_cap",
-        help=(
-            "Top-N open PRs by likely-to-merge-soon ranking. Higher = "
-            "more coverage, longer wall-clock. Each PR is ~10-15s of "
-            "deep-agent time."
-        ),
-    )
-with scan_cols[2]:
-    st.caption(
-        f"Expected wall-clock: ~{open_pr_cap * 10}-{open_pr_cap * 15}s "
-        f"(runs 4 in parallel; Bedrock rate-limits the concurrency)."
     )
 
 if scan_button:
