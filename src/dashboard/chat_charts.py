@@ -189,11 +189,21 @@ def _schema_ok(chart: dict) -> tuple[bool, str]:
                 f"prediction charts must have exactly one series; "
                 f"got {len(series)}"
             )
+        # Accept labels that START WITH the three required base words,
+        # case-insensitively. This lets the model add honest qualifiers
+        # like "Change (ASSUMED)" or "Projected (low confidence)" without
+        # us rejecting the chart — the base word is what identifies which
+        # bar is which, the parenthetical is prose.
         xs = [str(x).strip().lower() for x in series[0]["x"]]
-        if xs != ["current", "change", "projected"]:
+        required = ("current", "change", "projected")
+        if len(xs) != 3 or not all(
+            xs[i].startswith(required[i]) for i in range(3)
+        ):
             return False, (
-                f"prediction chart x-labels must be exactly "
-                f"['Current', 'Change', 'Projected']; got {series[0]['x']}"
+                f"prediction chart x-labels must start with "
+                f"['Current', 'Change', 'Projected'] "
+                f"(qualifiers in parentheses allowed); "
+                f"got {series[0]['x']}"
             )
         for field in ("current_grounding", "rate_grounding"):
             if not isinstance(basis.get(field), list):
