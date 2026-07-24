@@ -62,6 +62,14 @@ with st.sidebar:
         st.session_state.chat_display = []
         st.rerun()
 
+    # Probe GitHub availability once per render so we can be honest about
+    # what the bot can actually reach. We call chat_agent's own probe (same
+    # signal fed to the model) so sidebar and bot stay in sync.
+    from src.ai_agent.chat_agent import _detect_github_read_available
+    _gh_read_ok = _detect_github_read_available()
+    _gh_label = ("GitHub repo browsing (search repos, files, code, PRs) — "
+                 f"{'✓ available' if _gh_read_ok else '✗ not configured'}")
+
     st.caption("**Tools available to the bot**")
     st.caption(
         "• Cost Explorer (spend by day / service)  \n"
@@ -71,7 +79,7 @@ with st.sidebar:
         "• Compute Optimizer (EC2 + Lambda rightsizing)  \n"
         "• AWS Budgets, Service Quotas, S3 lifecycle policies  \n"
         "• AWS Pricing API  \n"
-        "• GitHub repo browsing (search repos, files, code, PRs)"
+        f"• {_gh_label}"
     )
     st.caption("**Auto-redacted**")
     st.caption("Secrets, tokens, IAM policy docs, private keys, JWTs, and "
@@ -139,6 +147,7 @@ def _run_pending_question(q: str) -> None:
             history=st.session_state.chat_history,
             user_msg=q,
             account_id=active.account_id,
+            github_read_available=_gh_read_ok,
         )
     except Exception as e:  # noqa: BLE001
         st.session_state.chat_display.append({
@@ -170,15 +179,24 @@ def _run_pending_question(q: str) -> None:
 for msg in st.session_state.chat_display:
     with st.chat_message(msg["role"]):
         if msg.get("guard_triggered"):
-            st.error(
-                "**Hallucination guard intercepted this reply.** "
-                "One or more AWS tool calls were denied by IAM, and the "
-                "model's original answer contained dollar figures that "
-                "weren't grounded in a successful API response. Below is "
-                "the honest fallback message.",
-                icon="🛑",
-            )
-            reason = msg.get("guard_reason")
+            reason = msg.get("guard_reason") or ""
+            if reason.startswith("substitution"):
+                banner_text = (
+                    "**Scope-substitution guard intercepted this reply.** "
+                    "The model refused the account you actually asked "
+                    "about, then handed over the currently connected "
+                    "account's data as a consolation. Below is the honest "
+                    "scope message instead."
+                )
+            else:
+                banner_text = (
+                    "**Hallucination guard intercepted this reply.** "
+                    "One or more AWS tool calls were denied by IAM, and "
+                    "the model's original answer contained dollar figures "
+                    "that weren't grounded in a successful API response. "
+                    "Below is the honest fallback message."
+                )
+            st.error(banner_text, icon="🛑")
             if reason:
                 with st.expander("Why the guard fired"):
                     st.caption(reason)

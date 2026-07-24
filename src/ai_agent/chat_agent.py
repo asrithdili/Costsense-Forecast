@@ -6,22 +6,28 @@ strips anything that looks like a secret, IAM policy document, JWT, private
 key, or AWS access key ID — before Claude sees the tool output.
 
 Hallucination hardening (added 2026-07):
-    LLMs will fabricate dollar figures when a tool errors, even with a system
-    prompt telling them not to. Three layers of defense keep the assistant
-    honest when the user's AWS profile can't read a resource:
+    LLMs will fabricate dollar figures when a tool errors, or pivot to the
+    connected account when the user asked about a different one, even with
+    a system prompt telling them not to. Four layers of defense:
       1. Every tool_result whose payload contains an ``error`` field is sent
-         back to Claude with Anthropic's ``is_error: true`` flag — the model
-         treats explicit is_error results very differently from a JSON string
-         that happens to contain the word "error".
-      2. The system prompt injects the ACTIVE profile + account id so the
-         model can't answer questions about a different account.
-      3. A post-loop guard scans the final reply. If any tool call was denied
-         AND the reply contains a $-figure, we replace the reply with an
-         explicit "I don't have access to X" message. Deterministic backstop
-         for the LLM-based rules above.
+         back to Claude with Anthropic's ``is_error: true`` flag.
+      2. The system prompt injects the ACTIVE profile + account id + a
+         signal for whether GitHub read is configured, so the model knows
+         exactly what it can and cannot reach.
+      3. Denial-guard: if any tool_result was is_error=no_access AND the
+         reply contains a $-figure, override the reply with an honest "I
+         don't have access" message.
+      4. Substitution-guard: if the reply admits it couldn't answer the
+         user's target (contains phrases like "I don't have access",
+         "different account", "connected account") but ALSO contains
+         $-figures or a services table sourced from the CURRENT account,
+         override the reply — the model tried to be helpful by handing
+         over the connected account's data as a consolation, which is
+         the exact behavior we don't want.
 
 Public API:
-    chat_step(profile, model_id, history, user_msg, account_id) -> ChatTurn
+    chat_step(profile, model_id, history, user_msg, account_id,
+              github_read_available) -> ChatTurn
 
 `history` is the running list of {role, content} messages Claude will see.
 `ChatTurn` bundles the assistant reply text, tool-call transcript, and the
@@ -139,13 +145,18 @@ chat interface. The user will ask questions about their AWS account and you \
 will ground every answer in real data by calling the read-only tools you \
 have available.
 
-Your tools cover: Cost Explorer, CloudWatch metrics, CloudTrail events, \
+Your AWS tools cover: Cost Explorer, CloudWatch metrics, CloudTrail events, \
 resource inventory (Lambda, RDS, EC2, NAT, EBS, S3, DynamoDB), AWS Compute \
 Optimizer, AWS Budgets, Service Quotas, S3 lifecycle policies, and rightsizing \
-recommendations. You ALSO have read-only GitHub tools — you CAN and SHOULD \
-access GitHub repos directly: search for a repo by name, list its files, \
-read file contents, search code, and list/diff pull requests. Never claim \
-GitHub access is "outside your scope" — it isn't.
+recommendations. These tools ONLY work against the currently connected AWS \
+account (see ACTIVE SCOPE above). If the user asks about a different \
+account, you have NO way to reach it — say so and stop.
+
+GitHub tools: read-only access to repos (search, list files, get file \
+contents, search code, list/diff pull requests). Their availability is \
+signalled in the ACTIVE SCOPE block above. If GitHub read is available you \
+CAN and SHOULD use these tools directly; if it's marked unavailable, tell \
+the user GitHub isn't reachable — do NOT attempt the tools anyway.
 
 Rules:
 - NEVER guess. When the user asks "what's my biggest cost driver," call \
@@ -186,16 +197,36 @@ Prose ("Lambda is your biggest driver") is fine when supported by a tool; \
 figures ($400/day, ~$65K/month) are ONLY fine when a tool call actually \
 returned them.
 
+CRITICAL SCOPE RULES:
+- The ACTIVE SCOPE block above names EXACTLY ONE AWS account you can \
+reach. Your AWS tools return data from THAT account only. You have NO \
+mechanism to see any other account.
+- If the user asks about a DIFFERENT account (by name, id, or nickname \
+like "policy manager", "acl-prod", "shared services"), you MUST refuse \
+briefly and STOP. Reply is ONE short paragraph: "I don't have access to \
+that account — my active profile is X (account Y). Switch profiles in \
+the sidebar or ask the account's owner."
+- DO NOT offer the connected account's data as a "here's what I can see \
+instead" consolation. That is the specific failure mode this rule \
+prevents. No table, no numbers, no "meanwhile", no "however here is". \
+Full stop after the refusal.
+- The refusal-and-stop rule applies even if the connected account's data \
+would be interesting or useful. The user did not ask for it.
+
 Response format: plain markdown. Use bullet points and short paragraphs. \
 No JSON unless the user explicitly asks for JSON. Always write dollar \
 figures with a leading "$" (e.g. "$400–800", "$65K/year", never a bare \
 "400–800" or "65K/year") since these are all USD amounts."""
 
 
-def _build_system(profile: str | None, account_id: str | None) -> str:
+def _build_system(
+    profile: str | None,
+    account_id: str | None,
+    github_read_available: bool = False,
+) -> str:
     """Prepend the active-scope block. Front-loading the profile + account
-    before the rules block anchors the model to the correct scope earlier
-    in the context window."""
+    + GitHub-availability flag before the rules block anchors the model to
+    the correct scope earlier in the context window."""
     scope_lines = ["ACTIVE SCOPE:"]
     if profile:
         scope_lines.append(f"- AWS profile: {profile}")
@@ -207,6 +238,16 @@ def _build_system(profile: str | None, account_id: str | None) -> str:
         scope_lines.append(
             "- AWS account id: (unknown — the profile could not resolve "
             "get-caller-identity; assume you have no AWS access)"
+        )
+    if github_read_available:
+        scope_lines.append(
+            "- GitHub read: AVAILABLE (github_* tools will succeed)"
+        )
+    else:
+        scope_lines.append(
+            "- GitHub read: UNAVAILABLE (no GITHUB_TOKEN configured and "
+            "no gh CLI — do NOT call any github_* tool; if asked about a "
+            "repo, tell the user GitHub isn't reachable)"
         )
     scope_lines.append(
         "You MUST NOT report figures for any OTHER account. If the user "
@@ -283,12 +324,47 @@ def _summarize_output(obj) -> str:
 # Matches "$400", "$1,200.50", "$65K", "$65k", "$1.2M", "$400/day", etc.
 _DOLLAR_FIGURE_RE = re.compile(r"\$\s?[\d][\d,\.]*\s?[KkMmBb]?")
 
+# Phrases the model uses when it's admitting it couldn't answer the user's
+# original target. Detected case-insensitively. The list is deliberately
+# conservative — false positives (guard firing on a legitimate reply) mean
+# the user sees the honest fallback instead of a real answer, and that is
+# strictly less bad than the substitution behavior we're stopping.
+_SCOPE_REFUSAL_PHRASES = (
+    "i don't have access",
+    "i do not have access",
+    "i don't have visibility",
+    "i do not have visibility",
+    "different account",
+    "another account",
+    "active aws profile",
+    "active profile is",
+    "currently connected",
+    "connected account",
+    "connected to",
+    "switch profiles",
+    "asked about",
+    "asked about the",
+    "scope notice",
+    "account scope",
+)
 
-def _apply_hallucination_guard(
+
+def _reply_has_refusal_language(reply: str) -> bool:
+    """True when the reply text contains a phrase indicating the model
+    admitted a scope mismatch — even if it then handed over consolation
+    data anyway."""
+    if not reply:
+        return False
+    lowered = reply.lower()
+    return any(phrase in lowered for phrase in _SCOPE_REFUSAL_PHRASES)
+
+
+def _apply_denial_guard(
     reply: str,
     tool_calls: list[ToolCall],
     profile: str | None,
     account_id: str | None,
+    github_read_available: bool,
 ) -> tuple[str, bool, str | None]:
     """If any tool call failed with ``no_access`` AND the reply contains a
     dollar figure, replace the reply with an honest denial. This is the
@@ -304,36 +380,149 @@ def _apply_hallucination_guard(
 
     figures = _DOLLAR_FIGURE_RE.findall(reply or "")
     if not figures:
-        # Model correctly avoided fabricating a number — nothing to override,
-        # but we still return a "guard did not trigger" so the caller can
-        # optionally surface a caveat.
         return reply, False, None
 
     tool_names = sorted({tc.name for tc in denied_tools})
-    scope_line = (
-        f"profile `{profile}` (account {account_id})"
-        if account_id else f"profile `{profile or '(none)'}`"
-    )
-    honest_reply = (
-        f"I can't answer this with real numbers — {scope_line} was denied "
-        f"access on: {', '.join(tool_names)}.\n\n"
-        f"AWS returned an authorization error, so any dollar figures I "
-        f"gave you here would be a guess, not real data. Switch to a "
-        f"profile that has read access to this account (Cost Explorer + "
-        f"the relevant service APIs), or ask the account owner to run the "
-        f"question — I'll ground the answer in the actual API response."
+    honest_reply = _honest_denial_message(
+        profile, account_id, tool_names, github_read_available,
     )
     reason = (
-        f"reply contained {len(figures)} dollar figure(s) but "
+        f"denial guard: reply contained {len(figures)} $-figure(s) but "
         f"{len(denied_tools)} tool call(s) were denied: "
         f"{', '.join(tool_names)}"
     )
     return honest_reply, True, reason
 
 
+def _apply_substitution_guard(
+    reply: str,
+    tool_calls: list[ToolCall],
+    profile: str | None,
+    account_id: str | None,
+    github_read_available: bool,
+) -> tuple[str, bool, str | None]:
+    """When the reply admits "I don't have access to X" but ALSO includes
+    $-figures from a successful tool call on the currently-connected
+    account, the model has substituted the connected account's data as a
+    consolation. Rewrite to a clean refusal.
+
+    Returns ``(new_reply, guard_triggered, reason)``.
+    """
+    if not _reply_has_refusal_language(reply):
+        return reply, False, None
+
+    if not _DOLLAR_FIGURE_RE.search(reply or ""):
+        # Model correctly refused with no numbers. Nothing to do.
+        return reply, False, None
+
+    honest_reply = _honest_scope_message(
+        profile, account_id, github_read_available,
+    )
+    reason = (
+        "substitution guard: reply used scope-refusal language "
+        "(\"I don't have access\" / \"different account\" / \"connected "
+        "account\") but ALSO contained a dollar figure. The model refused "
+        "the user's target and then handed over the current account's "
+        "data as a consolation — that is the exact behavior this guard "
+        "stops."
+    )
+    return honest_reply, True, reason
+
+
+def _honest_denial_message(
+    profile: str | None,
+    account_id: str | None,
+    denied_tool_names: list[str],
+    github_read_available: bool,
+) -> str:
+    """The fallback message when AWS explicitly denied a tool call."""
+    scope = (f"profile `{profile}` (account {account_id})"
+             if account_id else f"profile `{profile or '(none)'}`")
+    gh_line = (
+        "\n\nGitHub read IS available on this session — if the question "
+        "can be answered from repo contents, ask me to check the code "
+        "and I can help there."
+        if github_read_available else
+        "\n\nGitHub read is also not configured on this session, so I "
+        "can't fall back to code inspection either."
+    )
+    return (
+        f"**I don't have AWS access for that.** {scope} was denied by "
+        f"IAM on: {', '.join(denied_tool_names)}.\n\n"
+        f"Any dollar figures for this question would be a guess, not real "
+        f"data. Switch to a profile that has read access to this account, "
+        f"or ask the account's owner to run the question — I'll ground "
+        f"the answer in the actual API response."
+        f"{gh_line}"
+    )
+
+
+def _honest_scope_message(
+    profile: str | None,
+    account_id: str | None,
+    github_read_available: bool,
+) -> str:
+    """The fallback message when the user asked about a DIFFERENT account
+    (or one my active profile can't reach)."""
+    scope = (f"`{profile}` (account {account_id})"
+             if account_id else f"`{profile or '(none)'}`")
+    gh_line = (
+        "GitHub read IS available on this session, so I can help with "
+        "questions answerable from repo contents (code, IaC, PRs) even "
+        "when the AWS account is out of reach."
+        if github_read_available else
+        "GitHub read is also not configured on this session — I can't "
+        "fall back to code inspection either."
+    )
+    return (
+        f"**I don't have access to that account.** My active AWS profile "
+        f"is {scope} and my tools only reach that one account. I have no "
+        f"way to see cost, resources, or activity in a different account.\n\n"
+        f"To answer this question:\n"
+        f"- Switch to the profile that owns the target account (Account "
+        f"selector in the sidebar), or\n"
+        f"- Ask the account's owner to run the question on their profile.\n\n"
+        f"{gh_line}"
+    )
+
+
+def _apply_hallucination_guard(
+    reply: str,
+    tool_calls: list[ToolCall],
+    profile: str | None,
+    account_id: str | None,
+    github_read_available: bool = False,
+) -> tuple[str, bool, str | None]:
+    """Compose both guards. Denial guard runs first (a denied tool call is
+    stronger evidence than refusal language), then substitution guard.
+
+    Returns ``(new_reply, guard_triggered, reason)``.
+    """
+    reply, triggered, reason = _apply_denial_guard(
+        reply, tool_calls, profile, account_id, github_read_available,
+    )
+    if triggered:
+        return reply, triggered, reason
+    return _apply_substitution_guard(
+        reply, tool_calls, profile, account_id, github_read_available,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
+def _detect_github_read_available() -> bool:
+    """True when the chat page can plausibly reach GitHub — either a
+    GITHUB_TOKEN/GH_TOKEN is set OR the `gh` CLI is on PATH. This mirrors
+    what the github_tools actually depend on. Signalling this into the
+    system prompt lets Claude honestly claim / disclaim GitHub access."""
+    try:
+        from src.pr_scanner.gh_client import gh_available, token_configured
+        return bool(token_configured() or gh_available())
+    except Exception:  # noqa: BLE001
+        return False
+
 
 def chat_step(
     profile: str | None,
@@ -341,6 +530,7 @@ def chat_step(
     history: list[dict],
     user_msg: str,
     account_id: str | None = None,
+    github_read_available: bool | None = None,
 ) -> ChatTurn:
     """Advance one user turn. Runs the tool-use loop for this question and
     returns the assistant reply plus updated history.
@@ -350,11 +540,19 @@ def chat_step(
     the denial message when the post-loop guard fires. Callers that don't
     have it can pass ``None`` — the guard still works, it just can't name
     the account in the denial.
+
+    ``github_read_available`` controls the GitHub-availability signal in
+    the system prompt. If ``None`` (the default), we probe locally with
+    ``_detect_github_read_available()``. Callers that already know the
+    answer (e.g. a UI that renders a "GitHub connected" indicator) can
+    pass it in directly to avoid re-probing.
     """
     from src.ai_agent.bedrock_client import make_client
     client = make_client(profile, region=BEDROCK_REGION)
 
-    system_prompt = _build_system(profile, account_id)
+    if github_read_available is None:
+        github_read_available = _detect_github_read_available()
+    system_prompt = _build_system(profile, account_id, github_read_available)
     messages = list(history) + [{"role": "user", "content": user_msg}]
     tool_calls: list[ToolCall] = []
 
@@ -426,12 +624,14 @@ def chat_step(
         text_block = next((b for b in content if b.get("type") == "text"), None)
         reply = text_block.get("text", "") if text_block else "(no reply)"
 
-        # Post-loop hallucination guard: if the model produced $-figures
-        # despite one or more denied tool calls, replace the reply with an
-        # honest "I don't have access" message. This is deterministic — no
-        # LLM in the loop, so it can't be talked around.
+        # Post-loop hallucination guard: two rules, both deterministic.
+        # (1) Denial guard: denied tool + $-figure in reply -> honest denial.
+        # (2) Substitution guard: refusal language + $-figure in reply ->
+        #     honest scope message (catches the "here's the connected
+        #     account's data instead" pattern).
+        # No LLM in either guard, so they can't be talked around.
         reply, guard_triggered, guard_reason = _apply_hallucination_guard(
-            reply, tool_calls, profile, account_id,
+            reply, tool_calls, profile, account_id, github_read_available,
         )
 
         # Persist the final assistant turn in the history so follow-ups see
