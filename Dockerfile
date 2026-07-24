@@ -1,4 +1,8 @@
-FROM python:3.11-slim
+# App Runner requires linux/amd64. Pin the platform in FROM so builds on
+# ARM developer machines (Mac M-series, ARM Linux) still produce an amd64
+# image locally. The deploy script also passes --platform linux/amd64 to
+# docker buildx as belt-and-suspenders.
+FROM --platform=linux/amd64 python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \

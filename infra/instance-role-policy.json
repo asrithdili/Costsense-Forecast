@@ -1,0 +1,70 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadOnlyCostAndUsage",
+      "Effect": "Allow",
+      "Action": [
+        "ce:GetCostAndUsage",
+        "ce:GetCostForecast",
+        "ce:GetDimensionValues",
+        "ce:GetTags",
+        "ce:GetCostAndUsageWithResources",
+        "ce:GetReservationUtilization",
+        "ce:GetSavingsPlansCoverage",
+        "ce:GetSavingsPlansUtilization",
+        "ce:ListCostAllocationTags",
+        "cur:DescribeReportDefinitions",
+        "budgets:ViewBudget",
+        "budgets:Describe*",
+        "cloudwatch:GetMetricData",
+        "cloudwatch:GetMetricStatistics",
+        "cloudwatch:ListMetrics",
+        "cloudtrail:LookupEvents",
+        "compute-optimizer:GetEC2InstanceRecommendations",
+        "compute-optimizer:GetLambdaFunctionRecommendations",
+        "compute-optimizer:GetEBSVolumeRecommendations",
+        "compute-optimizer:GetAutoScalingGroupRecommendations",
+        "compute-optimizer:GetECSServiceRecommendations",
+        "compute-optimizer:GetEnrollmentStatus",
+        "compute-optimizer:DescribeRecommendationExportJobs",
+        "servicequotas:ListServiceQuotas",
+        "servicequotas:GetServiceQuota",
+        "pricing:GetProducts",
+        "organizations:ListAccounts",
+        "organizations:ListTagsForResource",
+        "organizations:DescribeOrganization",
+        "organizations:DescribeAccount",
+        "sts:GetCallerIdentity"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadOnlyInventory",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:Describe*",
+        "rds:Describe*",
+        "lambda:List*",
+        "lambda:Get*",
+        "s3:List*",
+        "s3:GetBucketLocation",
+        "s3:GetBucketTagging",
+        "s3:GetLifecycleConfiguration",
+        "s3:GetObject",
+        "dynamodb:List*",
+        "dynamodb:Describe*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "BedrockInvoke",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
