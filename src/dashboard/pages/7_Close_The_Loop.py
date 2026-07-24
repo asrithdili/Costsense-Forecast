@@ -54,8 +54,16 @@ import streamlit as st
 from src.aws.cost_explorer import fetch_daily_totals
 from src.aws.profiles import resolve_all
 from src.dashboard.costsense_theme import (
-    C, callout, confidence_pill, metric, money, section,
+    C, callout, confidence_pill, metric, money, plotly_layout, section,
 )
+
+
+def _rgba(hex_color: str, alpha: float) -> str:
+    """Hex → rgba() for Plotly fill colours. Mirrors Dashboard's helper so
+    both pages produce visually identical translucent fills."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
 )
@@ -427,37 +435,37 @@ if history_30d:
     st.markdown("##### 30-day history")
     dates = [d for d, _ in history_30d]
     vals = [a for _, a in history_30d]
+
+    # Match Dashboard's chart recipe exactly: spline curve + markers + brand
+    # teal + shared `plotly_layout()` for consistent theme (grid colour,
+    # hover card, font, legend position). Dashboard uses this at
+    # pages/2_Dashboard.py:802-806 and its identical helper — copying that
+    # so the two pages read as one visual system.
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=dates, y=vals, name="Actual daily spend", mode="lines",
-        line=dict(color=C.INK, width=1.6),
+        x=dates, y=vals, name="Actual daily spend",
+        mode="lines+markers",
+        line=dict(color=C.BRAND, width=2.5, shape="spline", smoothing=1.0),
+        marker=dict(size=6),
         hovertemplate="%{x|%d %b}<br>$%{y:,.0f}<extra>Actual</extra>",
     ))
-    # A single horizontal line at "current $/day" (trailing 7d avg) as a
-    # reference marker — this is a live number we ALREADY show in the tile
-    # above, not a projection. And a second reference line at "projected
-    # $/day" (current + net_delta) so the reader can see visually where
-    # the aggregated recommendations would put spend if applied. Both are
-    # single, honest, computed-from-live-data values.
+    # Horizontal reference lines: both are single live values already shown
+    # in tiles above. Drawing them makes the "current vs projected" gap
+    # visible — no forecast curve, no projected future line.
     if current_daily is not None:
         fig.add_hline(y=current_daily, line=dict(color=C.MUTED, width=1, dash="dot"),
                       annotation_text="Current $/day (7d avg)",
                       annotation_position="top left",
                       annotation_font=dict(size=10, color=C.MUTED))
     if projected is not None and items:
-        fig.add_hline(y=projected, line=dict(color=C.BRAND, width=1, dash="dashdot"),
+        fig.add_hline(y=projected, line=dict(color=C.BRAND_DARK, width=1.5, dash="dashdot"),
                       annotation_text="Projected $/day (current + net delta)",
                       annotation_position="bottom left",
-                      annotation_font=dict(size=10, color=C.BRAND))
+                      annotation_font=dict(size=10, color=C.BRAND_DARK))
     fig.update_layout(
-        height=320,
-        margin=dict(l=16, r=24, t=16, b=16),
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        yaxis_title="Daily spend (USD)",
+        **plotly_layout(height=380),
+        yaxis_title="USD / day",
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="right", x=1),
     )
     st.plotly_chart(fig, use_container_width=True)
 
