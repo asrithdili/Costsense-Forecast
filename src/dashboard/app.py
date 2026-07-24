@@ -29,6 +29,7 @@ from src.ai_agent.chat_agent import (
     _detect_github_read_available,
     chat_step,
 )
+from src.dashboard.chat_charts import render_charts_inline, strip_chart_blocks
 from src.dashboard.costsense_theme import section
 from src.dashboard.nav import inject_css, render as render_nav
 from src.dashboard.nav import render_sidebar_footer, render_sidebar_header
@@ -202,7 +203,14 @@ for msg in st.session_state.chat_display:
             if reason:
                 with st.expander("Why the guard fired"):
                     st.caption(reason)
-        _safe_md(msg["text"])
+        # Split assistant replies into (prose, chart_blocks). Prose renders
+        # first as markdown; chart blocks render inline via Plotly with
+        # their own hallucination guard (see chat_charts.py). User replies
+        # never contain chart blocks — the strip is a cheap no-op then.
+        text_for_display, chart_blocks = strip_chart_blocks(msg["text"])
+        _safe_md(text_for_display)
+        if chart_blocks:
+            render_charts_inline(chart_blocks, msg.get("tool_calls") or [])
         if msg.get("_trace"):
             with st.expander("Traceback"):
                 st.code(msg["_trace"])

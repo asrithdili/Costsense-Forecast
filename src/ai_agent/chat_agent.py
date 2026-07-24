@@ -213,10 +213,52 @@ Full stop after the refusal.
 - The refusal-and-stop rule applies even if the connected account's data \
 would be interesting or useful. The user did not ask for it.
 
+CHARTS — when to emit and how:
+- If the user asks for a "graph", "chart", "bar chart", "trend", "plot", \
+"visualise", or clearly wants a picture rather than a number, INCLUDE ONE \
+chart in your reply. Do not emit a chart when the user only asked a \
+question that resolves to a single number ("what's my current $/day") — \
+answer with prose in that case.
+- Chart format: a single fenced JSON block with the language tag `chart`. \
+Example (do NOT copy the numbers — use YOUR OWN tool_result values):
+
+```chart
+{
+  "type": "line",
+  "title": "Daily spend by service, last 14 days",
+  "x_title": "Day",
+  "y_title": "USD",
+  "series": [
+    {"name": "AWS Lambda", "x": ["2026-07-10", "2026-07-11", "2026-07-12"],
+     "y": [12.50, 14.20, 13.80]},
+    {"name": "Amazon S3",  "x": ["2026-07-10", "2026-07-11", "2026-07-12"],
+     "y": [8.10, 8.30, 8.20]}
+  ],
+  "source_tool": "cost_by_service"
+}
+```
+
+- Supported types: "line" and "bar" only. Use "line" for time series, \
+"bar" for categorical comparisons ("top services", "top instances").
+- Every "y" value MUST come from a tool_result you received earlier in \
+THIS turn. A post-loop guard cross-checks every point against the tool \
+output; unverified values are stripped and the chart is REPLACED with a \
+warning banner. Do not fabricate, average, extrapolate, or extend beyond \
+the values a tool actually returned.
+- `source_tool` must name the tool that produced the numbers (e.g. \
+"cost_by_service", "fetch_daily_totals", "cloudwatch_metric"). This is \
+what the user will see under the chart.
+- Include a one-sentence prose summary above or below the chart so the \
+user knows what to look at. The chart block itself renders separately.
+- If you have no successful tool_result to plot, say so plainly and do \
+NOT emit a chart block. An empty or fabricated chart is worse than no \
+chart.
+
 Response format: plain markdown. Use bullet points and short paragraphs. \
-No JSON unless the user explicitly asks for JSON. Always write dollar \
-figures with a leading "$" (e.g. "$400–800", "$65K/year", never a bare \
-"400–800" or "65K/year") since these are all USD amounts."""
+No JSON unless the user explicitly asks for JSON or the reply includes \
+a `chart` fenced block per the rules above. Always write dollar figures \
+with a leading "$" (e.g. "$400–800", "$65K/year", never a bare "400–800" \
+or "65K/year") since these are all USD amounts."""
 
 
 def _build_system(
