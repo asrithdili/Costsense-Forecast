@@ -23,4 +23,19 @@ EXPOSE 8501
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8501/_stcore/health || exit 1
 
-CMD ["streamlit", "run", "src/dashboard/app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true", "--browser.gatherUsageStats=false"]
+# Streamlit + reverse proxy (App Runner, Nginx, ALB) notes:
+# * `--server.enableXsrfProtection=false` — required behind proxies that
+#   rewrite the Origin header (App Runner's ALB does). With XSRF ON,
+#   Streamlit forces CORS ON, which then rejects the WebSocket upgrade
+#   from the proxied Origin and the app hangs on the "loading" skeleton.
+# * `--server.enableCORS=false` — same reason.
+# Together these disable the two same-origin protections that assume
+# direct-to-container access. Safe for internal/demo deployments where
+# App Runner's own auth / IP allowlist is the outer boundary.
+CMD ["streamlit", "run", "src/dashboard/app.py", \
+     "--server.port=8501", \
+     "--server.address=0.0.0.0", \
+     "--server.headless=true", \
+     "--server.enableCORS=false", \
+     "--server.enableXsrfProtection=false", \
+     "--browser.gatherUsageStats=false"]
