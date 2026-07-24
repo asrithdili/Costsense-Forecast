@@ -42,12 +42,6 @@ from src.pr_scanner.repos import gh_login, gh_orgs, repos_with_user_prs
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
 )
-from src.forecast.adapters import (
-    event_from_anomaly_action,
-    events_from_anomaly_actions,
-    queue_pending_event,
-)
-
 
 st.set_page_config(page_title="CostSense · Anomalies", layout="wide")
 inject_css()
@@ -650,40 +644,6 @@ if report.actions:
         kicker="Actions",
     )
 
-    bulk_fc1, bulk_fc2 = st.columns([2, 1], gap="medium", vertical_alignment="bottom")
-    with bulk_fc1:
-        bulk_apply_date = st.date_input(
-            "Expected apply date (all shown actions)",
-            value=date.today() + timedelta(days=14),
-            key=f"anom_fc_bulk_date::{report_key}",
-            help="When savings from these recommendations are expected to land.",
-        )
-    with bulk_fc2:
-        if st.button(
-            f"Add all {len(filtered)} shown to future forecast",
-            key=f"anom_fc_bulk_add::{report_key}",
-            use_container_width=True,
-            disabled=not filtered,
-        ):
-            indices = [report.actions.index(a) for a in filtered]
-            incoming = events_from_anomaly_actions(
-                report.actions,
-                profile=active.profile,
-                report_key=report_key,
-                action_indices=indices,
-                expected_apply=bulk_apply_date,
-            )
-            if not incoming:
-                callout("No material savings in the shown actions.", tone="warning")
-            else:
-                for ev in incoming:
-                    queue_pending_event(active.profile, ev)
-                callout(
-                    f"Queued {len(incoming)} event(s) for Future Forecast — open "
-                    "that page to review them in the event ledger.",
-                    tone="success",
-                )
-
     for display_i, a in enumerate(filtered, start=1):
         action_idx = report.actions.index(a)
         cat_label = CATEGORY_LABEL.get(
@@ -711,37 +671,6 @@ if report.actions:
                 f"- **Reason:** {_plain(a.reason) or '_—_'}\n"
                 f"- **Recommendation:** {_plain(a.recommendation) or '_—_'}"
             )
-
-            fc1, fc2 = st.columns([2, 1], gap="medium", vertical_alignment="bottom")
-            with fc1:
-                apply_date = st.date_input(
-                    "Expected apply date",
-                    value=date.today() + timedelta(days=14),
-                    key=f"anom_fc_date::{report_key}::{action_idx}",
-                    help="When this savings is expected to show up in spend.",
-                )
-            with fc2:
-                if st.button(
-                    "Add to future forecast",
-                    key=f"anom_fc_add::{report_key}::{action_idx}",
-                    use_container_width=True,
-                ):
-                    ev = event_from_anomaly_action(
-                        a,
-                        profile=active.profile,
-                        report_key=report_key,
-                        action_idx=action_idx,
-                        expected_apply=apply_date,
-                    )
-                    if ev is None:
-                        callout("No material savings to add to the forecast.", tone="warning")
-                    else:
-                        queue_pending_event(active.profile, ev)
-                        callout(
-                            "Queued for Future Forecast — open that page to "
-                            "review and toggle the event in the ledger.",
-                            tone="success",
-                        )
 
             # Single-approach mode: pick the first LLM approach that has a
             # distinct title (not just repeating the recommendation). If none

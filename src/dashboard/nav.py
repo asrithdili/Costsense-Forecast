@@ -40,7 +40,6 @@ _PAGES = [
     ("pages/3_PR_Predictor.py",         "PR Predictor"),
     ("pages/4_Anomalies.py",            "Anomalies"),
     ("pages/5_Org_Level_Impact.py",     "Org Level Impact"),
-    ("pages/6_Future_Forecast.py",      "Future Forecast"),
     ("pages/7_Close_The_Loop.py",       "Close the Loop"),
 ]
 
