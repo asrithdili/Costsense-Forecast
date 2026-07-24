@@ -25,7 +25,10 @@ load_config()
 
 import streamlit as st
 
-from src.ai_agent.chat_agent import chat_step
+from src.ai_agent.chat_agent import (
+    _detect_github_read_available,
+    chat_step,
+)
 from src.dashboard.costsense_theme import section
 from src.dashboard.nav import inject_css, render as render_nav
 from src.dashboard.nav import render_sidebar_footer, render_sidebar_header
@@ -65,7 +68,6 @@ with st.sidebar:
     # Probe GitHub availability once per render so we can be honest about
     # what the bot can actually reach. We call chat_agent's own probe (same
     # signal fed to the model) so sidebar and bot stay in sync.
-    from src.ai_agent.chat_agent import _detect_github_read_available
     _gh_read_ok = _detect_github_read_available()
     _gh_label = ("GitHub repo browsing (search repos, files, code, PRs) — "
                  f"{'✓ available' if _gh_read_ok else '✗ not configured'}")
