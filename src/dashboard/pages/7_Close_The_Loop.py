@@ -542,7 +542,38 @@ section(
     kicker="Live analysis",
 )
 
-if st.button("Analyze open PRs now", help="~30–60s. Uses the deep agent."):
+# Open-PR scan cap. Default 12 (mid of the user-requested 10-15 range).
+# The underlying `analyze_open_prs` defaults to 8; we override explicitly so
+# behaviour is deterministic regardless of upstream defaults. A slider lets
+# the user tune within 10-15 to trade coverage for wall-clock time (each
+# PR is ~10-15s of deep-agent work).
+_DEFAULT_OPEN_PR_SCAN_CAP = 12
+
+scan_cols = st.columns([1, 2, 3], gap="medium", vertical_alignment="bottom")
+with scan_cols[0]:
+    scan_button = st.button(
+        "Analyze open PRs now",
+        help="~2-3 min for the default 12 PRs. Uses the deep agent.",
+        use_container_width=True,
+    )
+with scan_cols[1]:
+    open_pr_cap = st.slider(
+        "Max PRs to analyse",
+        min_value=10, max_value=15, value=_DEFAULT_OPEN_PR_SCAN_CAP,
+        step=1, key="loop_open_pr_cap",
+        help=(
+            "Top-N open PRs by likely-to-merge-soon ranking. Higher = "
+            "more coverage, longer wall-clock. Each PR is ~10-15s of "
+            "deep-agent time."
+        ),
+    )
+with scan_cols[2]:
+    st.caption(
+        f"Expected wall-clock: ~{open_pr_cap * 10}-{open_pr_cap * 15}s "
+        f"(runs 4 in parallel; Bedrock rate-limits the concurrency)."
+    )
+
+if scan_button:
     from src.pr_scanner.profile_repo_match import normalize_profile
     normalized = normalize_profile(active.profile)
     repos_full: list[str] = []
@@ -564,15 +595,21 @@ if st.button("Analyze open PRs now", help="~30–60s. Uses the deep agent."):
             tone="warning",
         )
     else:
-        with st.spinner(f"Deep-analysing open PRs on "
-                        f"{len(repos_full)} repo(s)…"):
+        with st.spinner(f"Deep-analysing up to {open_pr_cap} open PRs "
+                        f"on {len(repos_full)} repo(s)…"):
             try:
                 from src.pr_scanner.open_prs import (
                     analyze_open_prs, list_open_prs_many,
                 )
                 open_prs = list_open_prs_many(repos_full)
-                priced = analyze_open_prs(open_prs, profile=active.profile) \
+                priced = (
+                    analyze_open_prs(
+                        open_prs,
+                        profile=active.profile,
+                        max_prs=open_pr_cap,
+                    )
                     if open_prs else []
+                )
                 cached_state.set("loop_open_prs", (active.profile,), priced)
                 st.rerun()
             except Exception as e:  # noqa: BLE001
