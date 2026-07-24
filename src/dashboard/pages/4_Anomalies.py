@@ -184,7 +184,14 @@ with top_bar(header):
         except Exception:  # noqa: BLE001
             suggested_full = []
         short_names = [r.split("/", 1)[-1] for r in suggested_full]
-        default_selection = _match(active_preview.profile, short_names) or short_names
+        # Profile-matched repos only. When no repo maps to this profile
+        # (common on team/sandbox accounts like dil-team-hackfest that
+        # aren't the primary deploy target for any repo), default to
+        # NO repos rather than every repo in the org. That prevents an
+        # account-level anomaly scan from silently pulling in unrelated
+        # repos' PRs — which caused bogus DIA-* recommendations to
+        # appear on hackfest deep-links.
+        default_selection = _match(active_preview.profile, short_names) or []
         _persisted_short = st.session_state.get("anom_repos_persist", [])
         short_names_merged = list(dict.fromkeys(
             short_names + [r for r in _persisted_short if r not in short_names]
@@ -200,6 +207,8 @@ with top_bar(header):
             "Repos to scan", options=short_names_merged,
             default=default_selection,
             key=_repos_widget_key,
+            help="Empty is valid — the scan will focus on AWS-side "
+                 "anomalies for the selected account only.",
         )
         st.session_state["anom_repos_persist"] = list(picked_short)
 
@@ -232,8 +241,15 @@ continuous_on = bool(st.session_state.get("anom_continuous_enabled", False))
 active = profiles[labels.index(picked_label)]
 model_id = model_ids[picked_model_idx]
 selected_repos = [f"{gh_org}/{n}" for n in picked_short] if gh_org else []
-if not selected_repos:
-    selected_repos = list(st.session_state.get("anom_selected_repos_persist", []))
+# Fallback to persisted list ONLY when this isn't an account-only
+# deep-link (from Org's View anomalies). Otherwise carrying over the
+# previous manual scan's repos pollutes the report with unrelated PRs.
+if not selected_repos and not st.session_state.get(
+    "anom_autorun_account_only_if_no_match"
+):
+    selected_repos = list(
+        st.session_state.get("anom_selected_repos_persist", [])
+    )
 st.session_state["anom_selected_repos_persist"] = list(selected_repos)
 
 with st.sidebar:
@@ -408,6 +424,9 @@ if _is_stale(report):
 # on Analyze, then clear the flag so subsequent reruns don't loop.
 if st.session_state.pop("anom_autorun", False):
     run_btn = True
+    # Also consume the companion "account-only if no repo match" flag
+    # so it doesn't affect the next non-deep-link scan the user runs.
+    st.session_state.pop("anom_autorun_account_only_if_no_match", None)
 
 # Don't re-run immediately when continuous is turned on and results already
 # exist, or when resuming a session that already has a cached report.

@@ -651,6 +651,20 @@ def _on_anomalies(account_id: str) -> None:
         st.session_state.get("anom_widget_ver", 0) + 1
     )
     st.session_state["anom_last_profile"] = None  # force account-change path
+
+    # Clear repo state from any previous manual scan so the auto-run
+    # doesn't carry over unrelated repos. Deep-links from the Org page
+    # target a specific ACCOUNT — the correct default is either the
+    # repos already matched to that profile (via profile_repo_match)
+    # OR no repos at all (account-only anomaly scan). Anomalies page
+    # will re-derive its default_repos from the newly-selected profile.
+    for k in ("anom_repos_persist", "anom_selected_repos_persist"):
+        st.session_state.pop(k, None)
+
+    # Signal to Anomalies that this run was launched via the account
+    # deep-link, so it can decide to run account-only if the newly
+    # matched repo list is empty (rather than reusing stale repos).
+    st.session_state["anom_autorun_account_only_if_no_match"] = True
     try:
         st.switch_page("pages/4_Anomalies.py")
     except Exception:  # noqa: BLE001
