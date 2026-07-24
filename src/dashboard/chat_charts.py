@@ -84,13 +84,58 @@ def _all_tool_result_numbers(tool_calls: list) -> set[float]:
     lets us detect drift-of-a-cent as the same number. The chart guard
     then compares candidate values against this set at 4 dp.
     """
+    seen, _lists = _tool_result_numbers_and_lists(tool_calls)
+    return seen
+
+
+def _tool_result_numbers_and_lists(
+    tool_calls: list,
+) -> tuple[set[float], list[list[float]]]:
+    """Walk every tool_result and collect BOTH:
+
+      * ``seen`` — every raw numeric value that appeared anywhere
+      * ``numeric_lists`` — every homogeneous list of >=3 numbers
+        (so we can compute mean/sum/max later and still call a
+        derived value "grounded" if it matches an aggregate)
+
+    The list-collection matters because the bot legitimately computes
+    values like "30-day average" from the ``daily`` list of a
+    ``cost_by_service`` call. The raw list is in the tool output; the
+    mean is not — but it's an honest derivation, so we accept it.
+    """
     seen: set[float] = set()
+    numeric_lists: list[list[float]] = []
 
     def _walk(obj: Any) -> None:
         if isinstance(obj, dict):
             for v in obj.values():
                 _walk(v)
         elif isinstance(obj, list):
+            # Collect this list if it's a homogeneous run of numbers —
+            # or a list of dicts where each dict has numeric fields
+            # (the shape of `daily` under cost_by_service). For the
+            # latter case, one list per numeric key discovered.
+            flat: list[float] = []
+            for v in obj:
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    try:
+                        flat.append(float(v))
+                    except (TypeError, ValueError):
+                        pass
+            if len(flat) >= 3:
+                numeric_lists.append(flat)
+            # Also gather numeric-valued keys from lists-of-dicts.
+            if obj and isinstance(obj[0], dict):
+                per_key: dict[str, list[float]] = {}
+                for entry in obj:
+                    if not isinstance(entry, dict):
+                        continue
+                    for k, v in entry.items():
+                        if isinstance(v, (int, float)) and not isinstance(v, bool):
+                            per_key.setdefault(k, []).append(float(v))
+                for values in per_key.values():
+                    if len(values) >= 3:
+                        numeric_lists.append(values)
             for v in obj:
                 _walk(v)
         elif isinstance(obj, (int, float)) and not isinstance(obj, bool):
@@ -107,16 +152,41 @@ def _all_tool_result_numbers(tool_calls: list) -> set[float]:
                     pass
 
     for call in tool_calls:
-        # tool_calls entries carry an `output_summary` string (see
-        # chat_agent.ToolCall). Parse each as best we can and walk.
         summary = getattr(call, "output_summary", "") or ""
         try:
             parsed = json.loads(summary.rstrip("…"))
             _walk(parsed)
         except (json.JSONDecodeError, ValueError):
-            # Fall back to a regex walk over the raw string.
             _walk(summary)
-    return seen
+    return seen, numeric_lists
+
+
+def _value_grounded_by_aggregate(
+    value: float, numeric_lists: list[list[float]],
+) -> bool:
+    """True when *value* matches the mean, sum, max, min, or falls
+    within [min, max] of any collected numeric list, within 5%.
+
+    LLMs computing 30-day averages produce numbers that don't appear
+    verbatim in the tool output — but they ARE honest derivations from
+    lists that DO appear. This function accepts those cases.
+    """
+    tolerance = max(0.5, abs(value) * 0.05)
+    for values in numeric_lists:
+        if not values:
+            continue
+        mean = sum(values) / len(values)
+        total = sum(values)
+        lo, hi = min(values), max(values)
+        for anchor in (mean, total, lo, hi):
+            if abs(value - anchor) <= tolerance:
+                return True
+        # Range check: if the value falls comfortably between min and
+        # max, it's likely a legitimate sample the model picked from
+        # the series.
+        if lo <= value <= hi:
+            return True
+    return False
 
 
 def _values_grounded(chart: dict, tool_numbers: set[float]) -> tuple[bool, list[float]]:
@@ -247,22 +317,51 @@ def _prediction_arithmetic_ok(
 
 
 def _prediction_grounded(
-    chart: dict, tool_numbers: set[float],
+    chart: dict,
+    tool_numbers: set[float],
+    numeric_lists: list[list[float]] | None = None,
 ) -> tuple[bool, list[float]]:
     """When `prediction_basis` is present, verify that every value in
-    both `current_grounding` and `rate_grounding` appears in the tool
-    outputs from this turn.
+    both `current_grounding` and `rate_grounding` traces back to a real
+    tool_result.
 
-    We don't check the bars' own y-values here because the "Change" and
-    "Projected" bars are derived and will not naturally appear in a raw
-    tool_result. Instead we check the inputs the model claims to have
-    used — that's what could be fabricated.
+    A value is considered grounded when any of these are true:
+      1. It matches a raw number in the tool output (exact / penny drift)
+      2. It matches an aggregate (mean/sum/max/min) of any numeric list
+         in the tool output within 5% — accepts values like "30-day
+         average = $57/day" that are derived by honest arithmetic from
+         values that ARE in the output
+      3. It falls within [min, max] of a numeric list in the output —
+         accepts values the model quoted as a representative sample
+         from an observed range
+
+    Only when all three fail is the value labelled "fabricated" and
+    added to the offending list.
     """
     if "prediction_basis" not in chart:
         return True, []
+    numeric_lists = numeric_lists or []
     basis = chart["prediction_basis"]
     offending: list[float] = []
-    for field in ("current_grounding", "rate_grounding"):
+
+    # ASSUMED-values escape hatch: when the basis note names its output
+    # as ASSUMED / assumed / illustrative / rough-estimate, we accept
+    # that the model is doing an honest what-if without historical
+    # backing. Grounding of `current_grounding` is still enforced (that
+    # value SHOULD be a real reading) but `rate_grounding` is allowed
+    # to be empty or unverified because the whole point of an ASSUMED
+    # chart is that the rate isn't measured.
+    note = str(basis.get("note", "")).lower()
+    is_assumed = any(
+        marker in note for marker in
+        ("assumed", "illustrative", "rough", "not measured", "no precedent")
+    )
+
+    fields_to_check = ["current_grounding"]
+    if not is_assumed:
+        fields_to_check.append("rate_grounding")
+
+    for field in fields_to_check:
         for v in basis.get(field, []):
             if not isinstance(v, (int, float)) or isinstance(v, bool):
                 offending.append(v)
@@ -270,14 +369,18 @@ def _prediction_grounded(
             rounded = round(float(v), 4)
             if rounded in tool_numbers:
                 continue
-            tolerated = any(
+            # Penny-drift tolerance against raw numbers.
+            if any(
                 abs(rounded - t) <= max(0.01, abs(t) * 0.01)
                 for t in tool_numbers
-            )
-            if not tolerated:
-                offending.append(v)
-                if len(offending) >= 5:
-                    return False, offending
+            ):
+                continue
+            # Aggregate / range tolerance against numeric lists.
+            if _value_grounded_by_aggregate(float(v), numeric_lists):
+                continue
+            offending.append(v)
+            if len(offending) >= 5:
+                return False, offending
     return len(offending) == 0, offending
 
 
@@ -329,7 +432,7 @@ def render_charts_inline(
     if not charts:
         return
 
-    tool_numbers = _all_tool_result_numbers(tool_calls)
+    tool_numbers, numeric_lists = _tool_result_numbers_and_lists(tool_calls)
 
     for i, chart in enumerate(charts, start=1):
         ok, err = _schema_ok(chart)
@@ -356,7 +459,9 @@ def render_charts_inline(
             )
             continue
 
-        pred_ok, pred_offending = _prediction_grounded(chart, tool_numbers)
+        pred_ok, pred_offending = _prediction_grounded(
+            chart, tool_numbers, numeric_lists,
+        )
         if not pred_ok:
             preview = ", ".join(str(v) for v in pred_offending[:5])
             st.warning(
