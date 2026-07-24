@@ -340,14 +340,33 @@ with a leading "$" (e.g. "$400–800", "$65K/year", never a bare "400–800" \
 or "65K/year") since these are all USD amounts."""
 
 
+def _infer_repo_from_profile(profile: str | None) -> str | None:
+    """Given an AWS SSO profile name like ``dil-data-platform-dev``, return
+    the likely GitHub repo (``DiligentCorp/data-platform``) using the same
+    ``normalize_profile`` helper that every other CostSense page uses.
+
+    Returns None for shared/team profiles (``dil-team-*``) and unknown
+    conventions. The bot is told this is a HINT — it should verify with
+    ``github_search_repositories`` before treating the repo as confirmed.
+    """
+    try:
+        from src.pr_scanner.profile_repo_match import normalize_profile
+    except Exception:  # noqa: BLE001
+        return None
+    normalized = normalize_profile(profile or "")
+    if not normalized:
+        return None
+    return f"DiligentCorp/{normalized}"
+
+
 def _build_system(
     profile: str | None,
     account_id: str | None,
     github_read_available: bool = False,
 ) -> str:
     """Prepend the active-scope block. Front-loading the profile + account
-    + GitHub-availability flag before the rules block anchors the model to
-    the correct scope earlier in the context window."""
+    + GitHub-availability flag + inferred repo before the rules block
+    anchors the model to the correct scope earlier in the context window."""
     scope_lines = ["ACTIVE SCOPE:"]
     if profile:
         scope_lines.append(f"- AWS profile: {profile}")
@@ -359,6 +378,24 @@ def _build_system(
         scope_lines.append(
             "- AWS account id: (unknown — the profile could not resolve "
             "get-caller-identity; assume you have no AWS access)"
+        )
+    # Inferred repo hint: `dil-data-platform-dev` -> `DiligentCorp/data-platform`.
+    # This is the same convention every other page (Anomalies, PR Predictor,
+    # Close the Loop) uses via `normalize_profile`. Adding it here so the
+    # chatbot doesn't ask "which repo?" for questions where the answer is
+    # already implied by the active profile.
+    inferred_repo = _infer_repo_from_profile(profile) if github_read_available else None
+    if inferred_repo:
+        scope_lines.append(
+            f"- Inferred repo (from profile-name convention): {inferred_repo}. "
+            f"Treat this as a HINT: use it as the default when the user "
+            f"asks about 'the repo', 'this account's code', or an event "
+            f"prediction question ('if we onboard N orgs', 'cost of "
+            f"migration X'). Verify with `github_search_repositories` "
+            f"before quoting file contents or PR numbers, but do NOT ask "
+            f"the user which repo it is unless the search comes back "
+            f"empty or you have specific reason to think the inference "
+            f"is wrong."
         )
     if github_read_available:
         scope_lines.append(
@@ -374,6 +411,13 @@ def _build_system(
         "You MUST NOT report figures for any OTHER account. If the user "
         "asks about a different account id, tell them to switch profiles "
         "in the sidebar — do not attempt to answer."
+    )
+    scope_lines.append(
+        "Tool names: the tool list at the top of this turn is exhaustive. "
+        "Do NOT invent tool names ('precedent_lookup', 'cost_forecast', "
+        "'repo_analyzer', etc.) — if a capability you want isn't in the "
+        "tool list, say so plainly rather than pretending you tried to "
+        "call something that doesn't exist."
     )
     return "\n".join(scope_lines) + "\n\n" + _SYSTEM_BASE
 
