@@ -138,6 +138,7 @@ def _run_pending_question(q: str) -> None:
             model_id=model_id,
             history=st.session_state.chat_history,
             user_msg=q,
+            account_id=active.account_id,
         )
     except Exception as e:  # noqa: BLE001
         st.session_state.chat_display.append({
@@ -159,6 +160,8 @@ def _run_pending_question(q: str) -> None:
         "role": "assistant",
         "text": turn.reply,
         "tool_calls": turn.tool_calls,
+        "guard_triggered": turn.guard_triggered,
+        "guard_reason": turn.guard_reason,
     })
 
 
@@ -166,6 +169,19 @@ def _run_pending_question(q: str) -> None:
 
 for msg in st.session_state.chat_display:
     with st.chat_message(msg["role"]):
+        if msg.get("guard_triggered"):
+            st.error(
+                "**Hallucination guard intercepted this reply.** "
+                "One or more AWS tool calls were denied by IAM, and the "
+                "model's original answer contained dollar figures that "
+                "weren't grounded in a successful API response. Below is "
+                "the honest fallback message.",
+                icon="🛑",
+            )
+            reason = msg.get("guard_reason")
+            if reason:
+                with st.expander("Why the guard fired"):
+                    st.caption(reason)
         _safe_md(msg["text"])
         if msg.get("_trace"):
             with st.expander("Traceback"):

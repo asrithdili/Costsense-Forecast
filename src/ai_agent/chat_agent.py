@@ -5,8 +5,23 @@ Every tool call goes through `scrub()` (from aws_tools_broad) which recursively
 strips anything that looks like a secret, IAM policy document, JWT, private
 key, or AWS access key ID — before Claude sees the tool output.
 
+Hallucination hardening (added 2026-07):
+    LLMs will fabricate dollar figures when a tool errors, even with a system
+    prompt telling them not to. Three layers of defense keep the assistant
+    honest when the user's AWS profile can't read a resource:
+      1. Every tool_result whose payload contains an ``error`` field is sent
+         back to Claude with Anthropic's ``is_error: true`` flag — the model
+         treats explicit is_error results very differently from a JSON string
+         that happens to contain the word "error".
+      2. The system prompt injects the ACTIVE profile + account id so the
+         model can't answer questions about a different account.
+      3. A post-loop guard scans the final reply. If any tool call was denied
+         AND the reply contains a $-figure, we replace the reply with an
+         explicit "I don't have access to X" message. Deterministic backstop
+         for the LLM-based rules above.
+
 Public API:
-    chat_step(profile, model_id, history, user_msg) -> ChatTurn
+    chat_step(profile, model_id, history, user_msg, account_id) -> ChatTurn
 
 `history` is the running list of {role, content} messages Claude will see.
 `ChatTurn` bundles the assistant reply text, tool-call transcript, and the
@@ -15,6 +30,7 @@ updated history to store back in session_state.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 
 import boto3
@@ -30,7 +46,95 @@ MAX_TOOL_TURNS_PER_QUESTION = 12
 MAX_TOKENS = 3000
 
 
-SYSTEM = """You are CostSense — a senior AWS FinOps analyst embedded in a \
+# ---------------------------------------------------------------------------
+# Error classification
+# ---------------------------------------------------------------------------
+#
+# Every tool in aws_tools / aws_tools_broad / github_tools wraps its
+# implementation in a `_safe` decorator that returns
+# ``{"error": "<ExceptionClassName>: <message>"}`` when boto3 or the GitHub
+# API raises. We inspect that string to bucket failures — the buckets drive
+# both the is_error flag we send to Claude and the post-loop guard.
+
+_NO_ACCESS_MARKERS = (
+    "AccessDenied",
+    "UnauthorizedOperation",
+    "AuthFailure",
+    "InvalidClientTokenId",
+    "SignatureDoesNotMatch",
+    "NoCredentials",
+    "TokenRefreshRequired",
+    "ExpiredToken",
+    "SSOTokenLoadError",
+    "UnrecognizedClientException",
+    "not authorized",
+    "is not authorized to perform",
+    "403",
+)
+
+_TRANSIENT_MARKERS = (
+    "Throttling",
+    "ThrottlingException",
+    "RequestLimitExceeded",
+    "TooManyRequests",
+    "ServiceUnavailable",
+    "InternalServerError",
+    "500",
+    "502",
+    "503",
+    "504",
+    "EndpointConnectionError",
+    "ReadTimeoutError",
+    "ConnectTimeoutError",
+)
+
+_NOT_FOUND_MARKERS = (
+    "NoSuchEntity",
+    "NotFound",
+    "ResourceNotFoundException",
+    "NoSuchBucket",
+    "InvalidParameterValueException",
+    "404",
+)
+
+
+def _classify_error(error_text: str) -> str:
+    """Bucket a raw error string into a coarse kind. The buckets are
+    deliberately coarse: the goal is to detect *access denial* reliably so
+    the post-loop guard can catch fabrications; other kinds are informational.
+    """
+    if not error_text:
+        return "unknown"
+    lowered = str(error_text)
+    for marker in _NO_ACCESS_MARKERS:
+        if marker in lowered:
+            return "no_access"
+    for marker in _TRANSIENT_MARKERS:
+        if marker in lowered:
+            return "transient"
+    for marker in _NOT_FOUND_MARKERS:
+        if marker in lowered:
+            return "not_found"
+    return "unknown"
+
+
+def _tool_result_meta(result) -> tuple[bool, str | None, str | None]:
+    """Return ``(is_error, error_kind, error_text)`` for a tool result.
+
+    Success case returns ``(False, None, None)``. Any dict with a truthy
+    ``error`` key is treated as a failure.
+    """
+    if isinstance(result, dict) and result.get("error"):
+        error_text = str(result["error"])
+        return True, _classify_error(error_text), error_text
+    return False, None, None
+
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+_SYSTEM_BASE = """You are CostSense — a senior AWS FinOps analyst embedded in a \
 chat interface. The user will ask questions about their AWS account and you \
 will ground every answer in real data by calling the read-only tools you \
 have available.
@@ -67,17 +171,63 @@ you fabricated came from a tool.
 - If the user asks something truly out of scope (e.g. "write me a poem"), \
 politely redirect to FinOps or the connected GitHub repos.
 
+CRITICAL ANTI-HALLUCINATION RULES:
+- If ANY tool_result comes back with is_error=true, treat that call as \
+having produced NO DATA. You may not use its content as a source of numbers.
+- If an is_error tool_result mentions access denial (AccessDenied, not \
+authorized, NoCredentials, ExpiredToken), tell the user their profile lacks \
+access to that resource — do NOT retry the same call and do NOT substitute \
+a plausible number in its place.
+- If ALL tools relevant to the user's question failed, your reply MUST NOT \
+contain any dollar figure. Say plainly that you can't answer without \
+access and suggest switching profiles or asking the account owner.
+- Numbers you cannot ground in a successful tool_result MUST be omitted. \
+Prose ("Lambda is your biggest driver") is fine when supported by a tool; \
+figures ($400/day, ~$65K/month) are ONLY fine when a tool call actually \
+returned them.
+
 Response format: plain markdown. Use bullet points and short paragraphs. \
 No JSON unless the user explicitly asks for JSON. Always write dollar \
 figures with a leading "$" (e.g. "$400–800", "$65K/year", never a bare \
 "400–800" or "65K/year") since these are all USD amounts."""
 
 
+def _build_system(profile: str | None, account_id: str | None) -> str:
+    """Prepend the active-scope block. Front-loading the profile + account
+    before the rules block anchors the model to the correct scope earlier
+    in the context window."""
+    scope_lines = ["ACTIVE SCOPE:"]
+    if profile:
+        scope_lines.append(f"- AWS profile: {profile}")
+    else:
+        scope_lines.append("- AWS profile: (none — tools will fail)")
+    if account_id:
+        scope_lines.append(f"- AWS account id: {account_id}")
+    else:
+        scope_lines.append(
+            "- AWS account id: (unknown — the profile could not resolve "
+            "get-caller-identity; assume you have no AWS access)"
+        )
+    scope_lines.append(
+        "You MUST NOT report figures for any OTHER account. If the user "
+        "asks about a different account id, tell them to switch profiles "
+        "in the sidebar — do not attempt to answer."
+    )
+    return "\n".join(scope_lines) + "\n\n" + _SYSTEM_BASE
+
+
+# ---------------------------------------------------------------------------
+# Public dataclasses
+# ---------------------------------------------------------------------------
+
 @dataclass
 class ToolCall:
     name: str
     input: dict
     output_summary: str        # first ~200 chars of the (scrubbed) result
+    is_error: bool = False
+    error_kind: str | None = None
+    error_text: str | None = None
 
 
 @dataclass
@@ -87,7 +237,13 @@ class ChatTurn:
     updated_history: list[dict] = field(default_factory=list)
     error: str | None = None
     model_id: str = ""
+    guard_triggered: bool = False   # True when post-loop guard rewrote reply
+    guard_reason: str | None = None
 
+
+# ---------------------------------------------------------------------------
+# Tool dispatch
+# ---------------------------------------------------------------------------
 
 def _merged_tool_specs() -> list[dict]:
     """All tools available to the chat agent: AWS base + broad + GitHub."""
@@ -120,17 +276,85 @@ def _summarize_output(obj) -> str:
     return s[:220] + ("…" if len(s) > 220 else "")
 
 
+# ---------------------------------------------------------------------------
+# Post-loop hallucination guard
+# ---------------------------------------------------------------------------
+
+# Matches "$400", "$1,200.50", "$65K", "$65k", "$1.2M", "$400/day", etc.
+_DOLLAR_FIGURE_RE = re.compile(r"\$\s?[\d][\d,\.]*\s?[KkMmBb]?")
+
+
+def _apply_hallucination_guard(
+    reply: str,
+    tool_calls: list[ToolCall],
+    profile: str | None,
+    account_id: str | None,
+) -> tuple[str, bool, str | None]:
+    """If any tool call failed with ``no_access`` AND the reply contains a
+    dollar figure, replace the reply with an honest denial. This is the
+    deterministic backstop for the anti-hallucination rules in the system
+    prompt — it catches cases where the model produces $-figures anyway.
+
+    Returns ``(new_reply, guard_triggered, reason)``.
+    """
+    denied_tools = [tc for tc in tool_calls
+                    if tc.is_error and tc.error_kind == "no_access"]
+    if not denied_tools:
+        return reply, False, None
+
+    figures = _DOLLAR_FIGURE_RE.findall(reply or "")
+    if not figures:
+        # Model correctly avoided fabricating a number — nothing to override,
+        # but we still return a "guard did not trigger" so the caller can
+        # optionally surface a caveat.
+        return reply, False, None
+
+    tool_names = sorted({tc.name for tc in denied_tools})
+    scope_line = (
+        f"profile `{profile}` (account {account_id})"
+        if account_id else f"profile `{profile or '(none)'}`"
+    )
+    honest_reply = (
+        f"I can't answer this with real numbers — {scope_line} was denied "
+        f"access on: {', '.join(tool_names)}.\n\n"
+        f"AWS returned an authorization error, so any dollar figures I "
+        f"gave you here would be a guess, not real data. Switch to a "
+        f"profile that has read access to this account (Cost Explorer + "
+        f"the relevant service APIs), or ask the account owner to run the "
+        f"question — I'll ground the answer in the actual API response."
+    )
+    reason = (
+        f"reply contained {len(figures)} dollar figure(s) but "
+        f"{len(denied_tools)} tool call(s) were denied: "
+        f"{', '.join(tool_names)}"
+    )
+    return honest_reply, True, reason
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
 def chat_step(
     profile: str | None,
     model_id: str,
     history: list[dict],
     user_msg: str,
+    account_id: str | None = None,
 ) -> ChatTurn:
     """Advance one user turn. Runs the tool-use loop for this question and
-    returns the assistant reply plus updated history."""
+    returns the assistant reply plus updated history.
+
+    ``account_id`` is the id resolved from ``profile`` via STS
+    get-caller-identity. It's used to scope the system prompt and to phrase
+    the denial message when the post-loop guard fires. Callers that don't
+    have it can pass ``None`` — the guard still works, it just can't name
+    the account in the denial.
+    """
     from src.ai_agent.bedrock_client import make_client
     client = make_client(profile, region=BEDROCK_REGION)
 
+    system_prompt = _build_system(profile, account_id)
     messages = list(history) + [{"role": "user", "content": user_msg}]
     tool_calls: list[ToolCall] = []
 
@@ -142,7 +366,7 @@ def chat_step(
                     "anthropic_version": "bedrock-2023-05-31",
                     "max_tokens": MAX_TOKENS,
                     "temperature": 0.2,
-                    "system": SYSTEM,
+                    "system": system_prompt,
                     "tools": _merged_tool_specs(),
                     "messages": messages,
                 }),
@@ -162,15 +386,18 @@ def chat_step(
             results = []
             for blk in tool_use_blocks:
                 out = _run_tool(blk["name"], blk.get("input") or {}, profile)
+                is_err, err_kind, err_text = _tool_result_meta(out)
                 tool_calls.append(ToolCall(
                     name=blk["name"],
                     input=blk.get("input") or {},
                     output_summary=_summarize_output(out),
+                    is_error=is_err,
+                    error_kind=err_kind,
+                    error_text=err_text,
                 ))
                 # Cap payload sent back to Claude
                 serialized = json.dumps(out, default=str)
                 if len(serialized) > 8000:
-                    # Structural trim: send only top-level keys + counts if huge
                     if isinstance(out, dict):
                         trimmed = {k: (f"<large list, len={len(v)}>"
                                        if isinstance(v, list) and len(v) > 30
@@ -179,11 +406,19 @@ def chat_step(
                         serialized = json.dumps(trimmed, default=str)[:8000]
                     else:
                         serialized = serialized[:8000] + "…[truncated]"
-                results.append({
+                result_block = {
                     "type": "tool_result",
                     "tool_use_id": blk["id"],
                     "content": serialized,
-                })
+                }
+                # Anthropic Messages API: setting is_error=true on the
+                # tool_result changes how the model treats the payload —
+                # it's much less likely to hallucinate a value from an
+                # explicitly-erroring call than from a JSON blob that
+                # happens to contain the word "error".
+                if is_err:
+                    result_block["is_error"] = True
+                results.append(result_block)
             messages.append({"role": "user", "content": results})
             continue
 
@@ -191,13 +426,34 @@ def chat_step(
         text_block = next((b for b in content if b.get("type") == "text"), None)
         reply = text_block.get("text", "") if text_block else "(no reply)"
 
-        # Persist the final assistant turn in the history so follow-ups see it.
+        # Post-loop hallucination guard: if the model produced $-figures
+        # despite one or more denied tool calls, replace the reply with an
+        # honest "I don't have access" message. This is deterministic — no
+        # LLM in the loop, so it can't be talked around.
+        reply, guard_triggered, guard_reason = _apply_hallucination_guard(
+            reply, tool_calls, profile, account_id,
+        )
+
+        # Persist the final assistant turn in the history so follow-ups see
+        # the OVERRIDDEN reply, not the model's original fabrication.
+        if guard_triggered:
+            # Replace the text block in the assistant message before saving
+            # to history, so subsequent turns don't see the fabricated one.
+            content = [
+                {"type": "text", "text": reply}
+                if b.get("type") == "text" else b
+                for b in content
+            ]
+            if not any(b.get("type") == "text" for b in content):
+                content.append({"type": "text", "text": reply})
         messages.append({"role": "assistant", "content": content})
         return ChatTurn(
             reply=reply,
             tool_calls=tool_calls,
             updated_history=messages,
             model_id=model_id,
+            guard_triggered=guard_triggered,
+            guard_reason=guard_reason,
         )
 
     return ChatTurn(
