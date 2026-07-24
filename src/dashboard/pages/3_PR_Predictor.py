@@ -27,8 +27,6 @@ from src.dashboard.state_cache import cached_state
 from src.dashboard.nav import (
     inject_css, render_sidebar_footer, render_sidebar_header, top_bar,
 )
-from src.forecast.adapters import event_from_pr_predictor, queue_pending_event
-
 
 st.set_page_config(page_title="CostSense · PR Predictor", layout="wide")
 inject_css()
@@ -339,35 +337,6 @@ if verdict is not None:
         ("Basis", _basis_pill_level, _basis_text),
         ("Confidence", _conf_pill_level, _conf.title()),
     ])
-
-    fc1, fc2 = st.columns([2, 1], gap="medium", vertical_alignment="bottom")
-    with fc1:
-        deploy_date = st.date_input(
-            "Expected merge / deploy date",
-            value=date.today() + timedelta(days=14),
-            key=f"prp_fc_deploy::{active.account_id}::{pr_url.strip()}",
-            help="When this PR's cost impact is expected to land in the forecast.",
-        )
-    with fc2:
-        if st.button(
-            "Add to future forecast",
-            key=f"prp_fc_add::{active.account_id}::{pr_url.strip()}",
-            use_container_width=True,
-        ):
-            ev = event_from_pr_predictor(
-                pr_url.strip(),
-                verdict,
-                expected_deploy=deploy_date,
-            )
-            if ev is None:
-                st.warning("No material cost delta to add to the forecast.")
-            else:
-                queue_pending_event(active.profile, ev)
-                callout(
-                    "Queued for Future Forecast — open that page to review "
-                    "and toggle the event.",
-                    tone="success",
-                )
 
     if not _measured or _basis != "measured":
         if _basis == "sibling_account":

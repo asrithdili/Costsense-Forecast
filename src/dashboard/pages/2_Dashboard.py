@@ -33,6 +33,12 @@ from src.backtest.scorer import score_for_target
 from src.forecast.backtest_replay import training_fit_replay
 from src.pipeline.paths import actuals_dir, backtest_dir, predictions_dir
 from src.pipeline.run_daily import run as run_pipeline
+from src.forecast.event_store import get_stored_events
+from src.forecast.event_overlay import (
+    overlay_events_on_forecast_df,
+    projection_for_ledger,
+    total_event_delta_usd,
+)
 
 
 FORECAST_MODEL_OPTIONS: dict[str, str] = {
@@ -51,6 +57,7 @@ from src.pr_scanner.repos import (
 from src.dashboard.costsense_theme import (
     C, callout, metric, money, pill, plotly_layout, section,
 )
+from src.dashboard.event_ledger_ui import render_event_ledger_section
 from src.dashboard.live_cost_meter import render_live_cost_meter
 from src.dashboard.notifications_ui import NotificationDraft, render_notification_button
 from src.dashboard.nav import (
@@ -234,15 +241,17 @@ _selected_service = (None if _svc_pick.startswith("(all")
                      else _svc_pick.split("  —  ")[0])
 
 _include_pr = st.session_state.get("dash_include_pr", False)
+_include_future_events = st.session_state.get("dash_include_future_events", False)
+_include_github = _include_pr or _include_future_events
 
-# GitHub org + repos — only when PR impact is enabled (avoids gh API calls).
+# GitHub org + repos — when PR impact or future events need codebase context.
 orgs: list[str] = []
 short_names: list[str] = []
 default_repos: list[str] = []
 default_org_idx = 0
 gh_org_default = "DiligentCorp"
 gh_org = st.session_state.get("dash_gh_org", gh_org_default)
-if _include_pr:
+if _include_github:
     try:
         gh_login()
         orgs = list(gh_orgs())
@@ -268,10 +277,11 @@ if _include_pr:
 
 svc_hdr = _selected_service or "All services"
 _pr_hdr = "PR on" if _include_pr else "billing only"
+_events_hdr = "events on" if _include_future_events else "events off"
 header = (f"Controls  ·  Account: {picked_label}  ·  "
           f"Cutoff: {_cutoff.isoformat()}  ·  "
           f"History: {_history_days}d  ·  Scope: {svc_hdr}  ·  "
-          f"Model: {_model_choice}  ·  {_pr_hdr}")
+          f"Model: {_model_choice}  ·  {_pr_hdr}  ·  {_events_hdr}")
 
 with top_bar(header):
     # Row 1 — AWS
@@ -311,8 +321,10 @@ with top_bar(header):
                  "in the model itself.",
         )
 
-    # Row 2 — service filter + optional PR layer
-    r2c1, r2c2 = st.columns([4, 2], gap="medium", vertical_alignment="bottom")
+    # Row 2 — service filter + optional layers
+    r2c1, r2c2, r2c3 = st.columns(
+        [4, 2, 2], gap="medium", vertical_alignment="bottom",
+    )
     with r2c1:
         pick_svc = st.selectbox(
             "Service filter", svc_options,
@@ -329,6 +341,14 @@ with top_bar(header):
                  "GitHub or Bedrock calls. Turn on to layer merged/open "
                  "PR cost deltas on top.",
         )
+    with r2c3:
+        include_future_events = st.checkbox(
+            "Include future events",
+            value=False,
+            key="dash_include_future_events",
+            help="Show the event ledger and layer validated manual "
+                 "assumptions on the forecast.",
+        )
     selected_service = (None if pick_svc.startswith("(all")
                         else pick_svc.split("  —  ")[0])
 
@@ -336,10 +356,14 @@ with top_bar(header):
     base_branch: str | None = None
     pr_lookback = 14
     analyzer_choice = "regex"
-    llm_model_choice = "us.anthropic.claude-sonnet-4-6"
+    llm_model_choice = st.session_state.get(
+        "dash_pr_llm", "us.anthropic.claude-sonnet-4-6",
+    )
+    if isinstance(llm_model_choice, int):
+        llm_model_choice = "us.anthropic.claude-sonnet-4-6"
 
-    if include_pr:
-        # Row 3 — GitHub
+    if include_pr or include_future_events:
+        # Row 3 — GitHub scope (repos ground event validation + PR scans)
         r3c1, r3c2, r3c3, r3c4 = st.columns(
             [2, 4, 2, 2], gap="medium", vertical_alignment="bottom",
         )
@@ -355,45 +379,63 @@ with top_bar(header):
                     "GitHub org", value=gh_org, key="dash_gh_org",
                 )
         with r3c2:
-            # Widget key includes the version counter — bumped on account
-            # change so Streamlit sees this as a NEW widget and honors
-            # `default=` (instead of restoring the previous multiselect
-            # state, which would keep showing the old profile's repo).
             picked_short = st.multiselect(
-                "Repos", options=short_names, default=default_repos,
+                "Repos",
+                options=short_names,
+                default=default_repos,
                 key=f"dash_repos_v{_widget_ver}",
+                help="Used for PR scans and for event validation against "
+                     "your codebase.",
             )
         selected_repos = [f"{gh_org}/{n}" for n in picked_short] if gh_org else []
 
-        # Base branch dropdown
-        branch_choices: list[str] = []
-        if selected_repos:
-            for r in selected_repos:
-                try:
-                    for b in recent_base_branches(r):
-                        if b not in branch_choices:
-                            branch_choices.append(b)
-                    default = repo_default_branch(r)
-                    if default not in branch_choices:
-                        branch_choices.append(default)
-                except Exception:  # noqa: BLE001
-                    continue
-        with r3c3:
-            if branch_choices:
-                base_branch = st.selectbox(
-                    "Base branch", branch_choices, key="dash_base_branch",
+        if include_pr:
+            branch_choices: list[str] = []
+            if selected_repos:
+                for r in selected_repos:
+                    try:
+                        for b in recent_base_branches(r):
+                            if b not in branch_choices:
+                                branch_choices.append(b)
+                        default = repo_default_branch(r)
+                        if default not in branch_choices:
+                            branch_choices.append(default)
+                    except Exception:  # noqa: BLE001
+                        continue
+            with r3c3:
+                if branch_choices:
+                    base_branch = st.selectbox(
+                        "Base branch", branch_choices, key="dash_base_branch",
+                    )
+                else:
+                    base_branch = st.text_input(
+                        "Base branch", placeholder="e.g. main",
+                        key="dash_base_branch_text",
+                    ) or None
+            with r3c4:
+                pr_lookback = st.slider(
+                    "PR lookback (d)", 3, 30, 14, step=1, key="dash_pr_lookback",
                 )
-            else:
-                base_branch = st.text_input(
-                    "Base branch", placeholder="e.g. main",
-                    key="dash_base_branch_text",
-                ) or None
-        with r3c4:
-            pr_lookback = st.slider(
-                "PR lookback (d)", 3, 30, 14, step=1, key="dash_pr_lookback",
-            )
+        elif include_future_events:
+            with r3c3:
+                llm_model_choice = st.selectbox(
+                    "Validation model",
+                    options=[
+                        "us.anthropic.claude-sonnet-4-6",
+                        "anthropic.claude-3-haiku-20240307-v1:0",
+                    ],
+                    index=0,
+                    key="dash_event_llm",
+                    help="Bedrock model for AI event validation.",
+                )
+            with r3c4:
+                st.caption(
+                    f"{len(selected_repos)} repo(s) in scope for validation."
+                    if selected_repos else
+                    "Pick repos so the agent can read your codebase."
+                )
 
-        # Row 4 — PR analyzer
+    if include_pr:
         r4c1, r4c2, _, _ = st.columns(
             [2, 3, 2, 2], gap="medium", vertical_alignment="bottom",
         )
@@ -467,6 +509,8 @@ with st.sidebar:
             ("Model",    model_choice),
             ("Scope",    selected_service or "All services"),
             ("PR layer", "on" if include_pr else "off"),
+            ("Events",   "on" if include_future_events else "off"),
+            ("Repos",    str(len(selected_repos)) if _include_github else "—"),
         ],
     )
 
@@ -507,6 +551,7 @@ with st.spinner(f"Fetching cost history for `{active_profile}`… "
 # wall-clock past 5 minutes on a busy repo, which the demo needs to
 # stay under.
 _MAX_OPEN_PRS_DEEP_ANALYSIS = 3
+_EVENT_FORECAST_DAYS = 7
 
 if do_forecast:
     _run_msg = (
@@ -621,6 +666,70 @@ except Exception:  # noqa: BLE001
 
 bt = _load_backtest(account_id)
 fc_df = pd.DataFrame(latest["forecast"]) if latest else pd.DataFrame()
+_fc_df_raw = fc_df.copy()
+
+_stored_events = get_stored_events(active_profile) if include_future_events else []
+_events_applied = False
+_event_delta_total = 0.0
+if (
+    include_future_events
+    and _stored_events
+    and not fc_df.empty
+    and selected_service is None
+):
+    fc_df = overlay_events_on_forecast_df(fc_df, _stored_events)
+    _event_delta_total = total_event_delta_usd(fc_df)
+    _events_applied = any(e.enabled for e in _stored_events)
+    _events_in_chart_window = abs(_event_delta_total) > 0.5
+
+if include_future_events:
+    _enabled_events = sum(1 for e in _stored_events if e.enabled)
+    with st.container(border=True):
+        if _events_applied and _events_in_chart_window:
+            section(
+                "Future events layer",
+                f"**{_enabled_events}** enabled event(s) in the ledger are "
+                "bumped onto the forecast line and next-7-day total "
+                f"(**${_event_delta_total:+,.0f}** over the chart window). "
+                "Toggle events in the ledger below to see the chart update.",
+                kicker="Included",
+            )
+        elif _events_applied:
+            section(
+                "Future events layer",
+                f"**{_enabled_events}** enabled event(s) in the ledger. "
+                "None affect the next-7-day chart yet — see the waterfall "
+                "below for when they land.",
+                kicker="Outside chart window",
+            )
+        elif selected_service is not None:
+            section(
+                "Future events layer",
+                "Event deltas are account-wide. Clear the **service filter** "
+                "to layer ledger events on the forecast chart.",
+                kicker="Service filter on",
+            )
+        elif not _stored_events:
+            section(
+                "Future events layer",
+                "No events in the ledger yet. Add one below — each is "
+                "validated against AWS and GitHub before it affects the forecast.",
+                kicker="Empty",
+            )
+        elif fc_df.empty:
+            section(
+                "Future events layer",
+                "Run **Run forecast** in Controls first, then ledger events "
+                "will layer onto the future band.",
+                kicker="No forecast",
+            )
+        else:
+            section(
+                "Future events layer",
+                "All ledger events are toggled off — enable at least one to "
+                "bump the forecast.",
+                kicker="Disabled",
+            )
 
 # PR step series (history + future) persisted by the pipeline.
 # Only show it when NO service filter is selected — PR deltas are account-wide,
@@ -827,7 +936,12 @@ else:
         ))
         fig.add_trace(go.Scatter(
             x=fc_df["target_date"], y=fc_df["adjusted_usd"],
-            mode="lines+markers", name="adjusted (baseline + PR delta)",
+            mode="lines+markers",
+            name=(
+                "adjusted (baseline + PR + events)"
+                if _events_applied else
+                "adjusted (baseline + PR delta)"
+            ),
             line=dict(color=C.BRAND_DARK, width=2.5, shape="spline",
                       smoothing=1.0),
         ))
@@ -902,18 +1016,67 @@ else:
             "Daily baseline, PR delta, and confidence band.",
             kicker="Breakdown",
         )
+        _detail_cols = ["target_date", "baseline_usd", "pr_delta_usd"]
+        if "event_delta_usd" in fc_df.columns:
+            _detail_cols.append("event_delta_usd")
+        _detail_cols.extend(["adjusted_usd", "lower_usd", "upper_usd"])
+        _rename = {
+            "target_date": "Date",
+            "baseline_usd": "Baseline",
+            "pr_delta_usd": "PR Δ",
+            "event_delta_usd": "Events Δ",
+            "adjusted_usd": "Adjusted",
+            "lower_usd": "Lower",
+            "upper_usd": "Upper",
+        }
         st.dataframe(
-            fc_df[["target_date", "baseline_usd", "pr_delta_usd",
-                   "adjusted_usd", "lower_usd", "upper_usd"]]
-            .rename(columns={
-                "target_date": "Date",
-                "baseline_usd": "Baseline",
-                "pr_delta_usd": "PR Δ",
-                "adjusted_usd": "Adjusted",
-                "lower_usd": "Lower",
-                "upper_usd": "Upper",
-            }),
+            fc_df[_detail_cols].rename(columns=_rename),
             use_container_width=True, hide_index=True,
+        )
+
+
+if include_future_events:
+    st.divider()
+    _events = get_stored_events(active_profile)
+    _event_start = cutoff + timedelta(days=1)
+    _event_proj = None
+    try:
+        if not _fc_df_raw.empty:
+            _event_proj = projection_for_ledger(_fc_df_raw, _events)
+        elif not hist_df.empty:
+            _hist_dates = [date.fromisoformat(d) for d in hist_df["day"]]
+            _hist_values = hist_df["actual_usd"].tolist()
+            _event_proj = projection_for_ledger(
+                pd.DataFrame(),
+                _events,
+                hist_values=_hist_values,
+                hist_dates=_hist_dates,
+                fallback_start=_event_start,
+                min_horizon_days=_EVENT_FORECAST_DAYS,
+            )
+        else:
+            callout(
+                "No cost history — add events after Cost Explorer data loads.",
+                tone="warning",
+            )
+    except ValueError:
+        callout(
+            "Run **Run forecast** in Controls to size event impacts, or wait "
+            "for cost history to load.",
+            tone="warning",
+        )
+    if _event_proj is not None:
+        _event_start = _event_proj.dates[0]
+        render_event_ledger_section(
+            profile=active_profile,
+            projection=_event_proj,
+            chart_window_end=(
+                date.fromisoformat(str(_fc_df_raw["target_date"].iloc[-1])[:10])
+                if not _fc_df_raw.empty else None
+            ),
+            start_day=_event_start,
+            model_id=llm_model_choice,
+            github_repos=selected_repos,
         )
 
 
@@ -1142,7 +1305,7 @@ else:
     # the last "Run forecast" click), and we connect it visually by
     # prepending the last past-prediction point.
     if latest and latest.get("forecast"):
-        fut_df = pd.DataFrame(latest["forecast"])
+        fut_df = fc_df if not fc_df.empty else pd.DataFrame(latest["forecast"])
         if not fut_df.empty:
             last_past = bt.iloc[-1]
             future_x = [last_past["target_date"]] + fut_df["target_date"].tolist()
@@ -1206,7 +1369,10 @@ section(
 )
 
 if latest and latest.get("forecast"):
-    fc_rows = latest["forecast"]
+    if not fc_df.empty:
+        fc_rows = fc_df.to_dict("records")
+    else:
+        fc_rows = latest["forecast"]
     future_total = sum(float(r.get("adjusted_usd", 0)) for r in fc_rows)
     future_avg = future_total / max(1, len(fc_rows))
 
@@ -1314,6 +1480,15 @@ if latest and latest.get("forecast"):
             f"**\\${open_pr_expected:+,.2f}/day** expected once open PRs merge "
             "(probability-weighted). The future line rises/falls slightly on "
             "each expected merge date."
+        )
+
+    if _events_applied and abs(_event_delta_total) > 0.5:
+        n_ev = sum(1 for e in _stored_events if e.enabled)
+        reasons.append(
+            f"**Future events ({n_ev} enabled).** The ledger adds "
+            f"**\\${_event_delta_total:+,.0f}** over the next 7 days on top "
+            "of the model baseline (confidence-weighted). Toggle events in "
+            "the ledger to see the adjusted line move."
         )
 
     # Confidence band

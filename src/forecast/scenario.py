@@ -44,6 +44,13 @@ class Projection:
         return self.total_expected - self.total_baseline
 
     def contributions(self) -> List[Tuple[CostEvent, float]]:
+        return [
+            (ev, amt) for ev, amt in self.all_enabled_contributions()
+            if abs(amt) > 0.005
+        ]
+
+    def all_enabled_contributions(self) -> List[Tuple[CostEvent, float]]:
+        """Per-event totals over this projection window (may be zero)."""
         out: List[Tuple[CostEvent, float]] = []
         for ev in self.events:
             if not ev.enabled:
@@ -56,9 +63,12 @@ class Projection:
                 )
             else:
                 amt = sum(ev.additive_on(d) for d in self.dates) * p
-            if abs(amt) > 0.005:
-                out.append((ev, amt))
+            out.append((ev, amt))
         return sorted(out, key=lambda t: abs(t[1]), reverse=True)
+
+    def forecast_window_contributions(self) -> List[Tuple[CostEvent, float]]:
+        """Alias kept for callers that only want material in-window impact."""
+        return self.contributions()
 
     def budget_crossing(self, budget_total: float) -> Optional[date]:
         run = 0.0

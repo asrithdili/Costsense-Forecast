@@ -161,9 +161,12 @@ jobs:
             --arg pubip "$ECS_ASSIGN_PUBLIC_IP" \
             '{awsvpcConfiguration: {subnets: ($subnets | split(",")), securityGroups: ($sgs | split(",")), assignPublicIp: $pubip}}')
 
+          # Circuit breaker makes a bad rollout fail fast (~a few minutes)
+          # instead of the service flapping/retrying for the full job timeout.
           CREATE_ARGS=(--cluster "$ECS_CLUSTER" --service-name "$ECS_SERVICE"
             --task-definition "$ECS_TASK_DEFINITION" --desired-count 1
-            --launch-type FARGATE --network-configuration "$NETWORK_CONFIG")
+            --launch-type FARGATE --network-configuration "$NETWORK_CONFIG"
+            --deployment-configuration "deploymentCircuitBreaker={enable=true,rollback=true},maximumPercent=200,minimumHealthyPercent=100")
 
           if [ -n "$ECS_TARGET_GROUP_ARN" ]; then
             LB_CONFIG=$(jq -n \
@@ -194,12 +197,35 @@ jobs:
           image: ${{ steps.build-image.outputs.image }}
 
       - name: Deploy to ECS
+        id: deploy
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
           task-definition: ${{ steps.task-def.outputs.task-definition }}
           service: ${{ env.ECS_SERVICE }}
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
+          wait-for-minutes: 10
+
+      - name: Show ECS diagnostics on failure
+        if: failure() && steps.deploy.outcome == 'failure'
+        run: |
+          echo "### Deploy failed — recent service events" | tee -a "$GITHUB_STEP_SUMMARY"
+          aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].events[0:10].[createdAt,message]' --output text \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+          echo "### Recently stopped tasks" | tee -a "$GITHUB_STEP_SUMMARY"
+          STOPPED=$(aws ecs list-tasks --cluster "$ECS_CLUSTER" --service-name "$ECS_SERVICE" \
+            --desired-status STOPPED --query 'taskArns' --output text)
+          if [ -n "$STOPPED" ]; then
+            aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks $STOPPED \
+              --query 'tasks[*].{stoppedReason:stoppedReason,containers:containers[*].{reason:reason,exitCode:exitCode}}' \
+              --output json | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No stopped tasks found." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "Check CloudWatch Logs: /ecs/costsense" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Deployment summary
         run: |

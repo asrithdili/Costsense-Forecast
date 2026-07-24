@@ -120,39 +120,48 @@ def _summarize_output(obj) -> str:
     return s[:220] + ("…" if len(s) > 220 else "")
 
 
-def chat_step(
+def run_agent_with_tools(
     profile: str | None,
     model_id: str,
-    history: list[dict],
+    *,
+    system: str,
     user_msg: str,
+    history: list[dict] | None = None,
+    max_tool_turns: int = MAX_TOOL_TURNS_PER_QUESTION,
+    max_tokens: int = MAX_TOKENS,
+    temperature: float = 0.2,
 ) -> ChatTurn:
-    """Advance one user turn. Runs the tool-use loop for this question and
-    returns the assistant reply plus updated history."""
+    """Run one agent turn with AWS + GitHub tools and a custom system prompt."""
     from src.ai_agent.bedrock_client import make_client
     client = make_client(profile, region=BEDROCK_REGION)
 
-    messages = list(history) + [{"role": "user", "content": user_msg}]
+    base_history = list(history or [])
+    messages = base_history + [{"role": "user", "content": user_msg}]
     tool_calls: list[ToolCall] = []
 
-    for _ in range(MAX_TOOL_TURNS_PER_QUESTION + 1):
+    for _ in range(max_tool_turns + 1):
         try:
             resp = client.invoke_model(
                 modelId=model_id,
                 body=json.dumps({
                     "anthropic_version": "bedrock-2023-05-31",
-                    "max_tokens": MAX_TOKENS,
-                    "temperature": 0.2,
-                    "system": SYSTEM,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "system": system,
                     "tools": _merged_tool_specs(),
                     "messages": messages,
                 }),
             )
             payload = json.loads(resp["body"].read())
         except Exception as e:  # noqa: BLE001
-            return ChatTurn(reply="", error=f"bedrock invoke failed: {e}",
-                            model_id=model_id,
-                            updated_history=history + [
-                                {"role": "user", "content": user_msg}])
+            return ChatTurn(
+                reply="",
+                error=f"bedrock invoke failed: {e}",
+                model_id=model_id,
+                updated_history=base_history + [
+                    {"role": "user", "content": user_msg},
+                ],
+            )
 
         content = payload.get("content", [])
         tool_use_blocks = [b for b in content if b.get("type") == "tool_use"]
@@ -167,15 +176,17 @@ def chat_step(
                     input=blk.get("input") or {},
                     output_summary=_summarize_output(out),
                 ))
-                # Cap payload sent back to Claude
                 serialized = json.dumps(out, default=str)
                 if len(serialized) > 8000:
-                    # Structural trim: send only top-level keys + counts if huge
                     if isinstance(out, dict):
-                        trimmed = {k: (f"<large list, len={len(v)}>"
-                                       if isinstance(v, list) and len(v) > 30
-                                       else v)
-                                   for k, v in out.items()}
+                        trimmed = {
+                            k: (
+                                f"<large list, len={len(v)}>"
+                                if isinstance(v, list) and len(v) > 30
+                                else v
+                            )
+                            for k, v in out.items()
+                        }
                         serialized = json.dumps(trimmed, default=str)[:8000]
                     else:
                         serialized = serialized[:8000] + "…[truncated]"
@@ -187,11 +198,8 @@ def chat_step(
             messages.append({"role": "user", "content": results})
             continue
 
-        # Terminal — no more tool calls, model wants to reply.
         text_block = next((b for b in content if b.get("type") == "text"), None)
         reply = text_block.get("text", "") if text_block else "(no reply)"
-
-        # Persist the final assistant turn in the history so follow-ups see it.
         messages.append({"role": "assistant", "content": content})
         return ChatTurn(
             reply=reply,
@@ -204,7 +212,31 @@ def chat_step(
         reply="",
         tool_calls=tool_calls,
         updated_history=messages,
-        error=f"exceeded {MAX_TOOL_TURNS_PER_QUESTION} tool turns without "
-              "a final reply",
+        error=f"exceeded {max_tool_turns} tool turns without a final reply",
         model_id=model_id,
     )
+
+
+def chat_step(
+    profile: str | None,
+    model_id: str,
+    history: list[dict],
+    user_msg: str,
+) -> ChatTurn:
+    """Advance one user turn. Runs the tool-use loop for this question and
+    returns the assistant reply plus updated history."""
+    turn = run_agent_with_tools(
+        profile,
+        model_id,
+        system=SYSTEM,
+        user_msg=user_msg,
+        history=history,
+    )
+    if turn.error:
+        return ChatTurn(
+            reply="",
+            error=turn.error,
+            model_id=model_id,
+            updated_history=history + [{"role": "user", "content": user_msg}],
+        )
+    return turn
