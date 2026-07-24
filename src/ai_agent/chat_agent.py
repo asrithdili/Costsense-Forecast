@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 import boto3
 
@@ -434,6 +435,12 @@ class ToolCall:
     is_error: bool = False
     error_kind: str | None = None
     error_text: str | None = None
+    # Full (scrubbed) tool output, kept separately from ``output_summary``
+    # so the chart-hallucination guard can walk the complete payload for
+    # grounding checks. ``output_summary`` stays short for the UI's
+    # tool-call transcript — the guard needs the full data to find the
+    # 30-day list a "trailing average = $X" claim was derived from.
+    full_output: Any = None
 
 
 @dataclass
@@ -840,6 +847,7 @@ def chat_step(
                     name=blk["name"],
                     input=blk.get("input") or {},
                     output_summary=_summarize_output(out),
+                    full_output=out,   # untruncated — for chart guard
                     is_error=is_err,
                     error_kind=err_kind,
                     error_text=err_text,

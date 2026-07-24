@@ -152,6 +152,15 @@ def _tool_result_numbers_and_lists(
                     pass
 
     for call in tool_calls:
+        # Prefer `full_output` (untruncated dict/list) when the ToolCall
+        # carries it — the chart-hallucination guard needs the full data
+        # to find the daily-list a "30-day average = $X" claim was derived
+        # from. Fall back to parsing `output_summary` for older ToolCall
+        # instances that pre-date the full_output field.
+        full = getattr(call, "full_output", None)
+        if full is not None:
+            _walk(full)
+            continue
         summary = getattr(call, "output_summary", "") or ""
         try:
             parsed = json.loads(summary.rstrip("…"))
