@@ -5,7 +5,14 @@ Bedrock Claude, live AWS APIs, and GitHub PR history to forecast cost,
 explain movement, and rank cost-cutting actions — grounded in real
 account data, never hallucinated.
 
-Built for the Diligent Hackathon 2026.
+Built for the Diligent Hackathon 2026 — submitted under **MCP for
+Connected Compliance**.
+
+- **Live deployment:** http://costsense-alb-257440129.us-west-2.elb.amazonaws.com
+  (ECS Fargate + ALB, hosts 5 workload accounts via cross-account IAM)
+- **Design doc:** [docs/DESIGN.md](docs/DESIGN.md)
+- **Architecture deep-dive:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- **Team AIPDLC log:** [AIPDLC.md](AIPDLC.md)
 
 ---
 
@@ -113,14 +120,67 @@ Deep dive: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ---
 
+## Multi-account deployment (ECS + ALB, 5 workload accounts)
+
+The deployed app runs as a single ECS Fargate task behind an
+Application Load Balancer and reads cost data from **5 linked Diligent
+AWS workload accounts** by cross-account `sts:AssumeRole`.
+
+```
+                    Public URL
+   http://costsense-alb-257440129.us-west-2.elb.amazonaws.com
+                        │
+                        ▼
+                ┌───────────────┐
+                │      ALB      │  ← WebSocket + HTTP
+                └───────┬───────┘
+                        │
+                ┌───────▼───────┐
+                │  ECS Fargate  │  ← Streamlit container
+                │  (Task role)  │      (image in public ECR)
+                └───────┬───────┘
+                        │  sts:AssumeRole
+       ┌────────┬───────┼───────┬────────┐
+       ▼        ▼       ▼       ▼        ▼
+    Account  Account Account Account  Account
+   #1 role  #2 role #3 role #4 role  #5 role
+       │        │       │       │        │
+       └────────┴───────┼───────┴────────┘
+                        ▼
+        Cost Explorer · CloudWatch · Bedrock
+```
+
+Config lives in the ECS task-def as **`COSTSENSE_CROSS_ACCOUNT_ROLES`**
+(comma-separated `arn|label` pairs). Set it locally too if you want the
+same dropdown behavior without SSO:
+
+```bash
+export COSTSENSE_CROSS_ACCOUNT_ROLES=\
+"arn:aws:iam::111111111111:role/costsense-reader|dil-team-hackfest,\
+arn:aws:iam::222222222222:role/costsense-reader|dil-data-platform-dev"
+```
+
+Each account's role trusts the ECS task role and grants **read-only**
+`ce:*`, `cloudwatch:GetMetricData`, `bedrock:InvokeModel`. No mutating
+permissions anywhere.
+
+Recreate this stack: `infra/deploy-public-ecr.sh` (initial ECR push) →
+manual `aws ecs create-service` + ALB target-group wiring (documented
+in [AIPDLC.md § 5.15](AIPDLC.md)). No CloudFormation — the org SCP
+`p-uxu2m3ck` blocks `iam:CreateRole` from CFN in this account.
+
+---
+
 ## Documentation set
 
 | Doc | What's in it |
 |---|---|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | End-to-end technical walkthrough: pages, forecast engine, agents, tool registry, deployment |
+| [docs/DESIGN.md](docs/DESIGN.md) | System design + Mermaid diagrams: request flow, cross-account IAM, prediction pipeline, anti-hallucination guards |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | End-to-end technical walkthrough: pages, forecast engine, agents, tool registry, deployment topology |
 | [docs/PAGES.md](docs/PAGES.md) | Feature-by-feature guide to each of the 5 pages |
 | [docs/DATA_FLOW.md](docs/DATA_FLOW.md) | Every data source, cache, and file on disk. Forecast JSON schema. Secret scrubbing details. Failure modes. |
 | [docs/WHY_COSTSENSE.md](docs/WHY_COSTSENSE.md) | Positioning vs alternatives · design trade-offs · what CostSense honestly cannot do |
+| [AIPDLC.md](AIPDLC.md) | Team AIPDLC log — per-contributor phase-by-phase development record |
 
 ---
 

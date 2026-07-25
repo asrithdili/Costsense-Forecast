@@ -379,19 +379,96 @@ version:
 
 ## 10. Deployment
 
-- **Local:** `streamlit run src/dashboard/app.py --server.port 8501`
+CostSense ships in two modes: **local dev** (SSO profiles from
+`~/.aws/config`) and **hosted** (single ECS Fargate task behind an
+Application Load Balancer, reading from 5 workload accounts by
+cross-account role assume).
+
+### 10.1 Local dev
+
+- **Run:** `streamlit run src/dashboard/app.py --server.port 8501`
 - **AWS credentials:** whatever `~/.aws/config` profiles the user has SSO
   for. Every page has a profile picker in the sidebar.
-- **GitHub credentials:** `gh auth status` — CostSense shells out to the
-  `gh` CLI for repo access.
-- **Bedrock:** account `609400232087` (Diligent's shared Bedrock sandbox)
-  is what we currently target; changeable at the top of each
-  `*_agent.py` file.
+- **GitHub credentials:** `GITHUB_TOKEN` / `GH_TOKEN` env var, or
+  `gh auth status` as a fallback.
+- **Bedrock:** account `609400232087` (Diligent's shared Bedrock sandbox).
 
-No Docker image, no Kubernetes, no CI/CD required to run the demo. A
-GitHub Actions workflow (`daily.yml`) exists in the repo as a scaffold
-for a future scheduled forecast run, but is not currently active
-(no `AWS_ROLE_TO_ASSUME` secret configured).
+### 10.2 Hosted (ECS Fargate + ALB)
+
+Live URL: `http://costsense-alb-257440129.us-west-2.elb.amazonaws.com`
+
+```
+Public URL  →  ALB (HTTP :80, WebSocket-upgrade to /_stcore/stream)
+               │
+               ▼
+           ECS Fargate service (desired=1, awsvpc mode)
+               │  Task role: costsense-ecs-task-role
+               │  Trust:     ecs-tasks.amazonaws.com
+               │  Grants:    sts:AssumeRole on 5 workload roles
+               │             logs:*  ecr:GetDownloadUrlForLayer
+               ▼
+           Container: public.ecr.aws/<ns>/costsense:latest
+               │  Streamlit :8501 (XSRF+CORS disabled — safe behind ALB)
+               │  Env: COSTSENSE_CROSS_ACCOUNT_ROLES=arn1|label1,arn2|label2,…
+               │  Env: COSTSENSE_PRESERVE_CACHE=1
+               ▼
+           On boot: parse env var → each request that selects a profile
+                    triggers make_cross_account_session(arn) →
+                    sts:AssumeRole → boto3.Session with temp creds
+```
+
+**Why ECS + ALB (vs App Runner):** App Runner's Envoy ingress rejects
+the WebSocket upgrade for `/_stcore/stream` in this AWS org, so the
+Streamlit UI never renders past the skeleton loader. ALB has no such
+restriction. Both attempts are preserved in git history — `infra/*`
+docs the App Runner path (kept for reference, not currently in use).
+
+**Why no CloudFormation:** the org SCP `p-uxu2m3ck` blocks
+`iam:CreateRole` when the call is made from CloudFormation in most
+member accounts. Roles were created via the AWS console + CLI directly
+(documented in [AIPDLC.md § 5.15](../AIPDLC.md)).
+
+### 10.3 Cross-account IAM model
+
+Each workload account has a role like:
+
+```json
+// role costsense-reader in every workload account
+{
+  "TrustPolicy": {
+    "Principal": {"AWS": "arn:aws:iam::<ecs-account>:role/costsense-ecs-task-role"},
+    "Action": "sts:AssumeRole"
+  },
+  "InlinePolicy": [
+    "ce:GetCostAndUsage", "ce:GetCostForecast",
+    "cloudwatch:GetMetricData", "cloudwatch:GetMetricStatistics",
+    "bedrock:InvokeModel"  // only in the Bedrock host account
+  ]
+}
+```
+
+Populated into the ECS task-def as:
+
+```
+COSTSENSE_CROSS_ACCOUNT_ROLES=
+  arn:aws:iam::111111111111:role/costsense-reader|dil-team-hackfest,
+  arn:aws:iam::222222222222:role/costsense-reader|dil-data-platform-dev,
+  ... (5 total)
+```
+
+The Streamlit dropdown reads this env var and shows the 5 `label`s.
+Selecting one triggers a cached `sts:AssumeRole` call (session is reused
+until 5 minutes before expiry — see [src/aws/cross_account.py](../src/aws/cross_account.py)).
+
+### 10.4 CI / build automation
+
+- `.github/workflows/deploy-apprunner.yml` — legacy App Runner deploy
+  workflow, kept for reference but not currently triggered.
+- `.github/workflows/daily.yml` — scaffold cron for a scheduled
+  forecast; inactive (no `AWS_ROLE_TO_ASSUME` secret set).
+- Task-def updates: manual `aws ecs register-task-definition` +
+  `aws ecs update-service`. Not automated (would require merging the
+  App Runner workflow to ECS, which is deferred).
 
 ---
 
