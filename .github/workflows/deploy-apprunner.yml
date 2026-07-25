@@ -1,0 +1,118 @@
+name: Deploy to App Runner (public ECR)
+
+# Same source-of-truth pattern golden-thread uses: CI delegates to the
+# same script humans run locally. No workflow-side reimplementation, no
+# risk of the two paths drifting.
+#
+# Triggers on push to main touching the app / deploy files, and on
+# manual workflow_dispatch for controlled rollbacks or ad-hoc deploys.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "requirements.txt"
+      - "Dockerfile"
+      - "infra/**"
+      - ".github/workflows/deploy-apprunner.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to deploy (default: sha-<12-of-gitsha>)"
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+# Serialise deploys — App Runner service is single-instance and two
+# concurrent deploys will race the update-service call. cancel-in-
+# progress: false so a mid-flight deploy is allowed to finish rather
+# than being cut off.
+concurrency:
+  group: costsense-apprunner
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  AWS_ACCOUNT_ID: "609400232087"    # dil-team-hackfest — the only account this deploys into
+  AWS_DEPLOY_ROLE_NAME: github-actions-costsense
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve deploy role ARN
+        id: role
+        env:
+          DEPLOY_ROLE_ARN_SECRET: ${{ secrets.AWS_DEPLOY_ROLE_TO_ASSUME }}
+        run: |
+          if [ -n "$DEPLOY_ROLE_ARN_SECRET" ]; then
+            arn="$DEPLOY_ROLE_ARN_SECRET"
+            echo "Using AWS_DEPLOY_ROLE_TO_ASSUME secret"
+          else
+            arn="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${AWS_DEPLOY_ROLE_NAME}"
+            echo "Falling back to role name: $arn"
+          fi
+          echo "arn=$arn" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.role.outputs.arn }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify deploy identity
+        run: |
+          aws sts get-caller-identity
+          echo "Region: $AWS_REGION"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install jq (usually pre-installed on ubuntu-latest, but idempotent)
+        run: |
+          if ! command -v jq >/dev/null; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+          jq --version
+
+      # ------------------------------------------------------------------
+      # Compute the image tag — always unique per commit.
+      # 1. When triggered manually, honor the operator's input if set.
+      # 2. Otherwise use sha-<first 12 of gitsha>.
+      # NEVER reuse tags — App Runner will not re-pull an existing tag.
+      # ------------------------------------------------------------------
+      - name: Compute image tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="sha-${GITHUB_SHA:0:12}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Deploying image tag: $tag"
+
+      - name: Run deploy script
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          chmod +x ./infra/deploy-public-ecr.sh
+          ./infra/deploy-public-ecr.sh "${{ steps.tag.outputs.tag }}"
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "## CostSense deploy"
+            echo ""
+            echo "* Account: ${{ env.AWS_ACCOUNT_ID }} (hackfest)"
+            echo "* Region:  ${{ env.AWS_REGION }}"
+            echo "* Tag:     ${{ steps.tag.outputs.tag }}"
+          } >> "$GITHUB_STEP_SUMMARY"

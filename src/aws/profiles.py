@@ -68,7 +68,31 @@ def resolve_runtime() -> ProfileInfo | None:
         return None
 
 
+def resolve_cross_account() -> list[ProfileInfo]:
+    """Resolve accounts via ``COSTSENSE_CROSS_ACCOUNT_ROLES`` env var.
+
+    Container deployments (ECS task with a task role) can't rely on local
+    SSO profiles. Instead, they publish a comma-separated list of role
+    ARNs to assume via ``COSTSENSE_CROSS_ACCOUNT_ROLES``. This function
+    turns that env var into a ``list[ProfileInfo]`` — one per role — by
+    parsing the ARN (no live sts:AssumeRole call yet, that happens lazily
+    when the user picks a profile). Returns [] when the env var is unset.
+    """
+    from src.aws.cross_account import parse_cross_account_roles
+    roles = parse_cross_account_roles()
+    return [
+        ProfileInfo(profile=r.label, account_id=r.account_id)
+        for r in roles
+    ]
+
+
 def resolve_all() -> list[ProfileInfo]:
+    # Highest priority: cross-account env var (container deployments).
+    # When set, we IGNORE local SSO profiles — the intent is deterministic
+    # multi-account rendering from a single container identity.
+    cross_account = resolve_cross_account()
+    if cross_account:
+        return cross_account
     configured = [resolve(p) for p in list_profiles()]
     reachable = [p for p in configured if p.account_id]
     if reachable:

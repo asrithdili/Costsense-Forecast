@@ -25,8 +25,13 @@ showSidebarNavigation = false
 # "File change. Rerun / Always rerun" toast at the top-right.
 runOnSave = false
 headless = true
+# Reverse-proxy compatibility (App Runner / ALB / Nginx / Cloudflare Tunnel).
+# App Runner's Envoy rewrites the Origin header; Streamlit's default XSRF
+# check compares Origin against Host and rejects the WebSocket upgrade to
+# /_stcore/stream, leaving the app stuck on the skeleton loader. Turning
+# both off is the standard workaround.
 enableCORS = false
-enableXsrfProtection = true
+enableXsrfProtection = false
 
 [browser]
 gatherUsageStats = false
