@@ -29,7 +29,9 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from src.aws.cost_explorer import fetch_daily_totals
-from src.pr_scanner.gh_client import pr_diff, gh_available
+from src.pr_scanner.gh_client import (
+    api_get, gh_available, pr_diff, token_configured,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -100,43 +102,82 @@ def _list_prior_prs_touching_files(
     """Merged PRs in `repo` that touched at least one of the given files.
 
     GitHub's PR search doesn't natively support file filters, so we use
-    the code/search + a follow-up `gh pr list` in --search mode as a
-    heuristic. Fallback: list recent merged PRs and check their file
-    lists via the REST API (slower)."""
-    if not gh_available():
+    the search/issues endpoint with a filename keyword as a heuristic.
+    Two backends supported (matches gh_client.py):
+      * `gh` CLI when installed (local dev with `gh auth login`)
+      * REST API via GITHUB_TOKEN (container / CI / anywhere without gh)
+
+    Returns [] only when NEITHER is available (previously: returned []
+    whenever `gh` was missing, which silently blocked precedent lookup
+    in containers even when a valid GITHUB_TOKEN was set).
+    """
+    if not (gh_available() or token_configured()):
         return []
-    # Heuristic: search issues (PRs are issues on GitHub) using a filename
-    # keyword. This is imperfect but avoids fetching every merged PR's
-    # file list.
     hits: dict[int, dict] = {}
     for f in files[:5]:
         # Just the basename — search matches PR title/body.
         base = f.rsplit("/", 1)[-1]
-        try:
-            out = _run([
-                "gh", "pr", "list", "--repo", repo,
-                "--state", "merged", "--limit", str(limit),
-                "--search", base,
-                "--json", "number,title,mergedAt,url",
-            ])
-        except RuntimeError:
-            continue
-        for pr in json.loads(out or "[]"):
-            hits[pr["number"]] = pr
+        if gh_available():
+            # Native `gh` path — fastest, uses local OAuth session
+            try:
+                out = _run([
+                    "gh", "pr", "list", "--repo", repo,
+                    "--state", "merged", "--limit", str(limit),
+                    "--search", base,
+                    "--json", "number,title,mergedAt,url",
+                ])
+            except RuntimeError:
+                continue
+            for pr in json.loads(out or "[]"):
+                hits[pr["number"]] = pr
+        else:
+            # REST fallback — matches `gh pr list --search <base>` by
+            # using search/issues with is:pr + is:merged + repo qualifiers.
+            # Field names differ from gh's --json output; normalise here so
+            # callers see the same shape either way.
+            try:
+                data = api_get("search/issues", {
+                    "q": f"is:pr is:merged repo:{repo} {base}",
+                    "per_page": str(limit),
+                }) or {}
+            except Exception:  # noqa: BLE001
+                continue
+            for item in data.get("items", []):
+                number = item.get("number")
+                if not number:
+                    continue
+                hits[number] = {
+                    "number": number,
+                    "title": item.get("title", ""),
+                    "mergedAt": item.get("closed_at", ""),
+                    "url": item.get("html_url", ""),
+                }
     return list(hits.values())
 
 
 def _pr_files(repo: str, number: int) -> list[str]:
-    """List of files changed by PR #number."""
-    if not gh_available():
-        return []
-    try:
-        out = _run([
-            "gh", "api", f"repos/{repo}/pulls/{number}/files?per_page=100",
-        ])
-        return [f.get("filename", "") for f in json.loads(out or "[]")]
-    except RuntimeError:
-        return []
+    """List of files changed by PR #number.
+
+    Two backends — `gh` CLI or REST-with-token — same as
+    ``_prior_prs_touching_files``. Returns [] only when neither is
+    available.
+    """
+    if gh_available():
+        try:
+            out = _run([
+                "gh", "api", f"repos/{repo}/pulls/{number}/files?per_page=100",
+            ])
+            return [f.get("filename", "") for f in json.loads(out or "[]")]
+        except RuntimeError:
+            return []
+    if token_configured():
+        try:
+            data = api_get(f"repos/{repo}/pulls/{number}/files",
+                           {"per_page": "100"}) or []
+            return [f.get("filename", "") for f in data]
+        except Exception:  # noqa: BLE001
+            return []
+    return []
 
 
 # ---------------------------------------------------------------------------

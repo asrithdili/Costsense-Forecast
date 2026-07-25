@@ -112,7 +112,30 @@ def _should_use_env_credentials(profile: str | None) -> bool:
 
 
 def make_session(profile: str | None = None) -> boto3.Session:
-    """Return a boto3 Session for *profile*, honoring aws-vault env creds."""
+    """Return a boto3 Session for *profile*, honoring aws-vault env creds.
+
+    Priority order:
+      1. If ``profile`` matches a label in
+         ``COSTSENSE_CROSS_ACCOUNT_ROLES``, do an ``sts:AssumeRole`` into
+         that role and return a session with the temp credentials.
+         (Container deployments — ECS task assumes into linked accounts.)
+      2. If ``profile`` matches the runtime-profile-name, use the default
+         credential chain (task role via IMDS or env vars).
+      3. If ambient env credentials should override the profile arg (see
+         ``_should_use_env_credentials`` for the rules), use those.
+      4. If no ``profile`` was given at all, default credential chain.
+      5. Otherwise, load the named profile from ``~/.aws/config``.
+    """
+    # 1. Cross-account role assume (container deployments).
+    if profile:
+        try:
+            from src.aws.cross_account import get_role_by_label, make_cross_account_session
+            role = get_role_by_label(profile)
+            if role is not None:
+                return make_cross_account_session(role.role_arn)
+        except Exception:  # noqa: BLE001 — never let cross-account bugs kill local dev
+            pass
+
     if profile == runtime_profile_name():
         profile = None
 

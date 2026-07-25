@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import atexit
 import hashlib
+import os
 import pickle
 import threading
 from pathlib import Path
@@ -72,13 +73,28 @@ def _wipe_ui_state_dir() -> None:
 # any shutdown mode (Ctrl+C, kill, crash, power loss) because it
 # runs at the next start rather than depending on a shutdown hook
 # firing.
+#
+# EXCEPTION: containerised deployments (ECS Fargate) restart the
+# container on health-check failures, task-def updates, or Fargate
+# platform patching — every restart is a fresh filesystem. The wipe
+# behaviour that's helpful locally becomes destructive there: every
+# cache set() by one Streamlit page is gone by the time another
+# page tries to read it (because a task restart happened between,
+# or the ALB routed a subsequent request to a warm task instance
+# that was never told about the write).
+#
+# Set COSTSENSE_PRESERVE_CACHE=1 in the container to skip both the
+# on-import wipe and the atexit wipe. In that mode the ONLY thing
+# that clears the cache is a task restart (which is already a full
+# filesystem reset). Locally, leave the env var unset and behaviour
+# is unchanged.
 _UI_STATE_DIR.mkdir(parents=True, exist_ok=True)
-_wipe_ui_state_dir()
-
-# Also wipe on graceful exit as belt-and-suspenders. atexit fires on
-# Ctrl+C's SIGINT handling; won't fire on SIGKILL / power loss (which
-# is why the startup wipe is the real safety net).
-atexit.register(_wipe_ui_state_dir)
+if os.environ.get("COSTSENSE_PRESERVE_CACHE") != "1":
+    _wipe_ui_state_dir()
+    # atexit is belt-and-suspenders for SIGINT (Ctrl+C). It won't fire
+    # on SIGKILL / power loss, which is why the on-import wipe is the
+    # real safety net when the flag is off.
+    atexit.register(_wipe_ui_state_dir)
 
 _FILE_LOCK = threading.Lock()
 
