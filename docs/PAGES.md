@@ -23,6 +23,14 @@ Click it to switch the AWS profile, model, or any other input.
 Switching account switches everything: which data is queried, which
 saved forecast JSON is loaded from disk.
 
+**Available accounts:**
+- **Local dev:** whatever SSO profiles you have in `~/.aws/config`.
+- **Deployed URL** (http://costsense-alb-257440129.us-west-2.elb.amazonaws.com):
+  5 Diligent workload accounts — `dil-team-hackfest`, `dil-team-aura`,
+  `dil-data-platform-dev`, `dil-connector-service-dev`,
+  `dil-3rdparty-connector-discovery-dev`. The ECS task assumes
+  a read-only role into each. See [DESIGN.md § 4](DESIGN.md#4-cross-account-request-flow).
+
 ---
 
 ## 1. CostSense AI (`app.py`)

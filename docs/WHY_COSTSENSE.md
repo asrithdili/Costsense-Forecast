@@ -20,6 +20,12 @@ No AWS-native product joins these three signals. That join — and the
 7-day forward prediction that comes out of it — is CostSense's core
 contribution.
 
+**Shipped, not slideware.** Live at
+http://costsense-alb-257440129.us-west-2.elb.amazonaws.com — ECS
+Fargate + ALB, five Diligent workload accounts wired through
+cross-account IAM. Same UI you'd see running locally, same answers,
+grounded in real AWS API calls.
+
 ---
 
 ## 1. What's already out there — and where each falls short

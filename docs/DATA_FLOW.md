@@ -32,10 +32,63 @@
 Every AWS call is **read-only**. Zero `create_*`, `delete_*`, `update_*`,
 `put_*`, `start_*`, `stop_*`, or `modify_*` in the codebase.
 
+### Credential flow — local dev vs hosted
+
+CostSense fetches AWS credentials two different ways depending on
+where it's running. Both paths end in a `boto3.Session` bound to the
+target account.
+
+**Local dev (SSO profiles):**
+
+```
+User picks profile in sidebar
+   → make_session(profile) in src/aws/session.py
+   → boto3.Session(profile_name=profile)
+   → botocore reads ~/.aws/config + SSO cache
+   → API calls signed with the SSO short-lived creds
+```
+
+**Hosted (ECS Fargate — cross-account AssumeRole):**
+
+```
+Container starts
+   → ECS injects task role creds via IMDS
+   → env var COSTSENSE_CROSS_ACCOUNT_ROLES parsed on module import
+   → dropdown shows role labels (5 workload accounts)
+
+User picks a role label
+   → make_session(label) in src/aws/session.py
+   → get_role_by_label(label) → RoleARN
+   → make_cross_account_session(arn) in src/aws/cross_account.py
+      ├─ cache hit (expiry > now + 5min)?  return cached Session
+      └─ else: sts.AssumeRole(arn, session_name)
+              → temp AK + SK + token (1 hour)
+              → cache until expiry - 5min
+              → boto3.Session with temp creds
+   → API calls signed with temp creds
+```
+
+**No long-lived AWS keys anywhere.** Everything is either SSO-cached
+(local) or STS-cached (hosted). ECS task role is invoked via IMDS —
+same story.
+
 ### GitHub
 
-Everything routes through the `gh` CLI so it uses whatever token the
-user is already logged in with:
+Two backends, same tool interface, `src/pr_scanner/gh_client.py`
+handles the branch:
+
+| Environment | Backend | Auth source |
+|---|---|---|
+| Local dev (`gh` CLI installed) | `gh api …` shell-out | `gh auth login` cached OAuth session or `GITHUB_TOKEN` env var |
+| Container / CI (no `gh` CLI) | Python `requests` to `api.github.com` | `GITHUB_TOKEN` / `GH_TOKEN` env var |
+
+The container image doesn't ship `gh` — REST is the primary path
+there. Historic precedent lookups (`src/ai_agent/precedent.py`) transparently
+fall back to `search/issues` + `repos/*/pulls/*/files` when `gh` is
+absent. The normalization layer ensures both paths return
+identically-shaped dicts to callers.
+
+Everything below routes through the `gh` CLI when available:
 
 | Tool | CLI command | Purpose |
 |---|---|---|
@@ -75,6 +128,34 @@ shared `bedrock_client.make_client()` factory sets:
 - Delete `data/` → forces regeneration of everything
 - Anomaly report cache uses a `_SCHEMA_VERSION` string in the key so
   schema changes automatically invalidate stale reports
+
+### `data/ui_state/*.pkl` — disk-backed session state
+
+`src/dashboard/state_cache.py` gives pages a two-tier cache
+(session_state hot + disk pickle cold) so opening a second browser
+tab or coming back after a Streamlit restart doesn't lose expensive
+results (PR verdicts, anomaly reports).
+
+Wipe behavior differs by environment:
+
+| Environment | On-import wipe | atexit wipe | Rationale |
+|---|---|---|---|
+| Local dev (default) | Yes | Yes | Every `streamlit run` starts clean; Ctrl+C leaves no debris |
+| Hosted (`COSTSENSE_PRESERVE_CACHE=1`) | No | No | ECS task restart already resets the filesystem; wiping on import would drop cached results between page navigations because ALB doesn't guarantee sticky routing to the writer |
+
+The flag is set in the ECS task-def env vars; unset locally.
+
+### STS AssumeRole cache
+
+`src/aws/cross_account.py` maintains a per-role in-process cache of
+`boto3.Session` objects backed by STS temp credentials.
+
+- **Cache key:** role ARN
+- **TTL:** until (STS expiry − 5 minutes). Refresh triggered lazily on
+  next call after expiry.
+- **Scope:** per-process (per ECS task instance).
+- **Session name:** `costsense-<pid>-<counter>` — visible in CloudTrail
+  in the target account for audit.
 
 ---
 
