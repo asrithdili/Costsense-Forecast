@@ -25,6 +25,7 @@ Connected Compliance**.
 | 🔍 **PR Predictor** ([3_PR_Predictor.py](src/dashboard/pages/3_PR_Predictor.py)) | *"What will this specific PR do to our bill?"* Paste any PR URL → grounded impact analysis. |
 | ⚠️ **Anomalies** ([4_Anomalies.py](src/dashboard/pages/4_Anomalies.py)) | *"Where's the low-hanging fruit?"* Full-account sweep → ranked cards with 2-3 fix approaches each. |
 | 🌐 **Org-Level Impact** ([5_Org_Level_Impact.py](src/dashboard/pages/5_Org_Level_Impact.py)) | *"Which accounts in our org moved most this week?"* Per-account rollup across the AWS Organization. |
+| 🎯 **Future Forecast** ([7_Close_The_Loop.py](src/dashboard/pages/7_Close_The_Loop.py)) | *"What's the consolidated ledger of everything CostSense already recommended for this account?"* Aggregator — no forecasting, no projection. Mirrors what other pages produced. |
 
 ---
 
@@ -92,7 +93,7 @@ inference profile in `us-west-2` on Diligent's shared Bedrock sandbox
 
 ```
              ┌─────────────────────────────────────┐
-             │      Streamlit UI (5 pages)         │
+             │      Streamlit UI (6 pages)         │
              └─────┬───────────────────┬───────────┘
                    │                   │
     ┌──────────────┘                   └───────────────┐
@@ -177,7 +178,7 @@ in [AIPDLC.md § 5.15](AIPDLC.md)). No CloudFormation — the org SCP
 |---|---|
 | [docs/DESIGN.md](docs/DESIGN.md) | System design + Mermaid diagrams: request flow, cross-account IAM, prediction pipeline, anti-hallucination guards |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | End-to-end technical walkthrough: pages, forecast engine, agents, tool registry, deployment topology |
-| [docs/PAGES.md](docs/PAGES.md) | Feature-by-feature guide to each of the 5 pages |
+| [docs/PAGES.md](docs/PAGES.md) | Feature-by-feature guide to each of the 6 pages + shared UI infra |
 | [docs/DATA_FLOW.md](docs/DATA_FLOW.md) | Every data source, cache, and file on disk. Forecast JSON schema. Secret scrubbing details. Failure modes. |
 | [docs/WHY_COSTSENSE.md](docs/WHY_COSTSENSE.md) | Positioning vs alternatives · design trade-offs · what CostSense honestly cannot do |
 | [AIPDLC.md](AIPDLC.md) | Team AIPDLC log — per-contributor phase-by-phase development record |

@@ -1,6 +1,6 @@
 # CostSense — Page-by-Page Guide
 
-*What each of the five pages does, how to use it, and what to expect.*
+*What each of the six pages does, how to use it, and what to expect.*
 
 ---
 
@@ -13,6 +13,7 @@ Streamlit builds the sidebar from filenames. The nav order is:
 3. **PR Predictor** — analyze a single PR
 4. **Anomalies** — full-repo + full-AWS sweep
 5. **Org Level Impact** — per-account rollup across the AWS Organization
+6. **Future Forecast** — Close the Loop: consolidated view of every priced recommendation for the active account
 
 Every page has its own **Controls** strip at the very top (a
 collapsible expander). The header always shows the current selections
@@ -295,6 +296,46 @@ management (payer) account.
 
 ---
 
+## 6. Future Forecast — "Close the Loop" (`pages/7_Close_The_Loop.py`)
+
+### What it does
+One view of every priced recommendation CostSense has already produced
+for the active account. **Aggregator only** — no forecasting, no
+projection, no extrapolation. Reads the recommendations that PR
+Predictor and Anomalies already generated and consolidates them into
+a single ledger.
+
+### Design rule (deliberate)
+The docstring at the top of the page states it plainly: *"This page
+does NOT model anything. It does NOT forecast. It does NOT
+extrapolate."* It matches the honest pattern the other pages use:
+
+- PR Predictor: `_projected_headline = current_daily + _delta_headline`
+- Anomalies: `savings = report.total_daily_savings_usd` (renders
+  the `actions` list verbatim)
+
+Future Forecast preserves that honesty rather than compounding
+uncertainty across many priced items.
+
+### Top-bar controls
+- **Account** — same profile picker as every page. The ledger is
+  per-account.
+
+### What you get
+- **Total priced daily impact** across all pending recommendations
+- **Recommendation table** — one row per recommendation, showing:
+  source page (PR Predictor / Anomalies), title, `daily $` delta,
+  monthly projection, status
+- **Direct links** back into the page that produced each item
+
+### Limits
+- Nothing new can be predicted from this page. It's a mirror of
+  results already computed elsewhere.
+- If the source page's cache is cleared, the ledger empties. State is
+  read from `src/dashboard/state_cache.py` (see below).
+
+---
+
 ## Cross-cutting behaviors
 
 ### AWS SSO
@@ -319,3 +360,27 @@ JWT in a tag, it comes back as `[REDACTED-BY-COSTSENSE]`.
 No page depends on another. You can open only Anomalies and it works.
 You can open only Org-Level and it works. State is per-page in
 `st.session_state`.
+
+---
+
+## Shared UI infrastructure (`src/dashboard/*.py`)
+
+Every page pulls in helpers from a small shared layer so the app looks
+consistent and doesn't lose state on tab switches or container
+restarts.
+
+| Module | Purpose |
+|---|---|
+| [`nav.py`](../src/dashboard/nav.py) | Top-bar / sidebar helpers — `top_bar()`, `inject_css()`. Every page calls these before rendering its own content. |
+| [`costsense_theme.py`](../src/dashboard/costsense_theme.py) | Shared chart theme + section/callout/pill primitives. Ensures Dashboard, Ask CostSense, and PR Predictor all render charts the same way. |
+| [`state_cache.py`](../src/dashboard/state_cache.py) | Two-tier state cache (`st.session_state` + `data/ui_state/*.pkl`). Survives tab close / process restart. Guarded by `COSTSENSE_PRESERVE_CACHE=1` env var for the container. Full write-up in [DATA_FLOW.md § 2](DATA_FLOW.md#2-caching-layers). |
+| [`chat_charts.py`](../src/dashboard/chat_charts.py) | Chart-rendering + hallucination guard for Ask CostSense. Extracts fenced JSON blocks from the LLM's reply, validates against schema, cross-checks every numeric against the tool-call ledger, drops any chart that can't be grounded. Full flow in [DESIGN.md § 6](DESIGN.md#6-anti-hallucination-architecture). |
+| [`live_cost_meter.py`](../src/dashboard/live_cost_meter.py) | Hero instrument at the top of Dashboard. Static (no client-side counter loops) — shows trailing 7-day average daily burn vs the next 7-day forecast average, with a gauge and direction arrow. |
+| [`notifications_ui.py`](../src/dashboard/notifications_ui.py) | Draft-and-send email UI for shipping a recommendation ledger to a stakeholder. **Manual only** — button click sends, no automatic delivery. |
+| [`notification_delivery.py`](../src/dashboard/notification_delivery.py) | SMTP send backend for the above. Reads `COSTSENSE_NOTIFY_TO`, `COSTSENSE_SMTP_HOST` etc. from env / `.env`. Uses stdlib `smtplib` — no extra dependencies. |
+
+**Anti-hallucination guards** — chart schema, grounding checks,
+substitution guard, `ASSUMED` escape hatch — are all implemented in
+`chat_charts.py` + `chat_agent.py`. See
+[DESIGN.md § 6](DESIGN.md#6-anti-hallucination-architecture) for the
+full flow diagram.

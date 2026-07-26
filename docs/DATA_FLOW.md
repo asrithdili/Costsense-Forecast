@@ -111,6 +111,29 @@ shared `bedrock_client.make_client()` factory sets:
 - `connect_timeout = 15s`
 - `retries.max_attempts = 2`
 
+### Configuration layer (`src/config.py`, `src/env.py`, `config/*.json`)
+
+CostSense reads its settings from JSON files, not from scattered
+module-level constants:
+
+| Source | Purpose | Notes |
+|---|---|---|
+| [`config/costsense.json`](../config/costsense.json) | Default settings — AWS region, runtime profile name, Bedrock model IDs, forecast window sizes. Checked in. | Deep-merged base. |
+| [`config/costsense.local.json`](../config/costsense.local.json.example) | Per-developer overrides. Deep-merged on top of the base file. | **Gitignored** — safe for local secrets. |
+| [`src/config.py::get_str()` / `get_int()`](../src/config.py) | Typed accessors used across the codebase. `@lru_cache` — file read once per process. | Env vars still win for callers that check them explicitly (e.g. `GITHUB_TOKEN`). |
+| [`src/env.py`](../src/env.py) | Loads `.env` from repo root or `src/.env` at startup. Shell exports take precedence. | Used for GitHub tokens + SMTP creds. |
+
+**Env vars that affect data flow** (not exhaustive):
+
+| Env var | Set by | Effect |
+|---|---|---|
+| `AWS_PROFILE` / SSO cache | User (`aws sso login`) | Local dev profile picker |
+| `AWS_VAULT` | `aws-vault exec` | Detected by `session.py::vault_profile()` — env creds win for the same-profile case |
+| `COSTSENSE_CROSS_ACCOUNT_ROLES` | ECS task-def | 5 workload-account role ARNs. When set, container ignores local SSO. See [ARCHITECTURE § 10.3](ARCHITECTURE.md#103-cross-account-iam-model). |
+| `COSTSENSE_PRESERVE_CACHE` | ECS task-def | Skip the `state_cache` on-import + atexit wipes. Set in container, unset locally. |
+| `GITHUB_TOKEN` / `GH_TOKEN` | Shell / `.env` / ECS task-def | GitHub REST auth. Fine-grained or classic PAT. Fallback if `gh auth status` doesn't have a session. |
+| `COSTSENSE_NOTIFY_TO`, `COSTSENSE_NOTIFY_FROM`, `COSTSENSE_SMTP_HOST`, `COSTSENSE_SMTP_PORT`, `COSTSENSE_SMTP_USER`, `COSTSENSE_SMTP_PASSWORD`, `COSTSENSE_SMTP_USE_TLS` | Shell / `.env` | Optional — enables the "manual send" button in the notification-draft UI ([`notification_delivery.py`](../src/dashboard/notification_delivery.py)). No email is ever sent automatically. |
+
 ---
 
 ## 2. Caching layers

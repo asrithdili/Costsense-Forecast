@@ -18,9 +18,10 @@ would produce:
    "what will this PR do to cost?" — using Bedrock Claude with live
    read-only access to AWS.
 
-It's a single Streamlit app with **five pages**, backed by AWS SDK calls,
-GitHub CLI calls, and Bedrock invocations. No custom infrastructure. Runs
-on-demand from the user's laptop.
+It's a single Streamlit app with **six pages**, backed by AWS SDK calls,
+GitHub REST / CLI calls, and Bedrock invocations. Runs locally against SSO
+profiles or hosted on ECS + ALB across five workload accounts via
+cross-account role assume.
 
 ---
 
@@ -28,8 +29,8 @@ on-demand from the user's laptop.
 
 ```
                        ┌─────────────────────────────────────┐
-                       │        Streamlit UI (5 pages)       │
-                       │   app.py + pages/2..5_*.py          │
+                       │        Streamlit UI (6 pages)       │
+                       │   app.py + pages/2..5,7_*.py        │
                        └─────┬───────────────────┬───────────┘
                              │                   │
              ┌───────────────┘                   └───────────────┐
@@ -69,7 +70,7 @@ Everything read-only. Nothing mutates AWS or GitHub state.
 
 ---
 
-## 3. The five pages
+## 3. The six pages
 
 | Page | Purpose | Bedrock calls per open? |
 |---|---|---|
@@ -78,6 +79,7 @@ Everything read-only. Nothing mutates AWS or GitHub state.
 | **PR Predictor** (`3_PR_Predictor.py`) | Paste PR URL → cost impact + recs | 1 (multi-turn tool-use) |
 | **Anomalies** (`4_Anomalies.py`) | Full-repo + full-AWS sweep → ranked actions | 1-2 (tool-use loop) |
 | **Org-Level Impact** (`5_Org_Level_Impact.py`) | Per-account spend across the AWS Organization | 0 (pure CE calls) |
+| **Future Forecast — Close the Loop** (`7_Close_The_Loop.py`) | Ledger of every priced recommendation already produced. Aggregator only — no modelling. | 0 (read-only over cached results) |
 
 See [PAGES.md](PAGES.md) for feature-by-feature details.
 
@@ -200,19 +202,53 @@ into the future forecast. Open PRs get a probability-weighted expected
 delta (approved+CI-passing ≈ 0.9, draft ≈ 0.1). This is what makes the
 future line adjust to "PRs about to land."
 
+### 4.7 `src/forecast/` module map
+
+The forecast package is organised by responsibility, not by model:
+
+| File | Responsibility |
+|---|---|
+| [`ensemble.py`](../src/forecast/ensemble.py) | Naive-heavy blend + regime detector + 320-combo auto-tuner. The **default** forecast model — see § 4.1-4.4. |
+| [`backtest_replay.py`](../src/forecast/backtest_replay.py) | Walk-forward backtest (`walk_forward()`) for accuracy measurement. |
+| [`timeseries.py`](../src/forecast/timeseries.py) | `ForecastPoint` dataclass + time-series primitives shared by every model. |
+| [`baselines.py`](../src/forecast/baselines.py) | Simple baselines (last-value, mean, drift) used as sanity references. |
+| [`lightgbm_model.py`](../src/forecast/lightgbm_model.py) | LightGBM forecaster using lag + rolling-mean + calendar features. Not the default — kept for A/B comparison. |
+| [`usage_regressors.py`](../src/forecast/usage_regressors.py) | Regressors derived from AWS usage metrics (CloudWatch invocation counts, DB IOPS). |
+| [`with_usage.py`](../src/forecast/with_usage.py) | Combines ensemble output with usage-regressor signal. |
+| [`aws_forecast.py`](../src/forecast/aws_forecast.py) | Wrapper around Cost Explorer's native `GetCostForecast` — used as a reference line, not our production forecast. |
+| [`events.py`](../src/forecast/events.py) | `CostEvent` dataclass — dated cost events (step, ramp, pulse, multiplier, cliff) with confidence weighting. Feeds `scenario.py`. |
+| [`event_store.py`](../src/forecast/event_store.py) | Persist / load cost events (predicted from PRs, user-entered). |
+| [`scenario.py`](../src/forecast/scenario.py) | Compose baseline + events into explainable scenario bands (expected / low / high). Used by Future Forecast page. |
+| [`adapters.py`](../src/forecast/adapters.py) | Adapters between forecast primitives and page-facing shapes (chart series, ledger rows). |
+
+The **default hot path** — used by Dashboard — is
+`ensemble.py::forecast()`. Everything else is either a baseline for
+comparison, a component of `scenario.py` composition, or an unused
+alternative kept for A/B testing.
+
+**Anti-regressions:** `scripts/test_forecast_accuracy.py` runs the
+walk-forward backtest against 8 origins per profile with a 7-day
+stride so we can verify the regime detector's numbers claimed in
+§ 4.4 without hand-picking a happy sample.
+
 ---
 
 ## 5. AI agents — how Claude gets grounded
 
-There are four Bedrock-calling agents, all wired to a single client
-factory (`src/ai_agent/bedrock_client.py`) with a 300s read timeout.
+Every Bedrock-calling agent is wired to a single client factory
+(`src/ai_agent/bedrock_client.py`) with a 300s read timeout. The full
+inventory:
 
-| Agent | Entry point | System prompt shape |
+| Agent / module | Entry point | Purpose |
 |---|---|---|
-| **CostSense AI chat** | `chat_agent.chat_step()` | "You are a FinOps analyst. Ground every answer in tools." |
-| **PR Predictor** | `agent.analyze_pr()` | "You are a FinOps reviewer. Estimate cost impact of a diff." |
-| **Anomalies scan** | `anomaly_agent.analyze_anomalies()` | "Produce ranked actions with 2-3 approaches each." |
-| **Chart narrator** | `narrator.narrate()` (currently replaced by deterministic explainer) | *n/a on Dashboard* |
+| **CostSense AI chat** | [`chat_agent.chat_step()`](../src/ai_agent/chat_agent.py) | Free-form chat with tool-use loop. System prompt teaches the chart-block contract enforced by [`chat_charts.py`](../src/dashboard/chat_charts.py). |
+| **PR Predictor** | [`agent.analyze_pr()`](../src/ai_agent/agent.py) | Deep analysis of a single PR — extracts changed resources, prices them, estimates $ / day delta. Also imports [`diff_resources.py`](../src/ai_agent/diff_resources.py) for scope-ID extraction. |
+| **Anomalies** | [`anomaly_agent.analyze_anomalies()`](../src/ai_agent/anomaly_agent.py) | Full-account sweep. Consumes the pre-computed grounded context from `aws_sweep` + `repo_sweep`, produces ranked action cards. |
+| **AWS sweep** | [`aws_sweep.sweep()`](../src/ai_agent/aws_sweep.py) | Pre-fetches cost-by-service, Compute Optimizer results, idle EBS, NAT gateways, RDS, rightsizing recs, budgets — all in parallel. Result is grounded context passed to `anomaly_agent`. |
+| **Repo sweep** | [`repo_sweep.sweep()`](../src/ai_agent/repo_sweep.py) | Full-repo scan for cost-relevant signals (accounts / regions / envs, scheduled events, provisioned Lambda/Fargate, recent open PRs). REST-API driven. |
+| **Precedent grounding** | [`precedent.find_precedents()`](../src/ai_agent/precedent.py) | Finds historical PRs that expanded scope in the same files, measures $ / tenant / day step change in sibling accounts. See [DESIGN.md § 5](DESIGN.md#5-forecast--prediction-pipeline). |
+| **PR fix agent** | [`pr_fix_agent.plan_fix()`](../src/ai_agent/pr_fix_agent.py) | Second-pass agent for Anomalies → Open draft PR flow. Locates target files, applies the suggested fix, returns structured JSON consumed by [`gh_write.apply_pr_plan`](../src/pr_scanner/gh_write.py). |
+| **Chart narrator** | [`narrator.narrate()`](../src/ai_agent/narrator.py) | Legacy — replaced by the deterministic explainer on Dashboard. Kept for other pages. |
 
 ### 5.1 Tool inventory
 
@@ -271,6 +307,29 @@ retries once if the returned JSON is missing required fields (like the
 - **Structured output** via JSON schemas in the system prompt (not
   perfect, but robust with our extraction + retry logic)
 - **Haiku fallback** for cheap operations (chat, quick analysis)
+
+### 5.4 `src/pr_scanner/` module map
+
+Everything PR-related — reading, pricing, opening — lives in this
+package. Kept separate from `ai_agent/` so it can be exercised from
+CI without loading Bedrock.
+
+| File | Responsibility |
+|---|---|
+| [`gh_client.py`](../src/pr_scanner/gh_client.py) | Unified `gh` CLI + REST-API backend. Exposes `pr_diff`, `api_get`, `gh_available()`, `token_configured()`. Container falls back to REST when `gh` isn't installed. |
+| [`gh_write.py`](../src/pr_scanner/gh_write.py) | GitHub write helpers — create branches, commit files, open draft PRs. Only used by the "Open draft PR" button on Anomalies. |
+| [`scan.py`](../src/pr_scanner/scan.py) | Scan merged PRs, extract per-PR context, compute daily-cost deltas. |
+| [`open_prs.py`](../src/pr_scanner/open_prs.py) | Scan **open** PRs (not-yet-merged). Deep LLM analysis + merge-probability inference + expected daily delta. Feeds forecast overlays. |
+| [`llm_analyzer.py`](../src/pr_scanner/llm_analyzer.py) | LLM-driven per-PR analyzer used by `scan.py` and `open_prs.py` — extracts resources, prices them, returns structured verdict. |
+| [`github_scan.py`](../src/pr_scanner/github_scan.py) | GitHub-side traversal (walks org/repo, iterates PRs, applies filters). |
+| [`cloudwatch_tool.py`](../src/pr_scanner/cloudwatch_tool.py) | CloudWatch metric fetcher used inside LLM tool calls (Lambda invocations/duration, RDS CPU). |
+| [`pricing.py`](../src/pr_scanner/pricing.py) | AWS Pricing API wrapper (EC2, NAT). Cached to `data/pricing_cache.json`. |
+| [`profile_repo_match.py`](../src/pr_scanner/profile_repo_match.py) | Normalises AWS profile names → short repo names so precedent grounding can find the right sibling account. |
+| [`repos.py`](../src/pr_scanner/repos.py) | Populates org / repo dropdowns via `user/orgs` + PR-author search. |
+
+**Read/write split:** every file except `gh_write.py` is strictly
+read-only. Writing is only triggered by explicit user action
+("Prepare draft PR" → preview diff → "Open draft PR" button).
 
 ---
 
@@ -462,13 +521,36 @@ until 5 minutes before expiry — see [src/aws/cross_account.py](../src/aws/cros
 
 ### 10.4 CI / build automation
 
-- `.github/workflows/deploy-apprunner.yml` — legacy App Runner deploy
-  workflow, kept for reference but not currently triggered.
-- `.github/workflows/daily.yml` — scaffold cron for a scheduled
-  forecast; inactive (no `AWS_ROLE_TO_ASSUME` secret set).
-- Task-def updates: manual `aws ecs register-task-definition` +
-  `aws ecs update-service`. Not automated (would require merging the
-  App Runner workflow to ECS, which is deferred).
+Four GitHub Actions workflows live in `.github/workflows/`:
+
+| Workflow | Trigger | What it does | State |
+|---|---|---|---|
+| `pr-cost-check.yml` | `pull_request` to any branch | Runs the PR cost-impact check on the PR's diff, posts a comment on the PR, uploads a chart artifact. | **Active** — this is the one that gated PR #32. |
+| `pr-cost-check-reusable.yml` | `workflow_call` | Reusable inner workflow for `pr-cost-check.yml`. Isolates the boto3 + AWS role-assume steps so other workflows can re-invoke it. | **Active** |
+| `deploy-apprunner.yml` | `push` to `main`, `workflow_dispatch` | Legacy App Runner deploy path. Kept for reference — the running app is on ECS + ALB, not App Runner. | **Inactive** (App Runner path abandoned, see § 10.2) |
+| `daily.yml` | `schedule` (cron) | Scaffold for a nightly forecast run per account. Not currently active — no `AWS_ROLE_TO_ASSUME` secret configured. | **Inactive** (scaffold) |
+
+**`src/ci/`** hosts the Python entry points invoked by the pr-cost-check workflows:
+
+| File | Called from | Purpose |
+|---|---|---|
+| [`pr_check.py`](../src/ci/pr_check.py) | `scripts/pr_cost_check.py` | Orchestrates the full PR check — loads policy config, runs `agent.analyze_pr()`, formats the PR-comment output. |
+| [`forecast_context.py`](../src/ci/forecast_context.py) | `pr_check.py` | Builds `ForecastContext` (baseline, PR-driven delta, projected line) from Cost Explorer history for the comment. |
+| [`forecast_chart.py`](../src/ci/forecast_chart.py) | `pr_check.py` | Renders the "cost impact" chart artifact (matplotlib PNG) attached to the PR comment. |
+
+**`scripts/`** hosts the shell-callable entry points:
+
+| Script | Purpose |
+|---|---|
+| [`pr_cost_check.py`](../scripts/pr_cost_check.py) | CI entry point — reads `GITHUB_EVENT_PATH`, resolves the PR, calls `pr_check.run()`. |
+| [`prepare_deploy_config.py`](../scripts/prepare_deploy_config.py) | Legacy — prepared the `deploy/ecs/task-definition.json` for the abandoned CFN path. Kept for reference. |
+| [`test_forecast_accuracy.py`](../scripts/test_forecast_accuracy.py) | Walk-forward backtest runner used to reproduce the accuracy claims in § 4.4. |
+
+**ECS deploys** are still manual: `aws ecs register-task-definition` +
+`aws ecs update-service`. Wiring `deploy-apprunner.yml` to hit ECS
+instead is deferred — the App Runner attempt was documented in-repo
+as a paper trail, then superseded by the ECS + ALB path (see
+[AIPDLC.md § 5.15](../AIPDLC.md)).
 
 ---
 

@@ -249,7 +249,7 @@ message shows the `ASSUMED` badge.
 
 ---
 
-## 7. Five pages, one design principle
+## 7. Six pages, one design principle
 
 ```mermaid
 flowchart LR
@@ -259,6 +259,7 @@ flowchart LR
       P[PR Predictor<br/>impact of one PR]
       An[Anomalies<br/>ranked fix cards]
       O[Org Impact<br/>account-level rollup]
+      F[Future Forecast<br/>Close the Loop ledger]
     end
 
     A -.uses.-> Bedrock[Bedrock tool-use loop]
@@ -266,6 +267,7 @@ flowchart LR
     P -.uses.-> Bedrock
     An -.uses.-> Bedrock
     O -.uses.-> CE[Cost Explorer directly]
+    F -.reads.-> Cache[state_cache.py<br/>prior results ledger]
 
     Bedrock -.tools.-> Tools[23 read-only tools]
     Forecast -.data.-> CE
@@ -278,6 +280,9 @@ flowchart LR
 - Org Impact: same.
 - PR Predictor / Anomalies / CostSense AI: LLM picks tools, tools hit
   real APIs, chart guard rejects any answer that can't be grounded.
+- Future Forecast: **aggregator only** — reads the priced
+  recommendations already produced by other pages. No modelling, no
+  projection. Preserves honesty rather than compounding uncertainty.
 
 ---
 
