@@ -725,9 +725,16 @@ def _format_bedrock_error(
         )
 
     if "expiredtoken" in lowered or "unrecognizedclientexception" in lowered:
+        # On the container the profile is a cross-account role assumed via
+        # STS — there's no `aws sso login` to run. On a laptop the user's
+        # own SSO can be re-authenticated. Emit both hints so whichever
+        # path the user is on, one of them makes sense.
         return (
             f"**AWS session for {scope} has expired.** "
-            f"Run `aws sso login --profile {profile}` and try again.\n\n"
+            f"Try again in a moment — temporary credentials refresh "
+            f"automatically. If this keeps happening on the hosted URL, "
+            f"the container needs to be restarted. If you're running "
+            f"locally, run `aws sso login --profile {profile}` first.\n\n"
             f"AWS error detail: {text}"
         )
 

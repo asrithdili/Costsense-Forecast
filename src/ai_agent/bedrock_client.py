@@ -13,8 +13,6 @@ the sidebar.
 """
 from __future__ import annotations
 
-from functools import lru_cache
-
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
@@ -32,33 +30,59 @@ _BEDROCK_CONFIG = Config(
 )
 
 
-@lru_cache(maxsize=8)
 def make_client(profile: str | None, region: str | None = None):
+    """Build a fresh Bedrock-runtime client on every call.
+
+    Deliberately NOT cached. Why: on the container the boto3.Session for
+    cross-account profiles holds temporary AssumeRole credentials that
+    expire hourly. The cross-account layer already refreshes the Session
+    behind us, but a cached client would still be pointing at the old
+    Session's expired credentials — the classic "session refreshed but
+    the child client didn't" trap. Rebuilding is cheap (a Python object,
+    no network), so we just do it every call.
+    """
     region = region or default_bedrock_region()
     session = make_session(profile)
     return session.client("bedrock-runtime", region_name=region,
                           config=_BEDROCK_CONFIG)
 
 
-@lru_cache(maxsize=32)
+# STS get-caller-identity is cached briefly per profile so we don't hit
+# STS on every chat turn — but the cache expires so an ExpiredToken on
+# the underlying session doesn't get papered over indefinitely.
+_ACCOUNT_ID_TTL_SECONDS = 300
+_account_id_cache: dict[str | None, tuple[str | None, float]] = {}
+
+
 def resolve_account_id(profile: str | None) -> str | None:
     """Return the AWS account id the *profile* actually resolves to via
-    ``sts:GetCallerIdentity``. Cached per-profile in-process so we don't
-    hit STS on every chat turn.
+    ``sts:GetCallerIdentity``.
 
-    Returns ``None`` on any failure (auth, network, expired token). The
-    caller decides how to handle a ``None`` — the chat page treats it as
-    "cannot verify" and refuses the Bedrock call rather than proceeding
-    with unverifiable credentials.
+    Cached per-profile for a short TTL so we don't hit STS on every turn
+    but a stale hit can't outlive an expired session. Returns ``None``
+    on any failure (auth, network, expired token). The caller decides
+    how to handle ``None`` — the chat page treats it as "cannot verify"
+    and refuses the Bedrock call rather than proceeding with
+    unverifiable credentials.
     """
+    import time
+
+    now = time.time()
+    cached = _account_id_cache.get(profile)
+    if cached is not None and (now - cached[1]) < _ACCOUNT_ID_TTL_SECONDS:
+        return cached[0]
+
     try:
         session = make_session(profile)
         sts = session.client("sts")
-        return sts.get_caller_identity()["Account"]
+        account_id = sts.get_caller_identity()["Account"]
     except (BotoCoreError, ClientError):
-        return None
+        account_id = None
     except Exception:  # noqa: BLE001
-        return None
+        account_id = None
+
+    _account_id_cache[profile] = (account_id, now)
+    return account_id
 
 
 def verify_profile_account(
