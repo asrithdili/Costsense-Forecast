@@ -6,7 +6,7 @@ do" rather than just "what are the numbers." Key differences from v1:
   1. Loads on arrival — controls refine a result that is already on screen.
   2. Projection-led — the hero number is projected month-end, not a
      backward-looking window total.
-  3. Ownership — group by team / OU / environment / account / service.
+  3. Ownership — group by team / environment / account / service.
      Account IDs are not a language leadership speaks.
   4. Movers ranked by dollars with a materiality floor. Percent is displayed
      but never ranked on.
@@ -52,7 +52,6 @@ from src.dashboard.nav import (  # noqa: E402
 GROUP_DIMENSIONS = {
     "Team": "team",
     "Account": "account",
-    "OU": "ou",
     "Environment": "environment",
     "Service": "service",
 }
@@ -395,7 +394,7 @@ def _render_ownership(org: OrgSpend) -> None:
     if ownership_source == "unavailable":
         callout(
             "This profile can't read AWS Organizations (`ListAccounts` "
-            "denied), so we don't have team/OU/environment info for these "
+            "denied), so we don't have team/environment info for these "
             "accounts. **Group by Account** is the accurate view. To get "
             "the other groupings, ask DevOps to grant "
             "`organizations:ListAccounts` and "
