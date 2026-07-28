@@ -398,6 +398,7 @@ def _build_figure(chart: dict) -> go.Figure:
     (spline lines + markers + brand colour). Bar charts use a similar
     palette."""
     ctype = chart.get("type", "line")
+    bar_color = C.INFO if "prediction_basis" in chart else C.BRAND
     fig = go.Figure()
     for series in chart.get("series", []):
         name = str(series.get("name") or "")
@@ -406,7 +407,7 @@ def _build_figure(chart: dict) -> go.Figure:
         if ctype == "bar":
             fig.add_trace(go.Bar(
                 x=x, y=y, name=name,
-                marker=dict(color=C.BRAND),
+                marker=dict(color=bar_color),
                 hovertemplate="%{x}<br>$%{y:,.2f}<extra>" + name + "</extra>",
             ))
         else:  # line

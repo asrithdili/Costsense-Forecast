@@ -445,7 +445,7 @@ if history_30d:
     fig.add_trace(go.Scatter(
         x=dates, y=vals, name="Actual daily spend",
         mode="lines+markers",
-        line=dict(color=C.BRAND, width=2.5, shape="spline", smoothing=1.0),
+        line=dict(color=C.GOOD, width=2.5, shape="spline", smoothing=1.0),
         marker=dict(size=6),
         hovertemplate="%{x|%d %b}<br>$%{y:,.0f}<extra>Actual</extra>",
     ))
@@ -458,10 +458,10 @@ if history_30d:
                       annotation_position="top left",
                       annotation_font=dict(size=10, color=C.MUTED))
     if projected is not None and items:
-        fig.add_hline(y=projected, line=dict(color=C.BRAND_DARK, width=1.5, dash="dashdot"),
+        fig.add_hline(y=projected, line=dict(color=C.INFO, width=1.5, dash="dashdot"),
                       annotation_text="Projected $/day (current + net delta)",
                       annotation_position="bottom left",
-                      annotation_font=dict(size=10, color=C.BRAND_DARK))
+                      annotation_font=dict(size=10, color=C.INFO))
     fig.update_layout(
         **plotly_layout(height=380),
         yaxis_title="USD / day",
