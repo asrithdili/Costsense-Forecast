@@ -68,12 +68,142 @@ render_sidebar_header()
 # ---------- cached AWS fetchers ----------
 
 @st.cache_data(ttl=600, show_spinner=False)
+def _fetch_cutoff_day_actual(
+    profile: str,
+    cutoff_iso: str,
+    service: str | None = None,
+) -> float:
+    """Return Cost Explorer actual for cutoff day only (0 when CE has no row)."""
+    cutoff = date.fromisoformat(cutoff_iso)
+    totals = fetch_daily_totals(
+        cutoff, cutoff + timedelta(days=1), profile=profile, service=service,
+    )
+    for day, amount in totals:
+        if day == cutoff:
+            return float(amount)
+    return 0.0
+
+
+def _hist_past_for_chart(
+    hist_df: pd.DataFrame,
+    cutoff: date,
+    profile: str,
+    service: str | None,
+) -> pd.DataFrame:
+    """Past actuals through cutoff. Missing cutoff day is filled from CE, not assumed."""
+    cutoff_iso = cutoff.isoformat()
+    if hist_df.empty:
+        return pd.DataFrame([{
+            "day": cutoff_iso,
+            "actual_usd": _fetch_cutoff_day_actual(
+                profile, cutoff_iso, service=service,
+            ),
+        }])
+    past = hist_df.loc[_on_or_before(hist_df["day"], cutoff)].copy()
+    if cutoff_iso not in past["day"].astype(str).tolist():
+        past = pd.concat([past, pd.DataFrame([{
+            "day": cutoff_iso,
+            "actual_usd": _fetch_cutoff_day_actual(
+                profile, cutoff_iso, service=service,
+            ),
+        }])], ignore_index=True)
+    return past.sort_values("day").reset_index(drop=True)
+
+
+def _future_trace_xy(
+    cutoff: date,
+    anchor_y: float | None,
+    future_x: list,
+    future_y: list,
+) -> tuple[list, list[float]]:
+    """Connect cutoff anchor to future points for one continuous forecast trace."""
+    ys = [float(v) for v in future_y]
+    if anchor_y is None:
+        return future_x, ys
+    return [cutoff.isoformat()] + list(future_x), [anchor_y] + ys
+
+
+_CHART_TICK_STEP_DAYS = 14
+
+
+def _chart_day(value) -> date:
+    return pd.Timestamp(value).date()
+
+
+def _forecast_end_date(fc_future: pd.DataFrame) -> date | None:
+    if fc_future.empty:
+        return None
+    return _chart_day(fc_future["target_date"].max())
+
+
+def _chart_view_start(
+    hist_past: pd.DataFrame,
+    cutoff: date,
+    history_days: int,
+    *,
+    bt_past: pd.DataFrame | None = None,
+    day_col: str = "target_date",
+) -> date:
+    candidates: list[date] = []
+    if not hist_past.empty:
+        candidates.append(_chart_day(hist_past["day"].min()))
+    if bt_past is not None and not bt_past.empty:
+        candidates.append(_chart_day(bt_past[day_col].min()))
+    if candidates:
+        return min(candidates)
+    return cutoff - timedelta(days=history_days)
+
+
+def _chart_data_start(
+    *series: tuple[pd.DataFrame, str],
+    default: date,
+) -> date:
+    """First date with plotted data — avoids empty left padding on the axis."""
+    candidates: list[date] = []
+    for df, col in series:
+        if df is not None and not df.empty:
+            candidates.append(_chart_day(df[col].min()))
+    return min(candidates) if candidates else default
+
+
+def _fourteen_day_tick_dates(
+    view_start: date,
+    view_end: date,
+    *,
+    step: int = _CHART_TICK_STEP_DAYS,
+) -> list[date]:
+    """14-day ticks through the range; last label is exact forecast end day."""
+    ticks: list[date] = []
+    d = view_start
+    while d <= view_end:
+        ticks.append(d)
+        d += timedelta(days=step)
+    ticks = [t for t in ticks if t <= view_end]
+    if not ticks or ticks[-1] != view_end:
+        ticks.append(view_end)
+    return ticks
+
+
+def _forecast_chart_xaxis(view_start: date, view_end: date) -> dict:
+    ticks = _fourteen_day_tick_dates(view_start, view_end)
+    return dict(
+        gridcolor=C.HAIRLINE,
+        zerolinecolor=C.HAIRLINE,
+        range=[view_start.isoformat(), view_end.isoformat()],
+        tickmode="array",
+        tickvals=[t.isoformat() for t in ticks],
+        tickformat="%d %b",
+    )
+
+
+@st.cache_data(ttl=600, show_spinner=False)
 def _fetch_history(
     profile: str, cutoff_iso: str, days: int, service: str | None = None,
 ) -> pd.DataFrame:
     cutoff = date.fromisoformat(cutoff_iso)
     totals = fetch_daily_totals(
-        cutoff - timedelta(days=days), cutoff, profile=profile, service=service,
+        cutoff - timedelta(days=days), cutoff + timedelta(days=1),
+        profile=profile, service=service,
     )
     if not totals:
         return pd.DataFrame(columns=["day", "actual_usd"])
@@ -88,7 +218,7 @@ def _fetch_by_service(
     """Returns {service: [(day_iso, amount), ...]} sorted by total spend desc."""
     cutoff = date.fromisoformat(cutoff_iso)
     raw = fetch_daily_by_service(
-        cutoff - timedelta(days=days), cutoff, profile=profile,
+        cutoff - timedelta(days=days), cutoff + timedelta(days=1), profile=profile,
     )
     # normalize to iso strings for st.cache_data hashability
     return {
@@ -154,6 +284,109 @@ def _rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
+def _maybe_bump_cutoff_to_today() -> None:
+    """Advance the default cutoff when the calendar day changes so charts
+    don't stay pinned to yesterday's run."""
+    today = date.today()
+    anchor = st.session_state.get("_dash_today_anchor")
+    if anchor == today.isoformat():
+        return
+    if anchor:
+        prev_day = date.fromisoformat(anchor)
+        if st.session_state.get("dash_cutoff") == prev_day:
+            st.session_state["dash_cutoff"] = today
+    if "dash_cutoff" not in st.session_state:
+        st.session_state["dash_cutoff"] = today
+    st.session_state["_dash_today_anchor"] = today.isoformat()
+
+
+def _on_or_before(series: pd.Series, cutoff: date) -> pd.Series:
+    return pd.to_datetime(series) <= pd.Timestamp(cutoff)
+
+
+def _after(series: pd.Series, cutoff: date) -> pd.Series:
+    return pd.to_datetime(series) > pd.Timestamp(cutoff)
+
+
+def _ensure_row_at_cutoff(
+    df: pd.DataFrame,
+    cutoff: date,
+    day_col: str,
+    defaults: dict[str, float],
+) -> pd.DataFrame:
+    """Pad a missing cutoff row when CE End is exclusive (used for fitted series)."""
+    if df.empty:
+        row = {day_col: cutoff.isoformat(), **defaults}
+        return pd.DataFrame([row])
+    out = df.copy()
+    cutoff_iso = cutoff.isoformat()
+    if cutoff_iso not in out[day_col].astype(str).tolist():
+        row = {day_col: cutoff_iso, **defaults}
+        out = pd.concat([out, pd.DataFrame([row])], ignore_index=True)
+    return out.sort_values(day_col).reset_index(drop=True)
+
+
+def _past_through_cutoff(
+    df: pd.DataFrame,
+    cutoff: date,
+    day_col: str,
+    pad_defaults: dict[str, float],
+) -> pd.DataFrame:
+    if df.empty:
+        return _ensure_row_at_cutoff(df, cutoff, day_col, pad_defaults)
+    past = df.loc[_on_or_before(df[day_col], cutoff)].copy()
+    return _ensure_row_at_cutoff(past, cutoff, day_col, pad_defaults)
+
+
+def _value_at_cutoff(
+    df: pd.DataFrame,
+    cutoff: date,
+    day_col: str,
+    y_col: str,
+) -> float | None:
+    if df.empty:
+        return None
+    match = df.loc[pd.to_datetime(df[day_col]) == pd.Timestamp(cutoff)]
+    if not match.empty:
+        return float(match.iloc[-1][y_col])
+    return float(df.iloc[-1][y_col])
+
+
+def _fit_past_through_cutoff(
+    df: pd.DataFrame,
+    cutoff: date,
+    day_col: str = "target_date",
+) -> pd.DataFrame:
+    """Extend fitted/backtest series to cutoff (forward-fill last fit)."""
+    if df.empty:
+        return df
+    past = df.loc[_on_or_before(df[day_col], cutoff)].copy()
+    cutoff_iso = cutoff.isoformat()
+    if cutoff_iso not in past[day_col].astype(str).tolist():
+        last = past.iloc[-1].copy()
+        last[day_col] = cutoff_iso
+        past = pd.concat([past, pd.DataFrame([last])], ignore_index=True)
+    return past.sort_values(day_col).reset_index(drop=True)
+
+
+def _past_anchor_y(
+    hist_past: pd.DataFrame,
+    fit_past: pd.DataFrame,
+    cutoff: date,
+    *,
+    y_fit: str = "predicted_usd",
+    y_actual: str = "actual_usd",
+    day_col_fit: str = "target_date",
+    day_col_actual: str = "day",
+) -> float | None:
+    """Y value at cutoff for bridging past → future lines."""
+    if not fit_past.empty:
+        return _value_at_cutoff(fit_past, cutoff, day_col_fit, y_fit)
+    if not hist_past.empty:
+        return _value_at_cutoff(hist_past, cutoff, day_col_actual, y_actual)
+    return None
+
+
 # ---------- page title (rendered first so the page never looks blank) ----------
 
 section(
@@ -208,6 +441,7 @@ if _last_profile != active_profile:
 _widget_ver = st.session_state.get("dash_widget_ver", 0)
 
 # Read defaults for other controls up front so the header can reflect them.
+_maybe_bump_cutoff_to_today()
 _cutoff = st.session_state.get("dash_cutoff", date.today())
 _history_days = st.session_state.get("dash_history_days", 90)
 _model_choice = st.session_state.get("dash_model", "lightgbm")
@@ -685,11 +919,31 @@ if show_replay and not hist_df.empty:
         except Exception as e:  # noqa: BLE001
             callout(f"Training fit overlay failed: {e}", tone="warning")
 
+# Chart boundary: past (≤ cutoff) vs future (> cutoff, next 7d from saved run).
+_chart_cutoff = cutoff
+hist_past = _hist_past_for_chart(
+    hist_df, _chart_cutoff, active_profile, selected_service,
+)
+fc_future = (
+    fc_df.loc[_after(fc_df["target_date"], _chart_cutoff)].copy()
+    if not fc_df.empty else fc_df
+)
+replay_past = _fit_past_through_cutoff(replay_df, _chart_cutoff, "target_date")
+_forecast_end = _forecast_end_date(fc_future)
+_chart_x_end = _forecast_end if _forecast_end else _chart_cutoff
+_chart_x_start = _chart_view_start(
+    hist_past, _chart_cutoff, history_days,
+)
+_forecast_stale = (
+    latest
+    and latest.get("run_cutoff")
+    and latest["run_cutoff"] != _chart_cutoff.isoformat()
+)
 
 # KPI row
 kpis = st.columns(4, gap="medium")
-next_7_total = fc_df["adjusted_usd"].sum() if not fc_df.empty else None
-last_7_actual = hist_df.tail(7)["actual_usd"].sum() if not hist_df.empty else None
+next_7_total = fc_future["adjusted_usd"].sum() if not fc_future.empty else None
+last_7_actual = hist_past.tail(7)["actual_usd"].sum() if not hist_past.empty else None
 _replay_valid = replay_df.dropna(subset=["actual_usd"]) if not replay_df.empty else replay_df
 _replay_total_actual = _replay_valid["actual_usd"].abs().sum() if not _replay_valid.empty else 0.0
 replay_wape = ((_replay_valid["abs_err"].sum() / _replay_total_actual * 100)
@@ -788,92 +1042,117 @@ section(
     kicker="Overview",
 )
 
-# Unified chart: past actuals + future band
-if hist_df.empty and fc_df.empty:
+if _forecast_stale:
+    callout(
+        f"Saved forecast was run at cutoff **{latest['run_cutoff']}** but "
+        f"controls are set to **{_chart_cutoff.isoformat()}**. "
+        "Click **Run forecast** to refresh future dates.",
+        tone="info",
+    )
+
+# Unified chart: past actuals + future band (split at cutoff)
+if hist_past.empty and fc_future.empty:
     callout(
         f"No Cost Explorer data for account **{account_id}** in the last "
-        f"{history_days} days, and no forecast on disk. If this is a fresh "
-        f"sandbox, spend may simply be $0.",
+        f"{history_days} days through cutoff, and no future forecast on disk "
+        f"after **{_chart_cutoff.isoformat()}**. If this is a fresh sandbox, "
+        "spend may simply be $0 — otherwise click **Run forecast**.",
         tone="info",
     )
 else:
     fig = go.Figure()
-    if not hist_df.empty:
+    _past_anchor = _past_anchor_y(
+        hist_past, replay_past, _chart_cutoff, y_fit="predicted_usd",
+    )
+
+    if not fc_future.empty:
+        future_x = fc_future["target_date"].tolist()
+        upper_y = fc_future["upper_usd"].tolist()
+        lower_y = fc_future["lower_usd"].tolist()
+        adjusted_y = fc_future["adjusted_usd"].tolist()
+        band_x, upper_plot = _future_trace_xy(
+            _chart_cutoff, float(upper_y[0]), future_x, upper_y,
+        )
+        _, lower_plot = _future_trace_xy(
+            _chart_cutoff, float(lower_y[0]), future_x, lower_y,
+        )
+
         fig.add_trace(go.Scatter(
-            x=hist_df["day"], y=hist_df["actual_usd"],
-            mode="lines+markers", name="actual (Cost Explorer)",
-            line=dict(color=C.BRAND, width=2.5, shape="spline",
-                      smoothing=1.0),
-        ))
-    if not fc_df.empty:
-        fig.add_trace(go.Scatter(
-            x=fc_df["target_date"], y=fc_df["upper_usd"],
+            x=band_x, y=upper_plot,
             mode="lines",
-            line=dict(width=0, shape="spline", smoothing=1.0),
+            line=dict(width=0),
             showlegend=False, hoverinfo="skip",
         ))
         fig.add_trace(go.Scatter(
-            x=fc_df["target_date"], y=fc_df["lower_usd"],
-            mode="lines", fill="tonexty", name="forecast interval",
-            line=dict(width=0, shape="spline", smoothing=1.0),
-            fillcolor=_rgba(C.BRAND, 0.15),
-            hoverinfo="skip",
+            x=band_x, y=lower_plot,
+            mode="lines", fill="tonexty",
+            line=dict(width=0),
+            fillcolor=_rgba(C.INFO, 0.15),
+            showlegend=False, hoverinfo="skip",
         ))
+        # Bridge cutoff → first future day (no hover — keeps past tooltip clean).
+        if _past_anchor is not None and future_x:
+            fig.add_trace(go.Scatter(
+                x=[_chart_cutoff.isoformat(), future_x[0]],
+                y=[_past_anchor, float(adjusted_y[0])],
+                mode="lines",
+                line=dict(color=C.INFO, width=2.5, dash="dot", shape="linear"),
+                showlegend=False, hoverinfo="skip",
+                legendgroup="future",
+            ))
         fig.add_trace(go.Scatter(
-            x=fc_df["target_date"], y=fc_df["baseline_usd"],
-            mode="lines+markers", name="baseline forecast",
-            line=dict(color=C.INFO, width=2, dash="dot",
-                      shape="spline", smoothing=1.0),
-        ))
-        fig.add_trace(go.Scatter(
-            x=fc_df["target_date"], y=fc_df["adjusted_usd"],
-            mode="lines+markers", name="adjusted (baseline + PR delta)",
-            line=dict(color=C.BRAND_DARK, width=2.5, shape="spline",
-                      smoothing=1.0),
+            x=future_x,
+            y=[float(v) for v in adjusted_y],
+            mode="lines+markers", name="future prediction (next 7d)",
+            line=dict(color=C.INFO, width=2.5, dash="dot", shape="linear"),
+            legendgroup="future",
+            legendrank=1,
+            hovertemplate="future prediction: %{y:,.2f}<extra></extra>",
         ))
         fig.add_vline(
-            x=latest["run_cutoff"], line_dash="dash", line_color=C.FAINT,
+            x=_chart_cutoff.isoformat(), line_dash="dash", line_color=C.FAINT,
             annotation_text="cutoff", annotation_position="top",
         )
-    else:
+    elif not hist_past.empty:
         callout(
-            "No saved future forecast yet — click **Run forecast** in "
-            "**Controls** above. Training fit below still shows how well "
-            "the model tracks history.",
+            "No saved future forecast after cutoff — click **Run forecast** "
+            "in **Controls** above.",
             tone="info",
         )
 
-    if not pr_series_df.empty:
+    if not hist_past.empty:
         fig.add_trace(go.Scatter(
-            x=pr_series_df["day"], y=pr_series_df["pr_cum_usd"],
-            mode="lines", name="PR-attributable ($/day)",
-            line=dict(color=C.SEV["High"], width=1.5, dash="dot"),
-            hovertemplate="%{x}<br>PR delta $%{y:,.2f}<extra></extra>",
+            x=hist_past["day"], y=hist_past["actual_usd"],
+            mode="lines+markers", name="actual",
+            line=dict(color=C.GOOD, width=2.5, shape="spline", smoothing=1.0),
+            legendrank=3,
+            hovertemplate="actual: %{y:,.2f}<extra></extra>",
         ))
-    if not replay_df.empty:
+    if not replay_past.empty:
         fig.add_trace(go.Scatter(
-            x=replay_df["target_date"], y=replay_df["predicted_usd"],
-            mode="markers",
-            name="training fit (in-sample)",
-            marker=dict(color=C.BAD, size=8, symbol="diamond",
-                        line=dict(color="white", width=1)),
-            customdata=replay_df[["origin", "horizon", "actual_usd",
-                                  "abs_err"]].values,
-            hovertemplate=("Day %{x}<br>"
-                           "Fitted $%{y:,.2f}<br>"
-                           "Actual $%{customdata[2]:,.2f}<br>"
-                           "Trained at %{customdata[0]}<br>"
-                           "Abs err $%{customdata[3]:,.2f}"
-                           "<extra></extra>"),
+            x=replay_past["target_date"], y=replay_past["predicted_usd"],
+            mode="lines+markers",
+            name="fitted (training)",
+            line=dict(color=C.INFO, width=2.5, shape="spline", smoothing=1.0),
+            marker=dict(color=C.INFO, size=6),
+            legendrank=2,
+            hovertemplate="fitted (training): %{y:,.2f}<extra></extra>",
         ))
+    _fig_layout = plotly_layout(height=440)
+    _overview_x_start = _chart_data_start(
+        (hist_past, "day"),
+        (replay_past, "target_date"),
+        default=cutoff - timedelta(days=history_days),
+    )
+    _fig_layout["xaxis"] = _forecast_chart_xaxis(_overview_x_start, _chart_x_end)
     fig.update_layout(
-        **plotly_layout(height=440),
+        **_fig_layout,
         yaxis_title="USD / day",
         hovermode="x unified",
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    if not replay_df.empty:
+    if not replay_past.empty:
         with st.expander(
             f"Training fit detail  ·  {len(replay_df)} in-sample days"
             + (f"  ·  WAPE {replay_wape:.1f}%" if replay_wape is not None else ""),
@@ -896,15 +1175,15 @@ else:
                 use_container_width=True, hide_index=True,
             )
 
-    if latest:
+    if latest and not fc_future.empty:
         section(
             "Forecast detail",
             "Daily baseline, PR delta, and confidence band.",
             kicker="Breakdown",
         )
         st.dataframe(
-            fc_df[["target_date", "baseline_usd", "pr_delta_usd",
-                   "adjusted_usd", "lower_usd", "upper_usd"]]
+            fc_future[["target_date", "baseline_usd", "pr_delta_usd",
+                       "adjusted_usd", "lower_usd", "upper_usd"]]
             .rename(columns={
                 "target_date": "Date",
                 "baseline_usd": "Baseline",
@@ -1127,53 +1406,80 @@ else:
         )
 
     fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(
-        x=bt["target_date"], y=bt["predicted_usd"],
-        mode="lines+markers", name="fitted (training)",
-        line=dict(color=C.BRAND_DARK, width=2.5, shape="spline", smoothing=1.0),
-    ))
-    fig2.add_trace(go.Scatter(
-        x=bt["target_date"], y=bt["actual_usd"],
-        mode="lines+markers", name="actual",
-        line=dict(color=C.BRAND, width=2.5, shape="spline", smoothing=1.0),
-    ))
-    # Extend chart with the future 7-day forecast so past + future live on
-    # one axis. Future comes from `latest["forecast"]` (already persisted by
-    # the last "Run forecast" click), and we connect it visually by
-    # prepending the last past-prediction point.
-    if latest and latest.get("forecast"):
-        fut_df = pd.DataFrame(latest["forecast"])
-        if not fut_df.empty:
-            last_past = bt.iloc[-1]
-            future_x = [last_past["target_date"]] + fut_df["target_date"].tolist()
-            future_y = [float(last_past["predicted_usd"])] + fut_df["adjusted_usd"].tolist()
-            upper_y = [float(last_past["predicted_usd"])] + fut_df["upper_usd"].tolist()
-            lower_y = [float(last_past["predicted_usd"])] + fut_df["lower_usd"].tolist()
+    bt_dates = pd.to_datetime(bt["target_date"])
+    bt_slice = bt.loc[bt_dates <= pd.Timestamp(_chart_cutoff)].copy()
+    bt_past = (
+        _fit_past_through_cutoff(bt_slice, _chart_cutoff, "target_date")
+        if not bt_slice.empty else bt_slice
+    )
 
-            fig2.add_trace(go.Scatter(
-                x=future_x, y=upper_y, mode="lines",
-                line=dict(width=0, shape="spline", smoothing=1.0),
-                showlegend=False, hoverinfo="skip",
-            ))
-            fig2.add_trace(go.Scatter(
-                x=future_x, y=lower_y, mode="lines", fill="tonexty",
-                name="future forecast band",
-                line=dict(width=0, shape="spline", smoothing=1.0),
-                fillcolor=_rgba(C.BRAND, 0.15), hoverinfo="skip",
-            ))
-            fig2.add_trace(go.Scatter(
-                x=future_x, y=future_y,
-                mode="lines+markers", name="future prediction (next 7d)",
-                line=dict(color=C.BRAND_DARK, width=2.5, dash="dot",
-                          shape="spline", smoothing=1.0),
-            ))
-            fig2.add_vline(
-                x=str(last_past["target_date"]),
-                line_dash="dash", line_color=C.FAINT,
-                annotation_text="now", annotation_position="top",
-            )
+    fig2.add_trace(go.Scatter(
+        x=bt_past["target_date"], y=bt_past["predicted_usd"],
+        mode="lines+markers", name="fitted (training)",
+        line=dict(color=C.INFO, width=2.5, shape="spline", smoothing=1.0),
+        legendrank=3,
+        hovertemplate="fitted (training): %{y:,.2f}<extra></extra>",
+    ))
+    fig2.add_trace(go.Scatter(
+        x=bt_past["target_date"], y=bt_past["actual_usd"],
+        mode="lines+markers", name="actual",
+        line=dict(color=C.GOOD, width=2.5, shape="spline", smoothing=1.0),
+        legendrank=4,
+        hovertemplate="actual: %{y:,.2f}<extra></extra>",
+    ))
+    # Future forecast: only dates after cutoff; bridge closes any calendar gap.
+    if not fc_future.empty:
+        future_x = fc_future["target_date"].tolist()
+        future_y = [float(v) for v in fc_future["adjusted_usd"].tolist()]
+        upper_y = [float(v) for v in fc_future["upper_usd"].tolist()]
+        lower_y = [float(v) for v in fc_future["lower_usd"].tolist()]
+        past_anchor = _value_at_cutoff(
+            bt_past, _chart_cutoff, "target_date", "predicted_usd",
+        )
+        band_x, upper_plot = _future_trace_xy(
+            _chart_cutoff, upper_y[0], future_x, upper_y,
+        )
+        _, lower_plot = _future_trace_xy(
+            _chart_cutoff, lower_y[0], future_x, lower_y,
+        )
+        future_plot_x, future_plot_y = _future_trace_xy(
+            _chart_cutoff, past_anchor, future_x, future_y,
+        )
+
+        fig2.add_trace(go.Scatter(
+            x=band_x, y=upper_plot, mode="lines",
+            line=dict(width=0),
+            showlegend=False, hoverinfo="skip",
+            legendrank=2,
+        ))
+        fig2.add_trace(go.Scatter(
+            x=band_x, y=lower_plot, mode="lines", fill="tonexty",
+            name="future forecast band",
+            line=dict(width=0),
+            fillcolor=_rgba(C.INFO, 0.15), hoverinfo="skip",
+            legendrank=2,
+        ))
+        fig2.add_trace(go.Scatter(
+            x=future_plot_x, y=future_plot_y,
+            mode="lines+markers", name="future prediction (next 7d)",
+            line=dict(color=C.INFO, width=2.5, dash="dot", shape="linear"),
+            legendrank=1,
+            hovertemplate="future prediction: %{y:,.2f}<extra></extra>",
+        ))
+        fig2.add_vline(
+            x=_chart_cutoff.isoformat(),
+            line_dash="dash", line_color=C.FAINT,
+            annotation_text="now", annotation_position="top",
+        )
+    _backtest_x_start = _chart_data_start(
+        (bt_past, "target_date"),
+        default=cutoff - timedelta(days=history_days),
+    )
+    _backtest_xaxis = _forecast_chart_xaxis(_backtest_x_start, _chart_x_end)
+    _fig2_layout = plotly_layout(height=340)
+    _fig2_layout["xaxis"] = _backtest_xaxis
     fig2.update_layout(
-        **plotly_layout(height=340),
+        **_fig2_layout,
         yaxis_title="USD / day",
         hovermode="x unified",
     )
@@ -1182,15 +1488,21 @@ else:
     err_roll = bt["abs_error_usd"].rolling(7, min_periods=1).sum()
     act_roll = bt["actual_usd"].abs().rolling(7, min_periods=1).sum()
     bt["wape_pct"] = (err_roll / act_roll * 100).where(act_roll > 0)
+    bt_wape_plot = bt.loc[
+        pd.to_datetime(bt["target_date"]) <= pd.Timestamp(_chart_cutoff)
+    ]
     fig3 = go.Figure()
     fig3.add_trace(go.Scatter(
-        x=bt["target_date"],
-        y=bt["wape_pct"],
+        x=bt_wape_plot["target_date"],
+        y=bt_wape_plot["wape_pct"],
         mode="lines+markers", name="rolling 7-day WAPE",
         line=dict(color=C.BAD, width=2.5, shape="spline", smoothing=1.0),
     ))
+    _fig3_layout = plotly_layout(height=260)
+    # Match forecast chart x-scale so "now" aligns; line stops at cutoff.
+    _fig3_layout["xaxis"] = _backtest_xaxis
     fig3.update_layout(
-        **plotly_layout(height=260),
+        **_fig3_layout,
         yaxis_title="WAPE %",
         hovermode="x unified",
     )

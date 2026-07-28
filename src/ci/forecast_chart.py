@@ -9,6 +9,11 @@ import plotly.graph_objects as go
 
 from src.ci.forecast_context import ForecastContext
 
+# Match Dashboard chart tokens (costsense_theme.C) without importing Streamlit.
+_ACTUAL = "#2B8A3E"   # C.GOOD
+_PREDICTED = "#3B5BDB"  # C.INFO
+_PREDICTED_BAND = "rgba(59,91,219,0.15)"
+
 
 def _as_python_datetimes(values) -> list[datetime]:
     """Kaleido JSON export cannot serialize pandas.Timestamp."""
@@ -36,7 +41,7 @@ def build_forecast_figure(
             x=_as_python_datetimes(hist_df["day"]),
             y=hist_df["actual_usd"].tolist(),
             mode="lines+markers", name="actual (Cost Explorer)",
-            line=dict(color="#2E86AB", width=2.5, shape="spline",
+            line=dict(color=_ACTUAL, width=2.5, shape="spline",
                       smoothing=1.0),
         ))
 
@@ -56,19 +61,19 @@ def build_forecast_figure(
             x=fc_x, y=fc_lower,
             mode="lines", fill="tonexty", name="forecast interval",
             line=dict(width=0, shape="spline", smoothing=1.0),
-            fillcolor="rgba(160,120,220,0.20)",
+            fillcolor=_PREDICTED_BAND,
             hoverinfo="skip",
         ))
         fig.add_trace(go.Scatter(
             x=fc_x, y=fc_baseline,
             mode="lines+markers", name="baseline forecast",
-            line=dict(color="#A17DB5", width=2, dash="dot",
+            line=dict(color=_PREDICTED, width=2, dash="dot",
                       shape="spline", smoothing=1.0),
         ))
         fig.add_trace(go.Scatter(
             x=fc_x, y=fc_adjusted,
             mode="lines+markers", name="adjusted (baseline + PR delta)",
-            line=dict(color="#7B3F99", width=2.5, shape="spline",
+            line=dict(color=_PREDICTED, width=2.5, shape="spline",
                       smoothing=1.0),
         ))
         # Plotly <6 crashes in add_vline(..., annotation_text=...) on date axes
