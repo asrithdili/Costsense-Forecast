@@ -352,6 +352,16 @@ def _value_at_cutoff(
     return float(df.iloc[-1][y_col])
 
 
+def _backtest_from_training_fit(replay_df: pd.DataFrame) -> pd.DataFrame:
+    """Map in-sample training fit rows to backtest chart schema."""
+    out = replay_df.rename(columns={
+        "predicted_usd": "predicted_usd",
+        "actual_usd": "actual_usd",
+    }).copy()
+    out["abs_error_usd"] = out["abs_err"]
+    return out.dropna(subset=["actual_usd"])
+
+
 def _fit_past_through_cutoff(
     df: pd.DataFrame,
     cutoff: date,
@@ -854,6 +864,7 @@ except Exception:  # noqa: BLE001
     pass
 
 bt = _load_backtest(account_id)
+bt_saved_count = len(bt)
 fc_df = pd.DataFrame(latest["forecast"]) if latest else pd.DataFrame()
 
 # PR step series (history + future) persisted by the pipeline.
@@ -1365,16 +1376,13 @@ section(
     kicker="Accuracy",
 )
 
-# If we have saved daily backtest scores, use them. Otherwise fall back to the
-# in-sample training fit we just computed.
+# Prefer persisted backtest scores when we have enough history. Thin saved
+# scores (e.g. one auto-scored day) still block the rich training-fit curve
+# unless we fall back below.
+_bt_min_days = fit_lookback_days
 bt_source = "saved"
-if bt.empty and not replay_df.empty:
-    bt = replay_df.rename(columns={
-        "predicted_usd": "predicted_usd",
-        "actual_usd": "actual_usd",
-    }).copy()
-    bt["abs_error_usd"] = bt["abs_err"]
-    bt = bt.dropna(subset=["actual_usd"])
+if (bt.empty or len(bt) < _bt_min_days) and not replay_df.empty:
+    bt = _backtest_from_training_fit(replay_df)
     bt_source = "training fit (in-memory)"
 
 if bt.empty:
@@ -1385,8 +1393,15 @@ if bt.empty:
     )
 else:
     if bt_source != "saved":
-        st.caption(f"Source: {bt_source} — computed from live history, "
-                   "not persisted.")
+        _src_note = (
+            f"Source: {bt_source} — computed from live history, not persisted."
+        )
+        if bt_saved_count:
+            _src_note += (
+                f" Only {bt_saved_count} persisted score(s) on disk "
+                f"(need {_bt_min_days} for saved-only chart)."
+            )
+        st.caption(_src_note)
     bt = bt.sort_values("target_date").reset_index(drop=True)
     total_abs_err = bt["abs_error_usd"].sum()
     total_actual = bt["actual_usd"].abs().sum()
