@@ -18,6 +18,57 @@ def _load_actual(account_id: str, day: date, profile: str | None) -> float:
     return amount
 
 
+def backfill_scores_from_disk(account_id: str, profile: str | None = None) -> int:
+    """Score every landed target found in any ``forecast_*.json`` on disk.
+
+    Unlike ``score_for_target`` (which expects ``forecast_{target-7d}.json``),
+    this walks all saved forecast payloads and writes ``score_*.json`` rows.
+    When several runs predict the same target, the latest ``run_cutoff`` wins.
+    """
+    today = date.today()
+    eligible_through = today - timedelta(days=1)
+    best: dict[date, tuple[dict, str]] = {}
+
+    for f in sorted(predictions_dir(account_id).glob("forecast_*.json")):
+        payload = json.loads(f.read_text())
+        run_cutoff = str(payload.get("run_cutoff") or "")
+        for row in payload.get("forecast", []):
+            try:
+                target = date.fromisoformat(row["target_date"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if target > eligible_through:
+                continue
+            prev = best.get(target)
+            if prev is None or run_cutoff > prev[1]:
+                best[target] = (row, run_cutoff)
+
+    n = 0
+    for target, (row, run_cutoff) in sorted(best.items()):
+        score_file = backtest_dir(account_id) / f"score_{target.isoformat()}.json"
+        if score_file.exists():
+            continue
+        try:
+            actual = _load_actual(account_id, target, profile=profile)
+            predicted = float(row.get("adjusted_usd") or row.get("predicted_usd", 0))
+            abs_err = abs(predicted - actual)
+            ape = abs_err / actual if actual else None
+            result = {
+                "account_id": account_id,
+                "target_date": target.isoformat(),
+                "run_cutoff": run_cutoff,
+                "predicted_usd": predicted,
+                "actual_usd": actual,
+                "abs_error_usd": abs_err,
+                "ape": ape,
+            }
+            score_file.write_text(json.dumps(result, indent=2))
+            n += 1
+        except Exception:  # noqa: BLE001
+            pass
+    return n
+
+
 def score_for_target(target_day: date, profile: str | None = None) -> dict | None:
     info = resolve(profile) if profile else None
     account_id = (info.account_id if info else None) or "unknown"

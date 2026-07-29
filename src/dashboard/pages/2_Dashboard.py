@@ -29,7 +29,7 @@ import streamlit as st
 
 from src.aws.cost_explorer import fetch_daily_by_service, fetch_daily_totals
 from src.aws.profiles import ProfileInfo, resolve_all
-from src.backtest.scorer import score_for_target
+from src.backtest.scorer import backfill_scores_from_disk
 from src.forecast.backtest_replay import training_fit_replay
 from src.pipeline.paths import actuals_dir, backtest_dir, predictions_dir
 from src.pipeline.run_daily import run as run_pipeline
@@ -72,8 +72,8 @@ def _fetch_cutoff_day_actual(
     profile: str,
     cutoff_iso: str,
     service: str | None = None,
-) -> float:
-    """Return Cost Explorer actual for cutoff day only (0 when CE has no row)."""
+) -> float | None:
+    """Return Cost Explorer actual for cutoff day, or None when CE has no row."""
     cutoff = date.fromisoformat(cutoff_iso)
     totals = fetch_daily_totals(
         cutoff, cutoff + timedelta(days=1), profile=profile, service=service,
@@ -81,7 +81,7 @@ def _fetch_cutoff_day_actual(
     for day, amount in totals:
         if day == cutoff:
             return float(amount)
-    return 0.0
+    return None
 
 
 def _hist_past_for_chart(
@@ -90,23 +90,35 @@ def _hist_past_for_chart(
     profile: str,
     service: str | None,
 ) -> pd.DataFrame:
-    """Past actuals through cutoff. Missing cutoff day is filled from CE, not assumed."""
+    """Past actuals through cutoff. Skip today when CE has not landed yet."""
     cutoff_iso = cutoff.isoformat()
+    today = date.today()
+
+    def _append_cutoff_row(df: pd.DataFrame) -> pd.DataFrame:
+        day_actual = _fetch_cutoff_day_actual(profile, cutoff_iso, service=service)
+        if day_actual is not None:
+            return pd.concat([df, pd.DataFrame([{
+                "day": cutoff_iso,
+                "actual_usd": day_actual,
+            }])], ignore_index=True)
+        if cutoff < today:
+            return pd.concat([df, pd.DataFrame([{
+                "day": cutoff_iso,
+                "actual_usd": 0.0,
+            }])], ignore_index=True)
+        return df
+
     if hist_df.empty:
-        return pd.DataFrame([{
-            "day": cutoff_iso,
-            "actual_usd": _fetch_cutoff_day_actual(
-                profile, cutoff_iso, service=service,
-            ),
-        }])
+        day_actual = _fetch_cutoff_day_actual(profile, cutoff_iso, service=service)
+        if day_actual is not None:
+            return pd.DataFrame([{"day": cutoff_iso, "actual_usd": day_actual}])
+        if cutoff < today:
+            return pd.DataFrame([{"day": cutoff_iso, "actual_usd": 0.0}])
+        return pd.DataFrame(columns=["day", "actual_usd"])
+
     past = hist_df.loc[_on_or_before(hist_df["day"], cutoff)].copy()
     if cutoff_iso not in past["day"].astype(str).tolist():
-        past = pd.concat([past, pd.DataFrame([{
-            "day": cutoff_iso,
-            "actual_usd": _fetch_cutoff_day_actual(
-                profile, cutoff_iso, service=service,
-            ),
-        }])], ignore_index=True)
+        past = _append_cutoff_row(past)
     return past.sort_values("day").reset_index(drop=True)
 
 
@@ -253,28 +265,6 @@ def _load_backtest(account_id: str) -> pd.DataFrame:
     rows = [json.loads(f.read_text())
             for f in sorted(backtest_dir(account_id).glob("score_*.json"))]
     return pd.DataFrame(rows)
-
-
-def _auto_score(account_id: str, profile: str) -> int:
-    """For every forecast on disk older than 7 days, score any target dates
-    that don't yet have a backtest file. Returns count of newly scored rows."""
-    n = 0
-    today = date.today()
-    for f in sorted(predictions_dir(account_id).glob("forecast_*.json")):
-        payload = json.loads(f.read_text())
-        for row in payload.get("forecast", []):
-            target = date.fromisoformat(row["target_date"])
-            if target > today - timedelta(days=1):
-                continue  # actual not yet available
-            score_file = backtest_dir(account_id) / f"score_{target.isoformat()}.json"
-            if score_file.exists():
-                continue
-            try:
-                score_for_target(target, profile=profile)
-                n += 1
-            except Exception:  # noqa: BLE001
-                pass
-    return n
 
 
 def _rgba(hex_color: str, alpha: float) -> str:
@@ -857,9 +847,9 @@ if latest:
                 kicker="Not included",
             )
 
-# opportunistically score any old forecasts whose targets have landed
+# Backfill score_*.json from every forecast_*.json on disk
 try:
-    _auto_score(account_id, active_profile)
+    backfill_scores_from_disk(account_id, active_profile)
 except Exception:  # noqa: BLE001
     pass
 
@@ -898,7 +888,7 @@ if selected_service is None and latest and latest.get("pr_scan", {}).get("impact
 # In-sample training fit overlay + trust metric (single train at cutoff)
 replay_points: list = []
 replay_df = pd.DataFrame()
-if show_replay and not hist_df.empty:
+if show_replay and model_choice != "aws" and not hist_df.empty:
     with st.spinner(f"Fitting {model_choice} on training data…"):
         try:
             hist_for_replay = pd.DataFrame({
@@ -1376,23 +1366,40 @@ section(
     kicker="Accuracy",
 )
 
-# Prefer persisted backtest scores when we have enough history. Thin saved
-# scores (e.g. one auto-scored day) still block the rich training-fit curve
-# unless we fall back below.
+# Backtest chart source: persisted score_*.json; training fit for non-AWS models.
+_aws_native = model_choice == "aws"
+_BT_MIN_TRUST = 7
 _bt_min_days = fit_lookback_days
+bt_persisted = bt.copy()
+bt_chart = bt_persisted.copy()
 bt_source = "saved"
-if (bt.empty or len(bt) < _bt_min_days) and not replay_df.empty:
-    bt = _backtest_from_training_fit(replay_df)
+if not _aws_native and (bt_chart.empty or len(bt_chart) < _bt_min_days) and not replay_df.empty:
+    bt_chart = _backtest_from_training_fit(replay_df)
     bt_source = "training fit (in-memory)"
 
-if bt.empty:
+_has_bt_view = not bt_chart.empty or (_aws_native and not hist_past.empty)
+
+if not _has_bt_view:
     callout(
         "No backtest data yet — enable **Show training fit** in "
-        "the controls, or wait for saved forecasts to age past 7 days.",
+        "the controls (non-AWS models), or run **Run forecast** daily and "
+        "wait for saved forecasts to age past 7 days.",
         tone="info",
     )
 else:
-    if bt_source != "saved":
+    if _aws_native:
+        st.caption(
+            "AWS native has no in-sample training fit. Chart shows Cost Explorer "
+            f"actuals plus **{bt_saved_count}** persisted score(s) from saved "
+            "forecast JSON on disk."
+        )
+        if bt_saved_count < _BT_MIN_TRUST:
+            callout(
+                f"Only {bt_saved_count} scored day(s) on disk — run **Run forecast** "
+                f"daily to build history. MAE/WAPE need at least {_BT_MIN_TRUST} scores.",
+                tone="info",
+            )
+    elif bt_source != "saved":
         _src_note = (
             f"Source: {bt_source} — computed from live history, not persisted."
         )
@@ -1402,18 +1409,33 @@ else:
                 f"(need {_bt_min_days} for saved-only chart)."
             )
         st.caption(_src_note)
-    bt = bt.sort_values("target_date").reset_index(drop=True)
-    total_abs_err = bt["abs_error_usd"].sum()
-    total_actual = bt["actual_usd"].abs().sum()
-    wape_val_bt = (total_abs_err / total_actual * 100) if total_actual else None
+
+    bt_metrics = (
+        bt_persisted.sort_values("target_date").reset_index(drop=True)
+        if _aws_native and not bt_persisted.empty
+        else bt_chart.sort_values("target_date").reset_index(drop=True)
+    )
+    _metrics_ok = (not _aws_native) or bt_saved_count >= _BT_MIN_TRUST
+    if not bt_metrics.empty and _metrics_ok:
+        total_abs_err = bt_metrics["abs_error_usd"].sum()
+        total_actual = bt_metrics["actual_usd"].abs().sum()
+        wape_val_bt = (total_abs_err / total_actual * 100) if total_actual else None
+    else:
+        wape_val_bt = None
 
     bcols = st.columns(3, gap="medium")
     with bcols[0]:
-        metric("Days scored", len(bt))
+        metric(
+            "Days scored",
+            bt_saved_count if _aws_native else len(bt_chart),
+        )
     with bcols[1]:
-        mae_val = bt["abs_error_usd"].mean()
-        mae_display = money(mae_val) if mae_val >= 1_000 else f"${mae_val:.2f}"
-        metric("MAE", mae_display)
+        if bt_metrics.empty or not _metrics_ok:
+            metric("MAE", "—")
+        else:
+            mae_val = bt_metrics["abs_error_usd"].mean()
+            mae_display = money(mae_val) if mae_val >= 1_000 else f"${mae_val:.2f}"
+            metric("MAE", mae_display)
     with bcols[2]:
         metric(
             "WAPE",
@@ -1421,36 +1443,71 @@ else:
         )
 
     fig2 = go.Figure()
-    bt_dates = pd.to_datetime(bt["target_date"])
-    bt_slice = bt.loc[bt_dates <= pd.Timestamp(_chart_cutoff)].copy()
-    bt_past = (
-        _fit_past_through_cutoff(bt_slice, _chart_cutoff, "target_date")
-        if not bt_slice.empty else bt_slice
-    )
+    bt_past = pd.DataFrame()
+    bt_slice = pd.DataFrame()
 
-    fig2.add_trace(go.Scatter(
-        x=bt_past["target_date"], y=bt_past["predicted_usd"],
-        mode="lines+markers", name="fitted (training)",
-        line=dict(color=C.INFO, width=2.5, shape="spline", smoothing=1.0),
-        legendrank=3,
-        hovertemplate="fitted (training): %{y:,.2f}<extra></extra>",
-    ))
-    fig2.add_trace(go.Scatter(
-        x=bt_past["target_date"], y=bt_past["actual_usd"],
-        mode="lines+markers", name="actual",
-        line=dict(color=C.GOOD, width=2.5, shape="spline", smoothing=1.0),
-        legendrank=4,
-        hovertemplate="actual: %{y:,.2f}<extra></extra>",
-    ))
+    if _aws_native:
+        if not hist_past.empty:
+            fig2.add_trace(go.Scatter(
+                x=hist_past["day"], y=hist_past["actual_usd"],
+                mode="lines+markers", name="actual",
+                line=dict(color=C.GOOD, width=2.5, shape="spline", smoothing=1.0),
+                legendrank=4,
+                hovertemplate="actual: %{y:,.2f}<extra></extra>",
+            ))
+        if not bt_persisted.empty:
+            bt_dates = pd.to_datetime(bt_persisted["target_date"])
+            bt_slice = bt_persisted.loc[
+                bt_dates <= pd.Timestamp(_chart_cutoff)
+            ].copy()
+            pred_mode = "lines+markers" if len(bt_slice) > 1 else "markers"
+            fig2.add_trace(go.Scatter(
+                x=bt_slice["target_date"], y=bt_slice["predicted_usd"],
+                mode=pred_mode, name="saved prediction",
+                line=dict(color=C.INFO, width=2.5, shape="linear"),
+                marker=dict(color=C.INFO, size=8),
+                legendrank=3,
+                hovertemplate="saved prediction: %{y:,.2f}<extra></extra>",
+            ))
+        bt_past = bt_slice
+    else:
+        bt_dates = pd.to_datetime(bt_chart["target_date"])
+        bt_slice = bt_chart.loc[bt_dates <= pd.Timestamp(_chart_cutoff)].copy()
+        bt_past = (
+            _fit_past_through_cutoff(bt_slice, _chart_cutoff, "target_date")
+            if not bt_slice.empty else bt_slice
+        )
+        fig2.add_trace(go.Scatter(
+            x=bt_past["target_date"], y=bt_past["predicted_usd"],
+            mode="lines+markers", name="fitted (training)",
+            line=dict(color=C.INFO, width=2.5, shape="spline", smoothing=1.0),
+            legendrank=3,
+            hovertemplate="fitted (training): %{y:,.2f}<extra></extra>",
+        ))
+        fig2.add_trace(go.Scatter(
+            x=bt_past["target_date"], y=bt_past["actual_usd"],
+            mode="lines+markers", name="actual",
+            line=dict(color=C.GOOD, width=2.5, shape="spline", smoothing=1.0),
+            legendrank=4,
+            hovertemplate="actual: %{y:,.2f}<extra></extra>",
+        ))
+
     # Future forecast: only dates after cutoff; bridge closes any calendar gap.
     if not fc_future.empty:
         future_x = fc_future["target_date"].tolist()
         future_y = [float(v) for v in fc_future["adjusted_usd"].tolist()]
         upper_y = [float(v) for v in fc_future["upper_usd"].tolist()]
         lower_y = [float(v) for v in fc_future["lower_usd"].tolist()]
-        past_anchor = _value_at_cutoff(
-            bt_past, _chart_cutoff, "target_date", "predicted_usd",
-        )
+        if _aws_native:
+            past_anchor = _past_anchor_y(
+                hist_past, bt_past, _chart_cutoff,
+                y_fit="predicted_usd", y_actual="actual_usd",
+                day_col_fit="target_date", day_col_actual="day",
+            )
+        else:
+            past_anchor = _value_at_cutoff(
+                bt_past, _chart_cutoff, "target_date", "predicted_usd",
+            )
         band_x, upper_plot = _future_trace_xy(
             _chart_cutoff, upper_y[0], future_x, upper_y,
         )
@@ -1486,8 +1543,11 @@ else:
             line_dash="dash", line_color=C.FAINT,
             annotation_text="now", annotation_position="top",
         )
+    _bt_start_series: list = [(bt_past, "target_date")]
+    if _aws_native and not hist_past.empty:
+        _bt_start_series.insert(0, (hist_past, "day"))
     _backtest_x_start = _chart_data_start(
-        (bt_past, "target_date"),
+        *_bt_start_series,
         default=cutoff - timedelta(days=history_days),
     )
     _backtest_xaxis = _forecast_chart_xaxis(_backtest_x_start, _chart_x_end)
@@ -1500,27 +1560,31 @@ else:
     )
     st.plotly_chart(fig2, use_container_width=True)
 
-    err_roll = bt["abs_error_usd"].rolling(7, min_periods=1).sum()
-    act_roll = bt["actual_usd"].abs().rolling(7, min_periods=1).sum()
-    bt["wape_pct"] = (err_roll / act_roll * 100).where(act_roll > 0)
-    bt_wape_plot = bt.loc[
-        pd.to_datetime(bt["target_date"]) <= pd.Timestamp(_chart_cutoff)
-    ]
-    fig3 = go.Figure()
-    fig3.add_trace(go.Scatter(
-        x=bt_wape_plot["target_date"],
-        y=bt_wape_plot["wape_pct"],
-        mode="lines+markers", name="rolling 7-day WAPE",
-        line=dict(color=C.BAD, width=2.5, shape="spline", smoothing=1.0),
-    ))
-    _fig3_layout = plotly_layout(height=260)
-    # Match forecast chart x-scale so "now" aligns; line stops at cutoff.
-    _fig3_layout["xaxis"] = _backtest_xaxis
-    fig3.update_layout(
-        **_fig3_layout,
-        yaxis_title="WAPE %",
-        hovermode="x unified",
-    )
+    if not bt_metrics.empty and _metrics_ok:
+        err_roll = bt_metrics["abs_error_usd"].rolling(7, min_periods=1).sum()
+        act_roll = bt_metrics["actual_usd"].abs().rolling(7, min_periods=1).sum()
+        bt_metrics = bt_metrics.copy()
+        bt_metrics["wape_pct"] = (err_roll / act_roll * 100).where(act_roll > 0)
+        bt_wape_plot = bt_metrics.loc[
+            pd.to_datetime(bt_metrics["target_date"]) <= pd.Timestamp(_chart_cutoff)
+        ]
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(
+            x=bt_wape_plot["target_date"],
+            y=bt_wape_plot["wape_pct"],
+            mode="lines+markers", name="rolling 7-day WAPE",
+            line=dict(color=C.BAD, width=2.5, shape="spline", smoothing=1.0),
+        ))
+        _fig3_layout = plotly_layout(height=260)
+        _fig3_layout["xaxis"] = _backtest_xaxis
+        fig3.update_layout(
+            **_fig3_layout,
+            yaxis_title="WAPE %",
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig3, use_container_width=True)
+
+
     st.plotly_chart(fig3, use_container_width=True)
 
 
