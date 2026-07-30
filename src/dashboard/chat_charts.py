@@ -198,11 +198,24 @@ def _value_grounded_by_aggregate(
     return False
 
 
-def _values_grounded(chart: dict, tool_numbers: set[float]) -> tuple[bool, list[float]]:
+def _values_grounded(
+    chart: dict,
+    tool_numbers: set[float],
+    numeric_lists: list[list[float]] | None = None,
+) -> tuple[bool, list[float]]:
     """Return ``(ok, offending_values)``. ok=True when every y value in
-    every series shows up in ``tool_numbers`` at 4dp. offending_values
+    every series is grounded — either it appears in ``tool_numbers`` at
+    4dp, OR it matches an aggregate (mean / sum / min / max / in-range)
+    of any real ``numeric_lists`` from tool output. offending_values
     lists the first few values that failed — used for the warning banner
     so the user (and we during debugging) can see exactly what mismatched.
+
+    Aggregate acceptance is the "honest derivation" carve-out. Example:
+    the bot legitimately plots a 30-day average even though 30-day-average
+    isn't a value the API ever returned — the DAILY LIST that produced
+    that average IS in the API response. The guard treats the mean of
+    that list as grounded because it's a real derivation of real data,
+    not a fabrication.
 
     Prediction charts (with ``prediction_basis``) are skipped here — their
     "Change" and "Projected" bars are DERIVED from historical values,
@@ -212,6 +225,7 @@ def _values_grounded(chart: dict, tool_numbers: set[float]) -> tuple[bool, list[
     """
     if "prediction_basis" in chart:
         return True, []
+    numeric_lists = numeric_lists or []
     offending: list[float] = []
     for series in chart.get("series", []):
         for y in series.get("y", []):
@@ -226,10 +240,17 @@ def _values_grounded(chart: dict, tool_numbers: set[float]) -> tuple[bool, list[
                 abs(rounded - t) <= max(0.01, abs(t) * 0.01)
                 for t in tool_numbers
             )
-            if not tolerated:
-                offending.append(y)
-                if len(offending) >= 5:
-                    return False, offending
+            if tolerated:
+                continue
+            # Aggregate carve-out: does this value match mean / sum / min /
+            # max of any real list, or fall inside the [min, max] range of
+            # any real list? This is what accepts honest derivations like
+            # a 30-day average or a top-of-range projection.
+            if _value_grounded_by_aggregate(rounded, numeric_lists):
+                continue
+            offending.append(y)
+            if len(offending) >= 5:
+                return False, offending
     return len(offending) == 0, offending
 
 
@@ -483,7 +504,9 @@ def render_charts_inline(
             )
             continue
 
-        grounded, offending = _values_grounded(chart, tool_numbers)
+        grounded, offending = _values_grounded(
+            chart, tool_numbers, numeric_lists,
+        )
         if not grounded:
             preview = ", ".join(str(v) for v in offending[:5])
             st.warning(
