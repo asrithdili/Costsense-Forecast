@@ -335,6 +335,151 @@ DDB_SPEC = {
 
 
 # ---------------------------------------------------------------------------
+# Multi-account cost summary
+# ---------------------------------------------------------------------------
+
+def _cost_total_for_profile(profile: str, days: int) -> dict:
+    """Fetch total daily spend for one profile. Returns a result dict or
+    an error dict. Always returns — never raises — so the parallel pool
+    can collect results even when one account is unreachable."""
+    from datetime import date, timedelta
+    from src.aws.session import make_session
+    try:
+        session = make_session(profile)
+        ce = session.client("ce", region_name="us-east-1")
+        end = date.today()
+        start = end - timedelta(days=days)
+        resp = ce.get_cost_and_usage(
+            TimePeriod={"Start": start.isoformat(), "End": end.isoformat()},
+            Granularity="DAILY",
+            Metrics=["UnblendedCost"],
+        )
+        total = 0.0
+        daily = []
+        for period in resp.get("ResultsByTime", []):
+            amt = float(period["Total"]["UnblendedCost"]["Amount"])
+            daily.append({"day": period["TimePeriod"]["Start"],
+                          "usd": round(amt, 2)})
+            total += amt
+        return {
+            "profile": profile,
+            "total_usd": round(total, 2),
+            "avg_daily_usd": round(total / max(days, 1), 2),
+            "daily": daily,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"profile": profile, "error": str(exc)}
+
+
+@_safe
+def multi_account_cost(
+    days: int = 14,
+    accounts: list | None = None,
+    profile: str | None = None,
+) -> dict:
+    """Fetch cost totals for MULTIPLE AWS accounts in parallel and return
+    a side-by-side comparison.
+
+    When ``accounts`` is omitted or "all", every configured account
+    (from COSTSENSE_CROSS_ACCOUNT_ROLES or local SSO profiles) is queried.
+    Pass a list of profile labels (e.g. ["dil-data-platform-dev",
+    "dil-team-hackfest"]) to restrict the comparison.
+
+    The ``profile`` parameter is accepted but ignored — this tool always
+    queries all (or the listed) configured accounts, not just the active
+    one.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from src.aws.profiles import resolve_all
+
+    # Resolve the list of profiles to query.
+    all_profiles = [p.profile for p in resolve_all() if p.account_id]
+    if not all_profiles:
+        return {"error": "No reachable AWS profiles found."}
+
+    if accounts and accounts != "all":
+        target_labels = [a.strip() for a in
+                         (accounts if isinstance(accounts, list) else [accounts])]
+        target = [p for p in all_profiles if p in target_labels]
+        if not target:
+            return {
+                "error": (
+                    f"None of the requested accounts {target_labels} match "
+                    f"the configured profiles: {all_profiles}. "
+                    f"Use exact profile labels from the sidebar dropdown."
+                )
+            }
+    else:
+        target = all_profiles
+
+    results = []
+    with ThreadPoolExecutor(max_workers=min(8, len(target))) as pool:
+        futures = {pool.submit(_cost_total_for_profile, p, days): p
+                   for p in target}
+        for fut in as_completed(futures):
+            results.append(fut.result())
+
+    # Sort by total spend descending (errors go last).
+    results.sort(key=lambda r: -r.get("total_usd", -1))
+
+    grand_total = sum(r.get("total_usd", 0) for r in results
+                      if "error" not in r)
+    successful = [r for r in results if "error" not in r]
+    failed = [r for r in results if "error" in r]
+
+    return _scrub({
+        "accounts_queried": len(target),
+        "days": days,
+        "grand_total_usd": round(grand_total, 2),
+        "per_account": results,
+        "successful_accounts": len(successful),
+        "failed_accounts": len(failed),
+        "note": (
+            f"Queried {len(target)} accounts in parallel over the last "
+            f"{days} days. Grand total: ${grand_total:,.2f}. "
+            + (f"{len(failed)} account(s) unreachable: "
+               f"{[r['profile'] for r in failed]}." if failed else "")
+        ),
+    })
+
+
+MULTI_ACCOUNT_COST_SPEC = {
+    "name": "multi_account_cost",
+    "description": (
+        "Compare AWS spend across MULTIPLE accounts simultaneously. "
+        "Fetches total cost and daily averages for all configured accounts "
+        "(or a specified subset) in parallel and returns a ranked "
+        "side-by-side table. "
+        "USE THIS TOOL when the user asks about: 'all accounts', "
+        "'both accounts', 'compare accounts', 'which account costs more', "
+        "'total spend across accounts', 'cost across the org', "
+        "'how much are all my accounts spending', or any question that "
+        "clearly needs data from more than one account at once. "
+        "Do NOT call this for single-account questions — use cost_by_service "
+        "for those."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "days": {
+                "type": "integer",
+                "default": 14,
+                "maximum": 90,
+                "description": "Number of days to look back. Default 14.",
+            },
+            "accounts": {
+                "description": (
+                    "List of profile labels to compare, e.g. "
+                    "[\"dil-data-platform-dev\", \"dil-team-hackfest\"]. "
+                    "Omit or pass \"all\" to query every configured account."
+                ),
+            },
+        },
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -346,6 +491,7 @@ BROAD_TOOLS: dict[str, tuple[callable, dict]] = {
     "list_s3_buckets": (list_s3_buckets, S3_SPEC),
     "s3_bucket_lifecycle": (s3_bucket_lifecycle, S3_LIFECYCLE_SPEC),
     "list_dynamodb_tables": (list_dynamodb_tables, DDB_SPEC),
+    "multi_account_cost": (multi_account_cost, MULTI_ACCOUNT_COST_SPEC),
 }
 
 
