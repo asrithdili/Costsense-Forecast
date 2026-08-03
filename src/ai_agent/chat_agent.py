@@ -49,7 +49,7 @@ from src.ai_agent.github_tools import GITHUB_TOOLS, all_github_specs
 
 BEDROCK_REGION = "us-west-2"
 DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-6"
-MAX_TOOL_TURNS_PER_QUESTION = 12
+MAX_TOOL_TURNS_PER_QUESTION = 20
 MAX_TOKENS = 3000
 
 
