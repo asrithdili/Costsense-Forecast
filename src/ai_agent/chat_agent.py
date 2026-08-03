@@ -273,27 +273,47 @@ Prose ("Lambda is your biggest driver") is fine when supported by a tool; \
 figures ($400/day, ~$65K/month) are ONLY fine when a tool call actually \
 returned them.
 
+MULTI-ACCOUNT ANALYSIS — you CAN call any tool against any account:
+
+Every AWS tool accepts an optional ``account`` parameter that is a \
+profile label (e.g. "dil-data-platform-dev", "dil-connector-service-dev"). \
+When you pass ``account``, the tool call runs against THAT account \
+instead of the active profile.
+
+USE THIS to do deep multi-account analysis in a single turn. Examples:
+  - cost_by_service(days=90, account="dil-data-platform-dev")
+  - cost_by_service(days=90, account="dil-connector-service-dev")
+  - list_lambda_functions(account="dil-data-platform-dev")
+  - cloudtrail_lookup(account="dil-connector-service-dev")
+
+WHEN TO USE cross-account tool calls:
+  * User asks to "connect to" or "also check" another account.
+  * User says "these 2 accounts will work together."
+  * User asks for combined analysis across two named accounts.
+  * User wants org onboarding cost that spans multiple accounts.
+  * Any question where the full answer requires data from more than \
+one account.
+
+VALID account labels (use exactly as written):
+  dil-data-platform-dev, dil-connector-service-dev, dil-team-hackfest, \
+  dil-team-aura, dil-3rdparty-connector-discovery-dev
+
+Do NOT refuse multi-account questions. Do NOT tell the user to switch \
+profiles. Just call the tools with the appropriate ``account`` parameter \
+on each account needed and synthesise the combined result.
+
 CRITICAL SCOPE RULES:
-- The ACTIVE SCOPE block above names the DEFAULT AWS account. Your single-\
-account tools (cost_by_service, list_lambda_functions, etc.) return data \
-from THAT account only.
-- EXCEPTION — MULTI-ACCOUNT QUERIES: when the user explicitly asks about \
-MULTIPLE accounts at once ("all accounts", "both accounts", "compare \
-accounts", "across the org", "how much are all my accounts spending", \
-"analyse both X and Y"), call `multi_account_cost` INSTEAD of refusing. \
-That tool reaches every configured account in parallel. Do NOT trigger \
-the scope refusal for these questions — call the tool.
-- If the user asks about ONE SPECIFIC account that is NOT the active \
-profile AND NOT a multi-account question, THEN apply the scope refusal: \
-refuse briefly and STOP. Reply is ONE short paragraph: "I don't have \
-access to that account — my active profile is X (account Y). Switch \
-profiles in the sidebar or ask the account's owner."
-- DO NOT offer the connected account's data as a "here's what I can see \
-instead" consolation. That is the specific failure mode this rule \
-prevents. No table, no numbers, no "meanwhile", no "however here is". \
-Full stop after the single-account refusal.
-- The refusal-and-stop rule applies ONLY to single-account-specific \
-questions. Multi-account questions are served by multi_account_cost.
+- The ACTIVE SCOPE block above names the DEFAULT AWS account used when \
+you do NOT pass an ``account`` parameter.
+- For multi-account questions, use cross-account tool calls as above \
+instead of the scope refusal.
+- SUBSTITUTION GUARD still applies: do NOT silently answer about \
+account B when the user asked about account A with no mention of \
+multi-account intent. The cross-account ``account`` parameter is for \
+INTENTIONAL multi-account analysis, not for sneaking in consolation data.
+- If the user asks about a specific account that is not in the valid \
+labels list above AND is not a multi-account question, refuse briefly: \
+"I don't have access to that account. Switch profiles in the sidebar."
 
 CHARTS — when to emit and how:
 - If the user asks for a "graph", "chart", "bar chart", "trend", "plot", \
@@ -539,21 +559,59 @@ class ChatTurn:
 # Tool dispatch
 # ---------------------------------------------------------------------------
 
+_ACCOUNT_PARAM = {
+    "account": {
+        "type": "string",
+        "description": (
+            "Optional. Profile label of the AWS account to query — e.g. "
+            "'dil-data-platform-dev' or 'dil-connector-service-dev'. "
+            "Omit to use the currently active profile. Pass this when "
+            "doing multi-account analysis so you can call this tool on "
+            "several accounts in the same turn."
+        ),
+    }
+}
+
+
 def _merged_tool_specs() -> list[dict]:
-    """All tools available to the chat agent: AWS base + broad + GitHub."""
+    """All tools available to the chat agent: AWS base + broad + GitHub.
+
+    For every AWS tool, inject an optional ``account`` parameter so the
+    AI can direct individual tool calls at any configured account without
+    the user having to switch profiles.  GitHub tools are left unchanged
+    (they authenticate via token, not per-account AWS session).
+    """
+    import copy
     from src.ai_agent.aws_tools import tool_specs as base_specs
-    return base_specs() + all_broad_specs() + all_github_specs()
+    specs = []
+    for spec in base_specs() + all_broad_specs():
+        s = copy.deepcopy(spec)
+        props = s.setdefault("input_schema", {}).setdefault("properties", {})
+        props.update(_ACCOUNT_PARAM)
+        specs.append(s)
+    specs += all_github_specs()
+    return specs
 
 
 def _run_tool(name: str, args: dict, profile: str | None) -> dict:
-    """Route to whichever registry has the tool, then scrub secrets."""
+    """Route to whichever registry has the tool, then scrub secrets.
+
+    If the AI passes an ``account`` argument naming a different profile
+    label (e.g. "dil-data-platform-dev"), that profile is used instead
+    of the active session's profile.  This enables intentional
+    cross-account tool calls for multi-account analysis — the AI can
+    call cost_by_service on account A and again on account B in the
+    same turn.
+    """
     kwargs = dict(args or {})
+    # Honour an explicit account override from the AI.
+    effective_profile = kwargs.pop("account", None) or profile
     if name in BASE_TOOLS:
         fn, _ = BASE_TOOLS[name]
-        kwargs["profile"] = profile
+        kwargs["profile"] = effective_profile
     elif name in BROAD_TOOLS:
         fn, _ = BROAD_TOOLS[name]
-        kwargs["profile"] = profile
+        kwargs["profile"] = effective_profile
     elif name in GITHUB_TOOLS:
         fn, _ = GITHUB_TOOLS[name]  # GitHub tools auth via gh CLI / GITHUB_TOKEN
     else:
