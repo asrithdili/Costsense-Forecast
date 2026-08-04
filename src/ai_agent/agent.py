@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from functools import lru_cache
 
 import boto3
 
@@ -68,8 +67,8 @@ class AgentVerdict:
     raw_text: str = ""
 
 
-@lru_cache(maxsize=1)
 def _client(profile: str | None):
+    # Not cached — temp credentials expire hourly.
     from src.ai_agent.bedrock_client import make_client
     return make_client(profile, region=BEDROCK_REGION)
 

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 
 from src.aws.session import make_session
@@ -48,8 +47,8 @@ def _save_cache(cache: dict) -> None:
     CACHE_PATH.write_text(json.dumps(cache, indent=2, sort_keys=True))
 
 
-@lru_cache(maxsize=1)
 def _pricing_client(profile: str | None):
+    # Not cached — temp credentials expire hourly.
     session = make_session(profile)
     # Pricing endpoint only in us-east-1 / ap-south-1
     return session.client("pricing", region_name="us-east-1")

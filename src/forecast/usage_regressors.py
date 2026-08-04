@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from functools import lru_cache
 
 import pandas as pd
 
@@ -39,8 +38,8 @@ class UsageSeries:
     correlation: float    # Pearson r with daily cost, on the fetched window
 
 
-@lru_cache(maxsize=16)
 def _cw_client(profile: str | None, region: str):
+    # Not cached — temp credentials expire hourly.
     session = make_session(profile)
     return session.client("cloudwatch", region_name=region)
 

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
 from typing import Any
 
 from src.aws.session import make_session
@@ -26,8 +25,9 @@ class MetricPoint:
     value: float
 
 
-@lru_cache(maxsize=8)
 def _cw_client(profile: str | None, region: str):
+    # Not cached — cross-account sessions hold temp credentials that
+    # expire hourly. Same fix as aws_tools.py and bedrock_client.py.
     session = make_session(profile)
     return session.client("cloudwatch", region_name=region)
 
