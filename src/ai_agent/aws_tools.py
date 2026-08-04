@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import threading
 from datetime import date, datetime, timedelta, timezone
-from functools import lru_cache
 from typing import Any
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -26,12 +25,14 @@ from src.aws.session import make_session
 # session / clients
 # ---------------------------------------------------------------------------
 
-@lru_cache(maxsize=32)
 def _session(profile: str | None):
+    # Not cached — cross-account sessions hold temp credentials that
+    # expire hourly.  make_session() already caches the AssumeRole
+    # session internally; caching here would re-use a stale client
+    # after the underlying session refreshes.
     return make_session(profile)
 
 
-@lru_cache(maxsize=64)
 def _client(profile: str | None, service: str, region: str):
     return _session(profile).client(service, region_name=region)
 

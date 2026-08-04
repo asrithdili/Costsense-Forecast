@@ -10,15 +10,16 @@ from __future__ import annotations
 
 import json
 import re
-from functools import lru_cache
 
 from botocore.exceptions import BotoCoreError, ClientError
 
 from src.aws.session import make_session
 
 
-@lru_cache(maxsize=64)
 def _client(profile: str | None, service: str, region: str):
+    # Not cached — same reason as aws_tools.py: cross-account sessions
+    # hold temp credentials that expire hourly.  Rebuilding the boto3
+    # service client is cheap; holding a stale client is wrong.
     session = make_session(profile)
     return session.client(service, region_name=region)
 
